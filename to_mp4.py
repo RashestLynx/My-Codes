@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Safely convert MKV files to MP4 using ffmpeg.
+"""Safely convert video files (MKV, AVI, MOV, WebM, WMV, ...) to MP4 using ffmpeg.
 
 Safety guarantees:
   * The input file is never modified or deleted.
@@ -12,10 +12,13 @@ Safety guarantees:
   * ffmpeg is invoked without a shell, so odd filenames are handled safely.
 
 Usage:
-  python3 mkv_to_mp4.py movie.mkv
-  python3 mkv_to_mp4.py movie.mkv -o out.mp4
-  python3 mkv_to_mp4.py folder_with_mkvs/          # converts every .mkv inside
-  python3 mkv_to_mp4.py movie.mkv --reencode       # force full re-encode
+  python3 to_mp4.py movie.mkv
+  python3 to_mp4.py clip.avi -o out.mp4
+  python3 to_mp4.py videos/                  # converts every video file inside
+  python3 to_mp4.py movie.webm --reencode    # H.264/AAC for maximum compatibility
+
+A single file can be anything ffmpeg can read. Folder mode picks up the
+extensions in VIDEO_EXTENSIONS and skips files that are already .mp4.
 """
 
 import argparse
@@ -27,6 +30,13 @@ import sys
 import tempfile
 from functools import lru_cache
 from pathlib import Path
+
+# File types picked up when converting a whole folder.
+VIDEO_EXTENSIONS = {
+    ".mkv", ".avi", ".mov", ".webm", ".wmv", ".flv", ".m4v", ".mpg", ".mpeg",
+    ".ts", ".m2ts", ".mts", ".vob", ".3gp", ".3g2", ".ogv", ".asf", ".divx",
+    ".f4v", ".rm", ".rmvb",
+}
 
 # Codecs MP4 can hold as-is (stream copy).
 MP4_VIDEO_CODECS = {"h264", "hevc", "av1", "mpeg4", "vp9"}
@@ -239,13 +249,18 @@ def convert(src, dst, overwrite=False, force_reencode=False, crf=18):
 def collect_inputs(path):
     p = Path(path)
     if p.is_dir():
-        return sorted(f for f in p.iterdir() if f.is_file() and f.suffix.lower() == ".mkv")
+        # Hidden files are skipped, which also covers this script's own temp files.
+        return sorted(
+            f for f in p.iterdir()
+            if f.is_file() and not f.name.startswith(".")
+            and f.suffix.lower() in VIDEO_EXTENSIONS
+        )
     return [p]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Safely convert MKV files to MP4.")
-    parser.add_argument("input", help="an .mkv file, or a folder containing .mkv files")
+    parser = argparse.ArgumentParser(description="Safely convert video files to MP4.")
+    parser.add_argument("input", help="a video file (any format ffmpeg reads), or a folder of video files")
     parser.add_argument("-o", "--output",
                         help="output file, or output folder (required to be a folder for folder input); "
                              "defaults to the same location with a .mp4 extension")
@@ -267,7 +282,7 @@ def main():
 
     inputs = collect_inputs(args.input)
     if not inputs:
-        print(f"error: no .mkv files found in {args.input}", file=sys.stderr)
+        print(f"error: no video files found in {args.input}", file=sys.stderr)
         return 1
 
     is_batch = Path(args.input).is_dir()
@@ -275,15 +290,32 @@ def main():
         print(f"error: --output must be a folder when converting a folder: {args.output}",
               file=sys.stderr)
         return 1
-    failures = 0
+    # Files sharing a name ("clip.mkv", "clip.avi") would all become "clip.mp4",
+    # so those get the original extension kept: "clip.mkv.mp4", "clip.avi.mp4".
+    stem_counts = {}
     for src in inputs:
+        stem_counts[src.stem.lower()] = stem_counts.get(src.stem.lower(), 0) + 1
+
+    failures = 0
+    planned = set()
+    for src in inputs:
+        name = (src.name if stem_counts[src.stem.lower()] > 1 else src.stem) + ".mp4"
         if args.output:
             out = Path(args.output)
-            dst = out / (src.stem + ".mp4") if is_batch or out.is_dir() else out
+            dst = out / name if is_batch or out.is_dir() else out
         else:
-            dst = src.with_suffix(".mp4")
+            dst = src.with_name(name)
 
         print(f"Converting: {src} -> {dst}")
+        # Backstop against two inputs mapping to one output (e.g. "a.mkv.mp4"
+        # also existing as an input stem): never let the second replace the first.
+        key = os.path.normcase(str(dst.resolve()))
+        if key in planned:
+            print(f"  error: {dst.name} was already created from another file in this run; skipped",
+                  file=sys.stderr)
+            failures += 1
+            continue
+        planned.add(key)
         try:
             convert(src, dst, overwrite=args.overwrite,
                     force_reencode=args.reencode, crf=args.crf)
