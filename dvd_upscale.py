@@ -230,9 +230,12 @@ def probe(src):
     cstart = float(frac(f.get("start_time"), Fraction(0)))
     vs = s.get("start_time")
     vstart = float(frac(vs)) if vs not in (None, "N/A") else cstart
-    if Path(src).suffix.lower() in MPEG_EXT:
+    seek_delay, ext = 0.0, Path(src).suffix.lower()
+    if ext in MPEG_EXT or ext == ".avi":
         # a recording or .vob cut mid-GOP: its first packets can't be decoded, and the picture
-        # (which the sound is lined up with) starts at the first frame that can
+        # (which the sound is lined up with) starts at the first frame that can. An AVI stores
+        # no picture times: with B-frames ffmpeg times its pictures 1-2 frames late (the decoder
+        # delay), and -ss seeks by those times, so chunk seeks add that delay (see main)
         r = subprocess.run(["ffprobe", "-v", "quiet", "-select_streams", "v:0", "-read_intervals",
                             "%+#200", "-show_entries", "frame=best_effort_timestamp_time", "-of",
                             "csv=p=0", str(src)], capture_output=True, encoding="utf-8",
@@ -240,7 +243,10 @@ def probe(src):
         try:
             first = float(r.stdout.split()[0].strip(","))
             if vstart < first < vstart + 5:
-                vstart = first
+                if ext == ".avi":
+                    seek_delay = first - vstart
+                else:
+                    vstart = first
         except (IndexError, ValueError):
             pass
     duration = hms(f.get("duration"))
@@ -265,7 +271,7 @@ def probe(src):
         fps=fps,
         cstart=cstart, vstart=vstart,
         duration=duration or vdur + (vstart - cstart),
-        vduration=vdur)
+        vduration=vdur, seek_delay=seek_delay)
 
 
 def sample_start(info):
@@ -3410,7 +3416,9 @@ def main():
 
     def make(entry, gpu=devices[0], lane=None):
         i, t, length, expected = entry
-        seek = max(0.0, cut + float(t) - eps)
+        # (an AVI with B-frames: after the first chunk, which is read without -ss, seek by
+        # ffmpeg's late picture times, else each later chunk started 1-2 frames early)
+        seek = max(0.0, cut + float(t) + (info["seek_delay"] if t else 0.0) - eps)
         warm = i > 0 and (a.type == "vhs" and t * a.vhs_fin >= a.vhs_warm[0] + 1
                           or a.type != "vhs" and a.mode == "telecine" and not a.pal and t >= 1)
         with make_lock:             # (it sets this chunk's warm-up trim on a, then reads it)
