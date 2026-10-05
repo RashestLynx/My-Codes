@@ -93,7 +93,8 @@ queue.txt has one movie per line, exactly what you'd type after "python dvd_upsc
 - Lines starting with # are ignored, and so is anything after a # outside quotes. Use straight
   quotes "like this" around names with spaces. Paths are relative to the queue file's folder.
 - Each movie needs its own --work folder; if a line has none, "<output name>_work" next to the
-  output is used (or upscale_work, if a run of that same movie was started there by hand).
+  output is used (or, if a run of that same movie was started by hand or with --all, the folder
+  it was started in, so it continues instead of starting over).
 - Two lines with the same output file: the second is skipped. A finished movie records which
   file it was made from, and is never replaced by the upscale of a different file.
 - While it runs the PC is kept from going to sleep (single movies too). Keep it plugged in, and if you
@@ -389,6 +390,9 @@ MPEG_EXT = (".mpg", ".mpeg", ".vob", ".ts", ".m2ts", ".mts", ".m2v")
 # subtitle formats a .mkv can hold (mov_text is converted to SRT); teletext etc. can't go in
 MKV_SUBS = {"dvd_subtitle", "dvb_subtitle", "hdmv_pgs_subtitle", "hdmv_text_subtitle", "subrip",
             "ass", "ssa", "text", "mov_text", "webvtt", "arib_caption"}
+# what an .mp4 output keeps: audio .mp4 players take, and text subtitles (DVD ones are pictures)
+MP4_AUDIO = {"ac3", "eac3", "aac", "mp3"}
+MP4_SUBS = {"subrip", "ass", "ssa", "mov_text", "webvtt", "text"}
 
 
 def _phase_share(d):
@@ -434,7 +438,9 @@ def vhs_detect(a, info, start=None):
         rate /= 2
         dedup = f"fps={rate.numerator}/{rate.denominator},"
     start = sample_start(info) if start is None else start
-    p = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin", "-ss", f"{start:.1f}",
+    # (no -ss for a sample from the start: an AVI with B-frames can't seek to 0)
+    p = subprocess.run(["ffmpeg", "-hide_banner", "-nostdin",
+                        *(["-ss", f"{start:.1f}"] if start else []),
                         "-t", "60", "-i", a.input, "-an", "-sn", "-filter_complex",
                         f"[0:v]{dedup}split=2[a][b];[a]idet[ai];[b]{VHS_CADENCE_VF}[bo]",
                         "-map", "[ai]", "-f", "null", "-",
@@ -509,7 +515,8 @@ def vhs_chroma_delay(a, info):
              if a.mode != "progressive" else "")
     vf = (f"{deint}select='not(mod(n\\,9))',crop={w}:{h * 16}:(iw-{w})/2:8,format=yuv444p,"
           f"gblur=sigma=3:sigmaV=0.01:planes=1,scale={w}:{h}:flags=area,format=yuv444p")
-    raw = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-ss", f"{start:.1f}", "-i", a.input,
+    raw = subprocess.run(["ffmpeg", "-v", "error", "-nostdin",
+                          *(["-ss", f"{start:.1f}"] if start else []), "-i", a.input,
                           "-an", "-sn", "-vf", vf, "-frames:v", "16", "-f", "rawvideo", "-"],
                          capture_output=True).stdout
     fs, seq = w * h, [[], [], []]
@@ -591,10 +598,14 @@ def prefilter(a):
         # repeatfields first: frames the disc only flags to show for 3 fields (soft pulldown)
         # become those 3 fields, so the inverse telecine finds the same 3:2 pattern everywhere.
         # Without it a disc mixing soft and hard pulldown lost every 5th film frame in its soft
-        # parts; on hard telecine it changes nothing (verified bit-identical)
-        f += ["repeatfields", "fieldmatch", "yadif=deint=interlaced"]
-        if not getattr(a, "pal", False):
-            f += ["decimate"]               # PAL film is 2:2 (25 fps): nothing to drop
+        # parts; on hard telecine it changes nothing (verified bit-identical).
+        # Not for PAL: soft pulldown is an NTSC thing, and repeatfields drops the timestamps of
+        # frames not flagged top field first unless the rate is 29.97; with no decimate after
+        # it to make new ones, fps= then dropped every frame of BFF/progressive-flagged discs
+        if getattr(a, "pal", False):
+            f += ["fieldmatch", "yadif=deint=interlaced"]   # PAL film is 2:2: nothing to drop
+        else:
+            f += ["repeatfields", "fieldmatch", "yadif=deint=interlaced", "decimate"]
     elif a.mode == "interlaced":
         f += ["bwdif=mode=send_frame:deint=all"]
     elif getattr(a, "combed", False):
@@ -996,7 +1007,10 @@ class Chunk:
                 # frames, a noise pulse; with it 58 dB or better); the frames made from them are
                 # cut off again at the end of the prefilter
                 pre, a.vhs_trim = a.vhs_warm
-            self.src = ["-ss", f"{float(start) - pre / a.vhs_fin:.6f}",
+            seek = float(start) - pre / a.vhs_fin
+            # (no -ss for the first chunk here either: on an AVI with B-frames, -ss 0 gave
+            # garbled frames and lost the first ~1.6 s, or no frames at all for H.264)
+            self.src = [*(["-ss", f"{seek:.6f}"] if seek > 0 else []),
                         "-t", f"{float(length) + pre / a.vhs_fin + 0.25:.6f}",
                         "-i", a.chunk_input, "-an", "-sn"]
         elif warm:
@@ -3236,9 +3250,11 @@ def main():
         if old and frac(old.get("fps")) == given:
             fps = given                     # started that way by an older version
     a.fps = f"{fps.numerator}/{fps.denominator}"
+    if fps > 30 and a.level == "4.1":
+        # 1440x1080p59.94 is 366,833 macroblocks/s, level 4.1 allows 245,760 (camcorder tapes,
+        # or --fps 50/59.94 on a DVD: 1080p59.94 is 489,110)
+        a.level = "4.2"
     if a.type == "vhs":
-        if fps > 30 and a.level == "4.1":
-            a.level = "4.2"     # 1440x1080p59.94 is 366,833 macroblocks/s, level 4.1 allows 245,760
         # every chunk must start on a whole tape frame (4 film frames = 5 tape frames,
         # 2 fields = 1 tape frame), else the cut repeats or drops part of one
         unit = (fps / a.vhs_fin).numerator
@@ -3635,7 +3651,6 @@ def main():
     audio = [s for s in streams if s["codec_type"] == "audio"]
     subs = [s for s in streams if s["codec_type"] == "subtitle"]
     mp4 = Path(a.output).suffix.lower() in (".mp4", ".m4v")
-    common = {"ac3", "eac3", "aac", "mp3"}      # audio .mp4 players take
     amap, aopts = [], []
     if audio and audio[0]["codec_name"] != "aac":
         # AAC copy of the main track first, as the default: the one audio format every player,
@@ -3653,7 +3668,7 @@ def main():
     if audio:
         aopts += ["-disposition:a", "-default", "-disposition:a:0", "default"]
     for i, s in enumerate(audio):
-        if mp4 and s["codec_name"] not in common:
+        if mp4 and s["codec_name"] not in MP4_AUDIO:
             print(f"Note: audio track {i + 1} ({s['codec_name']}) can't go in .mp4, left out "
                   "(use .mkv to keep it)")
             continue
@@ -3662,8 +3677,7 @@ def main():
         amap += ["-map", f"1:a:{i}"]
     if mp4:
         # .mp4 only takes text subtitles; DVD subtitles are pictures
-        keep = [i for i, s in enumerate(subs)
-                if s["codec_name"] in ("subrip", "ass", "ssa", "mov_text", "webvtt", "text")]
+        keep = [i for i, s in enumerate(subs) if s["codec_name"] in MP4_SUBS]
         if len(keep) < len(subs):
             print("Note: DVD subtitles can't go in .mp4 and were left out (use .mkv to keep them)")
         smap = [x for i in keep for x in ("-map", f"1:s:{i}")]
@@ -3806,6 +3820,17 @@ def queue_test_secs(args):
 
 def queue_read(path):
     base, jobs, outs = path.parent, [], {}
+    claimed = set()                     # work folders a line already continues
+
+    def started_in(folder, args, test):
+        """A run of this line's movie (same --test) was started in that work folder."""
+        try:
+            old = json.loads((base / (folder + ("_test" if test else "")) / "settings.json")
+                             .read_text())
+        except (OSError, ValueError):
+            return False
+        return old.get("input") == str((base / args[0]).resolve()) and old.get("test", 0) == test
+
     for n, line in enumerate(queue_lines(path), 1):
         line = line.strip()
         if not line or line.startswith("#"):
@@ -3820,7 +3845,12 @@ def queue_read(path):
             args.pop(0)          # a whole "python dvd_upscale.py ..." command pasted in
         if args and not args[0].startswith("-") and (len(args) == 1 or args[1].startswith("-")):
             # no output name: the default one, under the queue file's folder
-            h = next((args[k + 1] for k, w in enumerate(args[:-1]) if w == "--height"), "1080")
+            h = "1080"
+            for k, w in enumerate(args):        # (the last one counts, as for argparse)
+                if w.startswith("--height="):
+                    h = w.split("=", 1)[1]
+                elif w == "--height" and k + 1 < len(args):
+                    h = args[k + 1]
             try:
                 out = default_output(base / args[0], base, int(h))
                 if queue_test_secs(args):           # a preview never takes the movie's name
@@ -3847,22 +3877,18 @@ def queue_read(path):
         if key:
             outs[key] = n
         if not any(w == "--work" or w.startswith("--work=") for w in args):
-            o = Path(args[1])
+            o, src = Path(args[1]), Path(args[0])
             work = str(o.with_name(o.stem + "_work"))      # next to the output: one per output
-            # a movie started by hand without --work is in upscale_work (upscale_work_test for
-            # --test runs), and an older version put it in "<output name>_work" next to the
-            # queue file: continue it there instead of starting over
+            # a movie started elsewhere continues there instead of starting over: by hand or
+            # with --all ("<movie name>_work" next to the movie), by hand with an older version
+            # (upscale_work), or by an older queue ("<output name>_work" next to the queue
+            # file). Each folder goes to one line only (two outputs of one movie would clash)
             test = queue_test_secs(args)
-            for older in ("upscale_work", o.stem + "_work"):
-                hand = base / (older + ("_test" if test else "")) / "settings.json"
-                try:
-                    old = json.loads(hand.read_text())
-                    if old.get("input") == str((base / args[0]).resolve()) and \
-                            old.get("test", 0) == test:
-                        work = older
-                        break
-                except (OSError, ValueError):
-                    pass
+            work = next((w for w in (work, str(src.with_name(src.stem + "_work")), "upscale_work",
+                                     o.stem + "_work")
+                         if w not in claimed and started_in(w, args, test)), work)
+            if "--analyze" not in args:
+                claimed.add(work)
             args += ["--work", work]
         jobs.append((n, line, args, None, True))
     return jobs
@@ -4054,13 +4080,19 @@ def check_finished_movie(src, out):
         have = 0
     if not want or have < 0.98 * want:
         return "its video is shorter than the original's"
-    first_audio = next((s.get("codec_name") for s in s_src if s.get("codec_type") == "audio"), None)
-    want_audio = t_src.count("audio") + (1 if first_audio not in (None, "aac") else 0)
+    # the tracks the new file can hold (the rules it was made with: an .mp4 leaves out DVD
+    # subtitles, fonts and audio .mp4 players don't take), plus the AAC copy of the main track
+    mp4 = Path(out).suffix.lower() in (".mp4", ".m4v")
+    a_src = [s.get("codec_name") for s in s_src if s.get("codec_type") == "audio"]
+    want_audio = (sum(1 for c in a_src if not mp4 or c in MP4_AUDIO)
+                  + (1 if a_src and a_src[0] != "aac" else 0))
+    want_subs = sum(1 for s in s_src if s.get("codec_type") == "subtitle"
+                    and s.get("codec_name") in (MP4_SUBS if mp4 else MKV_SUBS))
     if t_out.count("video") < 1 or t_out.count("audio") < want_audio:
         return "it doesn't have all of the original's audio tracks"
-    if t_out.count("subtitle") < t_src.count("subtitle"):
+    if t_out.count("subtitle") < want_subs:
         return "it doesn't have all of the original's subtitles"
-    if t_out.count("attachment") < t_src.count("attachment"):
+    if not mp4 and t_out.count("attachment") < t_src.count("attachment"):
         return "it doesn't have the original's attached fonts"
     # the picture itself, at points through the movie: about as bright as the original's
     # (a black or garbled stretch from a GPU fault fails this)
