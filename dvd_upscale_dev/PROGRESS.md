@@ -52,19 +52,26 @@ The user's changes:
   - GFPGAN 1.4 or CodeFormer as ONNX (CodeFormer also takes the `weight` input, i.e. fidelity);
   - a soft-mask paste back over only the face's part of the frame.
 - Two passes per chunk:
-  1. Detect every frame, link faces into tracks, smooth the landmarks (±2 frames), fill
-     1–2-frame gaps, fade in and out over 4 frames (not where a track touches the chunk's first
-     or last frame), and drop tracks shorter than 5 frames (same exception).
-  2. Restore and blend.
+  1. Detect every frame (YuNet top_k 5000: 50 lost faces in crowds), link faces into tracks,
+     fill 1–2-frame gaps, steady the landmarks with a straight-line fit over ±2 frames (slid
+     inward at an open chunk edge), fade in and out over 4 frames, and drop tracks shorter than
+     5 frames.
+     - A track of 3+ detections that touches the chunk's first or last frame, or misses only
+       that frame (held there if its face box still looks the same: 8x8 average difference
+       under 12), is open there: no fade.
+  2. Restore and blend. The paste is made up for `--ai-blend` (mask × S / ai_blend, at most 1),
+     so S is the face's share of the final picture, at most ai_blend.
 - Size gate by eye distance in source pixels (upscaled eye distance / scale): under 7 skipped,
   7–10 ramps up, over 90 tapers off.
 - How it runs: `--faces [S]` (default 0.6), `--face-model gfpgan|codeformer`, `--face-models DIR`
   (default `face_models` next to the script). Live and VHS only (anime/CGI: a NOTE, turned off;
-  `--fast`: turned off). At the start of `Chunk.finish`, a worker process
+  `--fast` or `--ai-blend 0`: turned off). At the start of `Chunk.finish`, a worker process
   (`dvd_upscale.py --faces-worker ...`) writes the changed frames into `tmp/faces`; once it
-  exits 0 they are moved over `tmp/out`. One worker at a time (`FACE_LOCK`), one retry, killed
-  on Ctrl+C (and at exit; it also stops when the main run's pipe to it closes). A start-up
-  check (`--faces-worker --check`) reports missing packages/models and the provider used.
+  exits 0 they are moved over `tmp/out`. One worker at a time (`FACE_LOCK`), one retry (on the
+  processor, `--cpu`), killed on Ctrl+C (and at exit; it also stops when the main run's pipe to
+  it closes) or after 10 minutes without a frame found or restored. A start-up check
+  (`--faces-worker --check`, 10-minute limit) reports missing, broken or too old packages,
+  missing or damaged model files, and the provider used.
 - `evalfaces.py LAYOUT VARIANT...` (imports dvd_upscale.py) on the `closeup` and `medium` layouts.
   - Variants: `none`, `gfpgan:S`, `codeformer:F:S`.
   - It compares each variant with the real HD face (PSNR, SSIM, sharpness, extra flicker, and
@@ -73,8 +80,9 @@ The user's changes:
   (3 chunks of 20 frames, the bicubic stand-in upscaler); the difference inside and outside the
   face, and at the chunk seams against inside the chunks. `REUSE=1` measures the last runs again.
   - medium, 0.6, CPU: 57 frames both (the source's 60 come out as 57 with or without --faces:
-    the clip is taken for 23.976 fps), face difference 2.16, outside 0.04 at most; extra flicker
-    at the seams 0.15 / 0.03 against a median of 0.16 inside the chunks (no seam pulse).
+    the clip is taken for 23.976 fps), face difference 2.67 (2.16 before the paste was made up
+    for --ai-blend 0.75), outside 0.04 at most; extra flicker at the seams 0.19 / 0.02 against a
+    median of 0.28 inside the chunks (no seam pulse).
 
 ## Downloads
 
