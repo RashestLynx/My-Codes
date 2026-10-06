@@ -51,6 +51,9 @@ VHS captures (--type vhs, normally detected by itself): a capture card's 720x480
   as video, pass --mode telecine. --mode interlaced forces the camcorder handling.
 - Cartoon tapes get the movie-tape settings too: on simulated Dragon Ball Z tapes they kept line
   weight and colours closer than the anime model (which thickened outlines, shifted flat colours).
+- --stabilize steadies a shaky camcorder tape: the camera shake is measured once over the whole
+  video (ffmpeg's vid.stab; on Windows the gyan.dev "full" build has it), then smoothed out with
+  the picture zoomed in 4% (--stabilize strong: 8%) so no moving edges show. Slow pans stay.
 
 Every movie in a folder, one after another:
   python dvd_upscale.py --all                  # all movies in the current folder
@@ -101,7 +104,7 @@ queue.txt has one movie per line, exactly what you'd type after "python dvd_upsc
   close the lid, set the lid action to "Do nothing" for when it's plugged in.
 Progress is logged to queue_log.txt next to the queue file.
 """
-import argparse, json, math, operator, os, re, shutil, signal, statistics, subprocess, sys
+import argparse, json, math, operator, os, re, shutil, signal, statistics, struct, subprocess, sys
 import tempfile
 import threading, time
 from bisect import bisect_right as _bisect
@@ -119,8 +122,8 @@ def nostdin(cmd):
     return cmd[:1] + ["-nostdin"] + cmd[1:] if Path(cmd[0]).stem.lower() == "ffmpeg" else cmd
 
 
-def run(cmd):
-    subprocess.run(nostdin(cmd), check=True, stdin=subprocess.DEVNULL)
+def run(cmd, cwd=None):
+    subprocess.run(nostdin(cmd), check=True, stdin=subprocess.DEVNULL, cwd=cwd)
 
 
 def capture(cmd):
@@ -162,7 +165,7 @@ def short_time(secs):
     return f"{m // 60} h {m % 60} min" if m >= 60 else f"{m} min"
 
 
-def ffmpeg_progress(cmd, secs, label):
+def ffmpeg_progress(cmd, secs, label, cwd=None):
     """Run an ffmpeg command showing label, % done and time left on the progress line; secs is
     the length of what it writes. Returns (exit code, its error output, seconds it took)."""
     cmd = nostdin(cmd)
@@ -170,7 +173,7 @@ def ffmpeg_progress(cmd, secs, label):
     t0 = time.time()
     with tempfile.TemporaryFile() as err:
         p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=err,
-                             encoding="utf-8", errors="replace")
+                             encoding="utf-8", errors="replace", cwd=cwd)
         try:
             for line in p.stdout:
                 key, _, val = line.strip().partition("=")
@@ -191,9 +194,9 @@ def ffmpeg_progress(cmd, secs, label):
     return p.returncode, text, time.time() - t0
 
 
-def run_step(cmd, secs, label):
+def run_step(cmd, secs, label, cwd=None):
     """run() for a long step: progress while it runs, how long it took when done."""
-    rc, text, took = ffmpeg_progress(cmd, secs, label)
+    rc, text, took = ffmpeg_progress(cmd, secs, label, cwd)
     if text.strip():
         print(text.rstrip(), file=sys.stderr, flush=True)
     if rc:
@@ -1054,6 +1057,51 @@ def gap_message(idx, missing, expected):
             "check it with --analyze.")
 
 
+def stab_index(path):
+    """--stabilize: where each frame's record is in the camera-motion file of vidstabdetect, which
+    vid.stab writes as text ("VID.STAB 1", one "Frame N (...)" line a frame: ffmpeg 6.x builds)
+    or binary ("TRF1", a 24-byte header, then a frame: int32 number, int32 count, 26 bytes a
+    measured field: newer builds). Returns (header, [(offset, length)] in frame order, binary)."""
+    recs = []
+    with open(path, "rb") as f:
+        if f.read(3) == b"TRF":
+            f.seek(0)
+            head, pos, size = f.read(24), 24, os.fstat(f.fileno()).st_size
+            while pos + 8 <= size:
+                n = struct.unpack("<ii", f.read(8))[1]
+                end = pos + 8 + 26 * n
+                if n < 0 or end > size:
+                    break                       # (a cut-short last record)
+                recs.append((pos, end - pos))
+                pos = f.seek(end)
+            return head, recs, True
+        f.seek(0)
+        head, pos = b"", 0
+        for line in f:
+            if line.startswith(b"Frame "):
+                if line.endswith(b"\n"):
+                    recs.append((pos, len(line)))
+            elif not recs:
+                head += line
+            pos += len(line)
+    return head, recs, False
+
+
+def write_stab_slice(path, index, first, end, dst):
+    """The records of frames first..end-1 (of the whole video) as a motion file of their own,
+    numbered from 1 again: vidstabtransform takes its file's frame 1 for the first frame it is
+    given, here the first of this chunk's margin frames."""
+    head, recs, binary = index
+    out = [head]
+    with open(path, "rb") as f:
+        for k, (pos, size) in enumerate(recs[first:end], 1):
+            f.seek(pos)
+            rec = f.read(size)
+            out.append(struct.pack("<i", k) + rec[4:] if binary else
+                       b"Frame %d " % k + rec.split(b" ", 2)[2])
+    Path(dst).write_bytes(b"".join(out))
+
+
 class Chunk:
     """One chunk of the movie, in three steps: read its frames out of the source (extract), run
     them through the upscaler (upscale, on the GPU) and encode them into the chunk file
@@ -1061,7 +1109,8 @@ class Chunk:
     chunk are fixed, so extract and finish can then run in other threads: the next chunk's
     frames are read, and the previous chunk encoded, while this one is upscaled."""
 
-    def __init__(self, a, idx, start, length, expected, work, label, last=False, warm=False):
+    def __init__(self, a, idx, start, length, expected, work, label, last=False, warm=False,
+                 stab=None):
         self.a, self.idx, self.expected, self.last, self.label = a, idx, expected, last, label
         self.start, self.length = float(start), float(length)
         # the GPU it is upscaled on, and for a helper GPU its name and where its messages go
@@ -1105,6 +1154,14 @@ class Chunk:
                         "-i", a.chunk_input, "-an", "-sn"]
             a.dvd_trim = 8
         self.pre = prefilter(a)             # (fixed now: it reads this chunk's warm-up trim)
+        # --stabilize: (first, end, margin): this chunk's piece of the camera-motion file,
+        # frames first..end-1 of the whole video: `margin` frames before this chunk, which are
+        # read and cut off again after the stabilizer, and some after it, so the smoothing has
+        # the same frames around each of this chunk's frames as in one run through the video
+        self.stab = stab
+        if stab:
+            self.pre += (f",vidstabtransform=input=stab.trf:{a.stab_tf}"
+                         + (f",trim=start_frame={stab[2]},setpts=PTS-STARTPTS" if stab[2] else ""))
         self.encode = None
 
     def clear_frames(self):
@@ -1137,7 +1194,8 @@ class Chunk:
             rgb = (",scale=flags=bicubic+accurate_rnd+full_chroma_int,format=rgb24"
                    if getattr(self.a, "rgb_interp", False) else "")
             run(["ffmpeg", "-y", "-v", "error", *self.src, "-vf", self.pre + rgb,
-                 "-frames:v", self.expected, "-compression_level", "1", pngs(tmp / "in")])
+                 "-frames:v", self.expected, "-compression_level", "1", pngs(tmp / "in")],
+                cwd=self.write_stab())
             n_in = len(list((tmp / "in").glob("*.png")))
             warning = None
             if 0 < n_in < self.expected and not self.last:
@@ -1231,12 +1289,24 @@ class Chunk:
             self.clear_frames()
             raise
 
+    def write_stab(self):
+        """--stabilize: this chunk's piece of the camera-motion file, in its tmp folder, where
+        its ffmpeg then runs (so the file name in the filter needs no escaping: drive letters,
+        quotes). Returns that folder, or None (no --stabilize)."""
+        if not self.stab:
+            return None
+        self.tmp.mkdir(parents=True, exist_ok=True)
+        write_stab_slice(self.a.stab_file, self.a.stab_index, self.stab[0], self.stab[1],
+                         self.tmp / "stab.trf")
+        return self.tmp
+
     def fast(self):
         """--fast: filters only, straight into the chunk file. Returns the frame count."""
         a = self.a
+        cwd = self.write_stab()
         run(["ffmpeg", "-y", "-v", "error", *self.src,
              "-vf", self.pre + "," + postfilter(a), "-frames:v", self.expected,
-             *encode_args(a), self.part])
+             *encode_args(a), self.part], cwd=cwd)
         try:
             got = count_frames(self.part)
         except subprocess.CalledProcessError:   # encoder got no frames: file is unreadable
@@ -1246,7 +1316,7 @@ class Chunk:
             print(gap_message(self.idx, self.expected - got, self.expected), flush=True)
             run(["ffmpeg", "-y", "-v", "error", *self.src, "-vf", self.pre
                  + ",tpad=stop_mode=clone:stop=-1," + postfilter(a), "-frames:v", self.expected,
-                 *encode_args(a), self.part])
+                 *encode_args(a), self.part], cwd=cwd)
         return got
 
     def finish(self):
@@ -2942,6 +3012,12 @@ def build_parser():
     p.add_argument("--sharpen", type=float, default=None,
                    help="final sharpening amount (default 0.6 anime, 0.3 live, vhs 0.3 movie "
                         "tapes / 0 camcorder tapes)")
+    p.add_argument("--stabilize", nargs="?", const="normal", choices=["normal", "strong"],
+                   default=None,
+                   help="steady a shaky camcorder or home video (VHS tapes, camera clips): the "
+                        "camera shake is measured once, then smoothed out, with the picture "
+                        "zoomed in 4%% so no moving edges show (strong: 8%%, for very shaky "
+                        "video). Not for films, whose camera moves are meant")
     p.add_argument("--fix-combed", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--work", default=None,
                    help='folder for the temporary files (default: "<movie name>_work" next to '
@@ -2977,6 +3053,9 @@ VHS TAPES (captured from a VCR: .mpg, .avi, .mkv ...; always 1440x1080)
                                                                            camcorder tapes 59.94 fps
   python dvd_upscale.py "Tape.mpg" "Tape 1080p.mkv" --type vhs --mode telecine
                                                      a movie tape it took for camcorder video
+  python dvd_upscale.py "Tape.mpg" "Tape 1080p.mkv" --stabilize       steady a shaky camcorder
+                                                                           tape (zooms in 4%;
+                                                                           --stabilize strong: 8%)
   (for camcorder tapes put realesr-general-dn50-x4v3.param/.bin in the upscaler's models folder)
 
 EVERY MOVIE IN A FOLDER
@@ -3368,6 +3447,28 @@ def main():
         trim = pre * fps / a.vhs_fin
         a.vhs_warm = (pre, int(trim)) if trim.denominator == 1 else (0, 0)
 
+    if a.stabilize:
+        if "vidstabtransform" not in capture(["ffmpeg", "-hide_banner", "-filters"])[1]:
+            sys.exit("--stabilize needs an ffmpeg with vid.stab (the vidstabdetect and "
+                     "vidstabtransform filters): on Windows the gyan.dev \"full\" build has "
+                     "them, the \"essentials\" one doesn't")
+        if a.type != "vhs":
+            print("NOTE: --stabilize is meant for camcorder and home videos: a film's camera "
+                  "moves are wanted, and steadying them zooms into the picture")
+        # smoothing over half a second each way (strong: a second), zoomed in just enough that
+        # the largest correction allowed (maxshift) shows no edge; crop=black and a fixed zoom
+        # keep nothing from one frame to the next, so each chunk comes out as one run would
+        secs, zoom, angle = {"normal": (0.5, 4, 0.02), "strong": (1.0, 8, 0.04)}[a.stabilize]
+        mu = max(1, round(secs * float(fps)))
+        width = (a.vhs_sw if a.type == "vhs" else
+                 int(info["h"] * float(Fraction(a.dar)) / 2) * 2 if a.dar else
+                 int(info["w"] * float(info["sar"]) / 2) * 2)
+        a.stab_tf = (f"smoothing={mu}:optalgo=gauss:optzoom=0:zoom={zoom}:crop=black:"
+                     f"interpol=bicubic:maxshift={round(width * zoom / 200)}:maxangle={angle}")
+        # frames read before (and motion taken after) each chunk: more than the smoothing's
+        # reach, in whole multiples of 4 (whole 3:2 cycles, whole tape frames)
+        a.stab_margin = -(-(mu + 2) // 4) * 4
+
     a.gop = round(4 * float(fps))
     old = previous_settings(a)
     if old and not a.cpu and old.get("enc") == " ".join(cpu_args(a)):
@@ -3404,6 +3505,7 @@ def main():
               chunk=a.chunk_frames, fast=a.fast, dar=a.dar, test=a.test, enc=" ".join(a.enc), w=a.out_w,
               denoise=a.denoise, ai_blend=a.ai_blend, smooth=a.smooth, sharpen=a.sharpen,
               **({"rgb": "interp"} if a.rgb_interp else {}),
+              **({"stabilize": a.stab_tf} if a.stabilize else {}),
               # VHS: field order, crop, colour shift, mask, sizes, warm-up (anime/live unchanged)
               **({"vhs": f"{prefilter(a)} warm={a.vhs_warm[0]}:{a.vhs_warm[1]}"}
                  if a.type == "vhs" else {}))
@@ -3467,7 +3569,8 @@ def main():
     # ffmpeg 6.1, up to 12 with a 2026 build), repeating frames at chunk starts and moving the
     # picture against the sound. Chunks are cut from a stream copy of the video in .mkv instead,
     # which seeks exactly; its timeline starts at the source's first video frame.
-    a.chunk_input, cut = a.input, vo
+    # (full paths: a --stabilize chunk's ffmpeg runs in its own folder)
+    a.chunk_input, cut = str(Path(a.input).resolve()), vo
     if Path(a.input).suffix.lower() in MPEG_EXT:
         idx = work / "video_index.mkv"
         if not idx.exists():
@@ -3480,7 +3583,30 @@ def main():
                       tmp], min(vlen, a.test + 10) if a.test else vlen, "copying the video")
             flush_to_disk(tmp)
             replace_file(tmp, idx)
-        a.chunk_input, cut = str(idx), 0.0
+        a.chunk_input, cut = str(idx.resolve()), 0.0
+    if a.stabilize:
+        # the camera motion of the whole video, measured once on the frames the chunks are made
+        # of (the same filters, from the same first frame, without the chunks' warm-up), and kept
+        # in the work folder for a resumed run
+        a.stab_file = work.resolve() / "stab.trf"
+        n_frames = sum(e for *_, e in plan)
+        if not a.stab_file.exists():
+            part = a.stab_file.with_name("stab.part.trf")
+            a.vhs_trim = a.dvd_trim = 0
+            seek0 = max(0.0, cut - eps)
+            print("Measuring the camera shake for --stabilize (once for this movie):", flush=True)
+            run_step(["ffmpeg", "-y", "-v", "error",
+                      *(["-ss", f"{seek0:.6f}"] if seek0 > 0 else []), "-i", a.chunk_input,
+                      "-an", "-sn", "-vf", prefilter(a) + f",vidstabdetect=result={part.name}"
+                      ":shakiness=6:accuracy=15:stepsize=6", "-frames:v", n_frames,
+                      "-f", "null", "-"], float(total), "measuring the camera shake",
+                     cwd=a.stab_file.parent)
+            flush_to_disk(part)
+            replace_file(part, a.stab_file)
+        a.stab_index = stab_index(a.stab_file)
+        if len(a.stab_index[1]) < n_frames - 2:
+            print(f"NOTE: the camera shake was measured on {len(a.stab_index[1])} of {n_frames} "
+                  "frames; the rest is left as it is")
     try:            # set by --all / --queue: which movie this is, and how much video comes after
         queue = json.loads(os.environ.get("DVD_UPSCALE_QUEUE") or "null")
         later = float(queue["later_secs"]) if queue else 0.0
@@ -3528,14 +3654,22 @@ def main():
 
     def make(entry, gpu=devices[0], lane=None):
         i, t, length, expected = entry
+        stab = None
+        if a.stabilize:
+            # start `margin` frames early (read, stabilized and cut off again; see Chunk)
+            first = i * a.chunk_frames          # this chunk's first frame in the whole video
+            margin = min(a.stab_margin, first) // 4 * 4
+            t, length = t - Fraction(margin) / fps, length + Fraction(margin) / fps
+            stab = (first - margin, first + expected + a.stab_margin, margin)
         # (an AVI with B-frames: after the first chunk, which is read without -ss, seek by
         # ffmpeg's late picture times, else each later chunk started 1-2 frames early)
         seek = max(0.0, cut + float(t) + (info["seek_delay"] if t else 0.0) - eps)
         warm = i > 0 and (a.type == "vhs" and t * a.vhs_fin >= a.vhs_warm[0] + 1
                           or a.type != "vhs" and a.mode == "telecine" and not a.pal and t >= 1)
         with make_lock:             # (it sets this chunk's warm-up trim on a, then reads it)
-            job = Chunk(a, i, f"{seek:.6f}", f"{float(length):.6f}", expected, work,
-                        f"chunk {i + 1}/{len(plan)}", last=(i == plan[-1][0]), warm=warm)
+            job = Chunk(a, i, f"{seek:.6f}", f"{float(length):.6f}", expected, work.resolve(),
+                        f"chunk {i + 1}/{len(plan)}", last=(i == plan[-1][0]), warm=warm,
+                        stab=stab)
         job.gpu, job.lane = gpu, lane
         job.make_room = None if lane else stop_helpers
         return job
@@ -4323,7 +4457,7 @@ def check_finished_movie(src, out):
 
 WORK_FILES = re.compile(r"chunk_\d{5}(\.part)?\.mkv|tmp_\d{5}|list\.txt|"
                         r"video_(joined|audio)\.mkv|video_index(\.part)?\.mkv|"
-                        r"(settings|detected)\.json(\.tmp)?|\.lock")
+                        r"(settings|detected)\.json(\.tmp)?|stab(\.part)?\.trf|\.lock")
 
 
 def clean_work_folder(work):
