@@ -5668,16 +5668,22 @@ def clip_main(argv):
     dur = media_duration(src)
     if dur and start >= dur:
         sys.exit(f"The video is only {hms_text(dur)} long: pick an earlier start.")
-    rc = subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-ss", f"{start:.3f}",
+    part = out.with_name(out.stem + ".part.mkv")       # (renamed only once it is complete)
+    # genpts: an .mpg/.vob or .avi cut mid-stream has packets without timestamps, which .mkv
+    # refuses (the cut then failed, or came out a fraction of a second long)
+    rc = subprocess.run(["ffmpeg", "-nostdin", "-y", "-v", "error", "-fflags", "+genpts",
+                         "-ss", f"{start:.3f}",
                          "-i", str(src), "-t", f"{length:.3f}", "-map", "0:v:0",
                          *([] if a.video_only else ["-map", "0:a?"]),
                          # DVD/recorder PCM can't go in .mkv as it is: lossless FLAC instead
                          "-c", "copy", *([] if a.video_only else ["-c:a", "flac"]
                                          if has_dvd_pcm(src) else []),
-                         "-metadata:s", "DURATION-eng=", str(out)],
+                         "-metadata:s", "DURATION-eng=", str(part)],
                         stdin=subprocess.DEVNULL).returncode
-    if rc or not out.exists() or not (media_duration(out) or 0) > 0:
+    if rc or not part.exists() or not (media_duration(part) or 0) > 0:
+        part.unlink(missing_ok=True)
         sys.exit("Couldn't cut the clip (see the ffmpeg error above).")
+    replace_file(part, out)
     print(f"Saved: {out} ({out.stat().st_size / 1e6:.0f} MB)")
     if a.upscale:
         clip_upscale(src, out, extra)
