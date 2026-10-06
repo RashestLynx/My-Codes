@@ -122,8 +122,11 @@ def run_one(name, src, args, run_dir, cwd=None, env_extra=None, outputs=None):
     log = run_dir / "commands.jsonl"
     esrgan = shims(run_dir / "shims", log)
     args = [str(esrgan) if a == "@ESRGAN" else a for a in args]
+    # OMP_NUM_THREADS=1: vid.stab's motion detection (--stabilize) runs on OpenMP threads, and
+    # which of its many local measurements come out as outliers varies with their timing (the
+    # stabilized picture of two runs measured the same: PSNR inf); one thread makes it repeat
     env = dict(os.environ, PATH=str(run_dir / "shims") + os.pathsep + os.environ["PATH"],
-               **(env_extra or {}))
+               OMP_NUM_THREADS="1", **(env_extra or {}))
     t0 = time.time()
     p = subprocess.run([sys.executable, str(SCRIPT), *args], capture_output=True, text=True,
                        env=env, cwd=cwd or run_dir)
