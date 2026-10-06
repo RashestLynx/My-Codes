@@ -730,15 +730,30 @@ def gpu_list(a):
     return str(a.gpu).replace(" ", "").split(",") if a.gpu is not None else [None]
 
 
+def compact_model(a):
+    """the small (SRVGGNetCompact) models: anime and VHS camcorder"""
+    return any(m in a.model for m in ("animevideov3", "general"))
+
+
+AUTO_THREADS = [8]      # frames on the GPU at once without --gpu-threads (lowered, see Chunk)
+
+
+def gpu_threads(a):
+    """frames the GPU upscales at once: the compact models --gpu-threads (default 8, lowered
+    to 6, then 4, by a chunk the upscaler failed on); the big x2plus/x4plus models always 2,
+    as more could run out of GPU memory. Each frame is upscaled on its own: same picture."""
+    if not compact_model(a):
+        return 2
+    return a.gpu_threads if a.gpu_threads is not None else AUTO_THREADS[0]
+
+
 def esrgan_cmd(a, src, dst, size=None, gpu=None):
-    compact = any(m in a.model for m in ("animevideov3", "general"))
+    compact = compact_model(a)
     gpu = gpu if gpu is not None else gpu_list(a)[0]
     # threads to load:upscale:save frames (default 1:2:2): reading and writing the PNGs is CPU
-    # work that otherwise leaves the GPU waiting; the small (compact) models also get 4 frames
-    # on the GPU at once (each frame is upscaled on its own: same result); the big x2plus/x4plus
-    # models stay at 2, as more could run out of GPU memory
+    # work that otherwise leaves the GPU waiting
     cmd = [a.esrgan_path, "-i", src, "-o", dst, "-n", a.model, "-s", a.scale, "-f", "png",
-           "-j", f"2:{(a.gpu_threads or 4) if compact else 2}:4"]
+           "-j", f"2:{gpu_threads(a)}:4"]
     models = models_dir(a)
     if models.is_dir():
         cmd += ["-m", models]
@@ -759,6 +774,20 @@ def esrgan_cmd(a, src, dst, size=None, gpu=None):
 # garbled or missing
 GPU_ERRORS = re.compile(r"vk(QueueSubmit|WaitForFences|AllocateMemory|MapMemory)\w* failed|"
                         r"VK_ERROR_DEVICE_LOST|device lost|(en|de)code image .* failed", re.I)
+
+
+def _read_log_updates(path, offset, pending=""):
+    """Read only bytes appended since the last check, retaining an unfinished log line."""
+    with open(path, "rb") as log:
+        log.seek(offset)
+        data = log.read()
+        offset = log.tell()
+    pending += data.decode("utf-8", "replace")
+    lines = pending.splitlines(keepends=True)
+    pending = ""
+    if lines and not lines[-1].endswith(("\n", "\r")):
+        pending = lines.pop()
+    return offset, pending, lines
 
 
 LANE_STATUS = {}     # what each helper GPU is doing, shown on the main progress line
@@ -804,6 +833,7 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
             # watchdog, counted in 1 s waits rather than clock time so a laptop that slept in
             # between isn't taken for a stall
             last, same, all_there, tick = -1, 0, 0, 0
+            log_offset, pending_log = 0, ""
             while True:
                 n = sum(1 for _ in os.scandir(dst))
                 if n:           # (for the check of two upscalers on one GPU, see main)
@@ -819,8 +849,10 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
                     # a GPU error: the chunk goes back now, not once the upscaler gives up (or
                     # hangs), and the main GPU does it
                     if tick % 5 == 0:
-                        bad = [x for x in log_path.read_bytes().decode("utf-8", "replace")
-                               .splitlines() if GPU_ERRORS.search(x)]
+                        log_offset, pending_log, log_lines = _read_log_updates(
+                            log_path, log_offset, pending_log)
+                        bad = [line for line in (*log_lines, pending_log)
+                               if GPU_ERRORS.search(line)]
                         if bad:
                             raise RuntimeError(f"the upscaler reported errors: "
                                                f"{bad[0].strip()[:100]}")
@@ -1255,8 +1287,16 @@ class Chunk:
                         # taken the memory this one needed: it stops, and this one goes alone
                         if self.make_room:
                             self.make_room("retry")
+                        # fewer frames on the GPU at once need less of its memory (only the
+                        # automatic count: one given with --gpu-threads is kept)
+                        retry_note = ""
+                        if (a.gpu_threads is None and compact_model(a)
+                                and AUTO_THREADS[0] > 4):
+                            AUTO_THREADS[0] -= 2
+                            retry_note = f"lowering the GPU thread count to {AUTO_THREADS[0]} and "
                         status_line()
-                        print(f"  {label}: {str(e).rstrip('.')} - trying this chunk once more.",
+                        print(f"  {label}: {str(e).rstrip('.')} - {retry_note}"
+                              "trying this chunk once more.",
                               flush=True)
                         shutil.rmtree(tmp / "out", ignore_errors=True)
                         (tmp / "out").mkdir()
@@ -2926,9 +2966,14 @@ def default_output(src, base=None, height=1080):
 
 def check_values(a):
     """Option values that would only fail later (after detection, or on every movie of a batch)."""
-    if a.ai_blend is not None and not 0 <= a.ai_blend <= 1:
+    if a.ai_blend is not None and (
+            not math.isfinite(a.ai_blend) or not 0 <= a.ai_blend <= 1):
         sys.exit("--ai-blend must be between 0 and 1")
-    if a.smooth is not None and a.smooth < 0 or a.sharpen is not None and not 0 <= a.sharpen <= 2:
+    invalid_smooth = a.smooth is not None and (
+        not math.isfinite(a.smooth) or a.smooth < 0)
+    invalid_sharpen = a.sharpen is not None and (
+        not math.isfinite(a.sharpen) or not 0 <= a.sharpen <= 2)
+    if invalid_smooth or invalid_sharpen:
         sys.exit("--smooth must be 0 or more, --sharpen between 0 and 2")
     if a.dar and frac(a.dar.replace(":", "/")) <= 0:
         sys.exit(f"Invalid --dar '{a.dar}', use e.g. 16:9 or 4:3")
@@ -2994,8 +3039,9 @@ def build_parser():
     p.add_argument("--tile", default=None, help="tile size if GPU runs out of memory (-t)")
     p.add_argument("--gpu-threads", type=int, default=None,
                    help="frames the GPU upscales at once with the anime and VHS models "
-                        "(default 4; the bigger live-action/CGI model always does 2): more can "
-                        "keep a GPU busier. The picture is the same either way")
+                        "(default 8; the bigger live-action/CGI model always does 2): more can "
+                        "keep a GPU busier. The picture is the same either way. When a chunk "
+                        "fails with the default, it is retried with 6 (then 4 on a later failure)")
     p.add_argument("--gpu-jobs", type=int, default=2,
                    help="upscalers running at once on each GPU (default 2): the second keeps "
                         "the GPU busy while the other starts up, checks its frames or waits for "
@@ -3104,7 +3150,8 @@ USEFUL EXTRAS (add to any command above)
   --fast             no AI: much quicker, ordinary resize
   --cpu              encode without an NVIDIA GPU (slow)
   --tile 128         if the GPU runs out of memory
-  --gpu-threads 6    frames the GPU works on at once (default 4): try 6 or 8 for speed; same picture
+  --gpu-threads 4    frames the GPU works on at once (anime/VHS models; default 8, lowered to
+                     6 then 4 by itself if a chunk fails); same picture either way
   --gpu-jobs 1       one upscaler at a time (default 2: the GPU waits less between chunks;
                      same picture, and it goes back to one by itself if two are slower)
 
@@ -3283,6 +3330,9 @@ def main():
         kind = (a.type if a.type != "vhs" else
                 f"vhs {'movie tape' if a.mode == 'telecine' else 'camcorder tape'}")
         print(f"Upscaler: {a.model} x{a.scale} ({kind} preset)")
+        jobs_note = (f"up to {a.gpu_jobs} upscalers per GPU, a second kept only if faster"
+                     if a.gpu_jobs > 1 else "one upscaler per GPU")
+        print(f"GPU settings: {gpu_threads(a)} frames at once on the GPU; {jobs_note}")
     info = vhs_info if a.type == "vhs" else probe_or_exit(a.input)
     sar_txt = f"{info['sar'].numerator}:{info['sar'].denominator}"
     print(f"Source: {info['w']}x{info['h']}, SAR {sar_txt}, "
