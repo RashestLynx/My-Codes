@@ -5732,9 +5732,11 @@ if __name__ == "__main__":
         except (AttributeError, ValueError):
             pass
     # ffmpeg/ffprobe/the upscaler next to this script work even when the movies are elsewhere
-    # (every ffmpeg call uses the bare name, and --all/--queue run each movie in its folder)
+    # (every ffmpeg call uses the bare name, and --all/--queue run each movie in its folder),
+    # and come first: a folder set up by setup.bat holds everything, and another ffmpeg on the
+    # PATH may be older or lack vid.stab
     _here = str(Path(__file__).resolve().parent)
-    if not shutil.which("ffmpeg") and shutil.which("ffmpeg", path=_here):
+    if any(shutil.which(t, path=_here) for t in ("ffmpeg", "realesrgan-ncnn-vulkan")):
         os.environ["PATH"] = _here + os.pathsep + os.environ.get("PATH", "")
     if sys.argv[1:2] == ["--faces-worker"]:          # (a chunk's face restoration: see Chunk)
         sys.exit(faces_worker_main(sys.argv[2:]))

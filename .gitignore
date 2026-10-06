@@ -1,1 +1,12 @@
 __pycache__/
+# what setup.bat downloads into the folder
+/python/
+/_setup_downloads/
+/ffmpeg.exe
+/ffprobe.exe
+/realesrgan-ncnn-vulkan.exe
+/vcomp140*.dll
+/models/
+/face_models/
+/Movies/
+/realesrgan-x2plus.zip
