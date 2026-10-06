@@ -743,14 +743,13 @@ def compact_model(a):
 
 
 AUTO_THREADS = [8]      # frames on the GPU at once without --gpu-threads (lowered, see Chunk)
+MIN_THREADS = 2         # ...down to this (2: the upscaler's own default, the least memory)
 
 
 def gpu_threads(a):
-    """frames the GPU upscales at once: the compact models --gpu-threads (default 8, lowered
-    to 6, then 4, by a chunk the upscaler failed on); the big x2plus/x4plus models always 2,
-    as more could run out of GPU memory. Each frame is upscaled on its own: same picture."""
-    if not compact_model(a):
-        return 2
+    """frames the GPU upscales at once: --gpu-threads, else 8, lowered to 6, 4, then 2 when a
+    chunk fails (a GPU short of memory: see Chunk.upscale). Each frame is upscaled on its own:
+    the same picture with any count."""
     return a.gpu_threads if a.gpu_threads is not None else AUTO_THREADS[0]
 
 
@@ -1894,7 +1893,9 @@ class Chunk:
                     f"this chunk's upscaled frames and has {free / 1e9:.1f} GB: make room (or "
                     "use --work on another drive)")
             try:
-                for attempt in (1, 2):
+                attempt = 0
+                while True:
+                    attempt += 1
                     try:
                         run_upscaler(a, tmp / "in", tmp / "out", n_in, label, (w, h),
                                      self.gpu, self.lane)
@@ -1906,19 +1907,23 @@ class Chunk:
                         break
                     except (RuntimeError, subprocess.CalledProcessError) as e:
                         # (no second try on a helper GPU: the main GPU redoes its chunk)
-                        if attempt == 2 or self.lane:
+                        if self.lane:
+                            raise
+                        # fewer frames on the GPU at once need less of its memory: 8, 6, 4,
+                        # then 2, one step per failed try, for the rest of the run (only the
+                        # automatic count: one given with --gpu-threads is kept). Tried again
+                        # once in any case, and as long as there is a step left
+                        lower = a.gpu_threads is None and AUTO_THREADS[0] > MIN_THREADS
+                        if attempt >= 2 and not lower:
                             raise
                         # a new upscaler process gets a fresh GPU device (after a driver
                         # reset, say). Another upscaler on the same GPU (--gpu-jobs) may have
                         # taken the memory this one needed: it stops, and this one goes alone
                         if self.make_room:
                             self.make_room("retry")
-                        # fewer frames on the GPU at once need less of its memory (only the
-                        # automatic count: one given with --gpu-threads is kept)
                         retry_note = ""
-                        if (a.gpu_threads is None and compact_model(a)
-                                and AUTO_THREADS[0] > 4):
-                            AUTO_THREADS[0] -= 2
+                        if lower:
+                            AUTO_THREADS[0] = max(MIN_THREADS, AUTO_THREADS[0] - 2)
                             retry_note = f"lowering the GPU thread count to {AUTO_THREADS[0]} and "
                         status_line()
                         print(f"  {label}: {str(e).rstrip('.')} - {retry_note}"
@@ -2050,12 +2055,11 @@ class Chunk:
                                  "this movie fresh" if os.environ.get("DVD_UPSCALE_QUEUE") else
                                  "start that in a new --work folder")
                         # (the GPU's memory only where it runs on the GPU: a run of the same
-                        # command tries the GPU first again; --gpu-threads only changes the
-                        # compact models)
+                        # command tries the GPU first again)
                         gpu_hint = "" if a.face_provider == "CPUExecutionProvider" else (
                             "if the GPU is short of memory: run the same command again with "
-                            "--gpu-jobs 1" + (" and/or --gpu-threads 4" if compact_model(a)
-                                              else "") + "; it keeps the finished chunks. ")
+                            "--gpu-jobs 1 and/or --gpu-threads 2; it keeps the finished "
+                            "chunks. ")
                         raise RuntimeError(
                             f"the face restoration failed twice on {label} ({why}). Its output "
                             "(end):\n  " + "\n  ".join(tail[-20:]) + "\n(" + gpu_hint
@@ -3833,10 +3837,10 @@ def build_parser():
                         "the movie, the others upscale whole chunks alongside it")
     p.add_argument("--tile", default=None, help="tile size if GPU runs out of memory (-t)")
     p.add_argument("--gpu-threads", type=int, default=None,
-                   help="frames the GPU upscales at once with the anime and VHS models "
-                        "(default 8; the bigger live-action/CGI model always does 2): more can "
-                        "keep a GPU busier. The picture is the same either way. When a chunk "
-                        "fails with the default, it is retried with 6 (then 4 on a later failure)")
+                   help="frames the GPU upscales at once (default 8): more can keep a GPU "
+                        "busier, fewer need less GPU memory. The picture is the same either "
+                        "way. When a chunk fails with the default, it is tried again with 6, "
+                        "then 4, then 2 (and the rest of the run keeps the lower count)")
     p.add_argument("--gpu-jobs", type=int, default=2,
                    help="upscalers running at once on each GPU (default 2): the second keeps "
                         "the GPU busy while the other starts up, checks its frames or waits for "
@@ -3966,8 +3970,8 @@ USEFUL EXTRAS (add to any command above)
                      says which
   --cpu              encode without an NVIDIA GPU (slow)
   --tile 128         if the GPU runs out of memory
-  --gpu-threads 4    frames the GPU works on at once (anime/VHS models; default 8, lowered to
-                     6 then 4 by itself if a chunk fails); same picture either way
+  --gpu-threads 4    frames the GPU works on at once (default 8, lowered to 6, 4, then 2 by
+                     itself if a chunk fails); same picture either way
   --gpu-jobs 1       one upscaler at a time (default 2: the GPU waits less between chunks;
                      same picture, and it goes back to one by itself if two are slower)
 
