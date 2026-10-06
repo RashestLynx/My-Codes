@@ -3681,8 +3681,11 @@ def main():
             now = dict(UPSCALER_FRAMES)
             new = {}                # GPU -> frames each of its upscalers made in that second
             for k, (dev, n) in now.items():
-                if k in last and n >= last[k][1]:
-                    new.setdefault(dev, []).append(n - last[k][1])
+                # (one that just appeared made its first frames within that second; a lower
+                # count than before is the same upscaler on its next chunk: skipped once)
+                before = last[k][1] if k in last else 0
+                if n >= before:
+                    new.setdefault(dev, []).append(n - before)
             last = now
             for dev in solo_ready:
                 r = rate.setdefault(dev, {1: [0, 0], 2: [0, 0]})     # frames, seconds
