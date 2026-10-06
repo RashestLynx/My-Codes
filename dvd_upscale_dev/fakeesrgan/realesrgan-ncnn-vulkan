@@ -1,0 +1,13 @@
+#!/usr/bin/env python3
+"""Stand-in for realesrgan-ncnn-vulkan: plain bicubic resize of every PNG in -i into -o."""
+import sys, subprocess, os, time
+args = sys.argv[1:]
+opt = {args[i]: args[i + 1] for i in range(0, len(args) - 1, 2)}
+src, dst, s, gpu = opt["-i"], opt["-o"], int(opt["-s"]), opt.get("-g", "0")
+print(f"[{gpu} FakeGPU {gpu}]  queueC=2[8]  queueG=0[16]  queueT=1[2]", flush=True)
+if os.environ.get("FAKE_SLOW_GPU") == gpu:
+    time.sleep(float(os.environ.get("FAKE_SLOW_SECS", "5")))
+r = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", os.path.join(src, "%06d.png"),
+                    "-vf", f"scale=iw*{s}:ih*{s}:flags=bicubic", "-compression_level", "1",
+                    os.path.join(dst, "%06d.png")])
+sys.exit(r.returncode)

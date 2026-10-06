@@ -1,0 +1,12 @@
+# Only the tools are committed: test media, models, downloads and run output are made by
+# make_test_media.sh (or the tools) and stay local
+*
+!*/
+!.gitignore
+!*.py
+!*.sh
+!*.md
+!realesrgan-ncnn-vulkan
+__pycache__/
+runs/
+dl/
