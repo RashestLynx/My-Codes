@@ -43,33 +43,38 @@ The user's changes:
 - `filtertest.py`: filter-graph checks.
 - `barcode.py`: decodes the frame number from each frame.
 
-## Face recovery (in progress)
+## Face recovery (`--faces`, in dvd_upscale.py)
 
-- `faces_core.py` holds the working code:
+- The face code is in `dvd_upscale.py` itself (`FaceRestorer`, `face_tracks`, `face_plan`,
+  `restore_faces`); `faces_core.py` was its prototype and computes the same frames.
   - YuNet detection (on frames at most 1280 px);
   - 5-landmark alignment to the FFHQ 512 template;
   - GFPGAN 1.4 or CodeFormer as ONNX (CodeFormer also takes the `weight` input, i.e. fidelity);
-  - a soft-mask paste back.
-- Two passes per folder:
+  - a soft-mask paste back over only the face's part of the frame.
+- Two passes per chunk:
   1. Detect every frame, link faces into tracks, smooth the landmarks (±2 frames), fill
-     1–2-frame gaps, fade in and out over 4 frames, and drop tracks shorter than 5 frames.
+     1–2-frame gaps, fade in and out over 4 frames (not where a track touches the chunk's first
+     or last frame), and drop tracks shorter than 5 frames (same exception).
   2. Restore and blend.
-- Size gate by eye distance in the upscaled frame:
-  - under 14 px: skipped;
-  - 14–20 px: ramps up;
-  - over 110 px: tapers off (the model's crop is only 512 px).
-- `evalfaces.py LAYOUT VARIANT...` runs on the `closeup` and `medium` layouts.
+- Size gate by eye distance in source pixels (upscaled eye distance / scale): under 7 skipped,
+  7–10 ramps up, over 90 tapers off.
+- How it runs: `--faces [S]` (default 0.6), `--face-model gfpgan|codeformer`, `--face-models DIR`
+  (default `face_models` next to the script). Live and VHS only (anime/CGI: a NOTE, turned off;
+  `--fast`: turned off). At the start of `Chunk.finish`, a worker process
+  (`dvd_upscale.py --faces-worker ...`) writes the changed frames into `tmp/faces`; once it
+  exits 0 they are moved over `tmp/out`. One worker at a time (`FACE_LOCK`), one retry, killed
+  on Ctrl+C (and at exit; it also stops when the main run's pipe to it closes). A start-up
+  check (`--faces-worker --check`) reports missing packages/models and the provider used.
+- `evalfaces.py LAYOUT VARIANT...` (imports dvd_upscale.py) on the `closeup` and `medium` layouts.
   - Variants: `none`, `gfpgan:S`, `codeformer:F:S`.
   - It compares each variant with the real HD face (PSNR, SSIM, sharpness, extra flicker, and
     SFace identity similarity; 0.36 or more means the same person).
-
-Planned integration:
-- `--faces [strength]`, opt-in, for live and VHS only (cartoons have no real faces);
-- after each chunk's upscale, on `tmp/out`, in a subprocess per chunk so an onnxruntime crash
-  can't take the run down;
-- needs `pip install onnxruntime` (or onnxruntime-directml / -gpu), `opencv-python-headless` and
-  `numpy`, plus the models in a `face_models` folder next to the script;
-- if anything is missing, the run stops with what to install and where to get the models.
+- `facerun.py LAYOUT [S]`: the whole script with and without `--faces` on `faces/LAYOUT/sd.mpg`
+  (3 chunks of 20 frames, the bicubic stand-in upscaler); the difference inside and outside the
+  face, and at the chunk seams against inside the chunks. `REUSE=1` measures the last runs again.
+  - medium, 0.6, CPU: 57 frames both (the source's 60 come out as 57 with or without --faces:
+    the clip is taken for 23.976 fps), face difference 2.16, outside 0.04 at most; extra flicker
+    at the seams 0.15 / 0.03 against a median of 0.16 inside the chunks (no seam pulse).
 
 ## Downloads
 

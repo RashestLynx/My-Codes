@@ -4,12 +4,17 @@ For each variant: copies LAYOUT/up (the 2x upscaled DVD frames) to LAYOUT/v_<var
 then measures in the face box of the real frames (LAYOUT/gt): PSNR, SSIM, sharpness (variance of
 the Laplacian; the real face's value for reference), extra flicker (frame-to-frame change not in
 the real video), identity (SFace cosine similarity to the real face; same person above 0.36)."""
-import os, shutil, sys, time
+import importlib.util, os, shutil, sys, time
 import numpy as np
 import cv2
-import faces_core
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+# the face code of dvd_upscale.py itself (one implementation; faces_core.py was its prototype)
+sys.dont_write_bytecode = True          # (no __pycache__ in the repository's root)
+_spec = importlib.util.spec_from_file_location("dvd_upscale",
+                                               os.path.join(HERE, "..", "dvd_upscale.py"))
+du = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(du)
 DATA = os.path.join(HERE, "faces")             # made by make_test_media.sh
 MODELS = os.path.join(DATA, "face_models")
 layout, variants = sys.argv[1], sys.argv[2:]
@@ -66,7 +71,7 @@ def measure(frames):
 
 ref = measure(gt)
 print(f"[{layout}] real face: sharpness {ref['sharp']:.0f}, eye distance "
-      f"{faces_core.eye_dist(gt_faces[0][4:14].reshape(5, 2)):.0f} px")
+      f"{du.face_eye_dist(gt_faces[0][4:14].reshape(5, 2)):.0f} px")
 for v in variants:
     out = os.path.join(DATA, layout, "v_" + v.replace(":", "_"))
     shutil.rmtree(out, ignore_errors=True)
@@ -74,11 +79,12 @@ for v in variants:
     t0 = time.time()
     if v != "none":
         kind, *nums = v.split(":")
+        # (in place; the "up" frames are 2x upscales of the DVD frames)
         if kind == "gfpgan":
-            n, prov = faces_core.restore_folder(out, MODELS, "gfpgan", float(nums[0]))
+            n, _, prov = du.restore_faces(out, MODELS, "gfpgan", float(nums[0]), scale=2)
         else:
-            n, prov = faces_core.restore_folder(out, MODELS, "codeformer", float(nums[1]),
-                                                float(nums[0]))
+            n, _, prov = du.restore_faces(out, MODELS, "codeformer", float(nums[1]),
+                                          float(nums[0]), scale=2)
     took = time.time() - t0
     frames = [cv2.imread(os.path.join(out, x)) for x in names]
     m = measure(frames)

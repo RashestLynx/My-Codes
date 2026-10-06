@@ -54,6 +54,12 @@ VHS captures (--type vhs, normally detected by itself): a capture card's 720x480
 - --stabilize steadies a shaky camcorder tape: the camera shake is measured once over the whole
   video (ffmpeg's vid.stab; on Windows the gyan.dev "full" build has it), then smoothed out with
   the picture zoomed in 4% (--stabilize strong: 8%) so no moving edges show. Slow pans stay.
+- --faces [strength] restores faces after the upscale (live action and VHS/home video only):
+  GFPGAN 1.4 (or --face-model codeformer, licensed for non-commercial use only) redraws each
+  face it finds, steadied from frame to frame, blended in at 0.6 (or the strength given, up to
+  1). Needs pip install onnxruntime-directml opencv-python-headless numpy (onnxruntime-gpu for
+  NVIDIA with CUDA; plain onnxruntime runs on the processor, very slowly) and the model files in
+  a face_models folder next to this script; the run says what is missing and where to get it.
 
 Every movie in a folder, one after another:
   python dvd_upscale.py --all                  # all movies in the current folder
@@ -105,7 +111,7 @@ queue.txt has one movie per line, exactly what you'd type after "python dvd_upsc
 Progress is logged to queue_log.txt next to the queue file.
 """
 import argparse, json, math, operator, os, re, shutil, signal, statistics, struct, subprocess, sys
-import tempfile
+import atexit, tempfile
 import threading, time
 from bisect import bisect_right as _bisect
 from collections import Counter
@@ -1134,6 +1140,403 @@ def write_stab_slice(path, index, first, end, dst):
     Path(dst).write_bytes(b"".join(out))
 
 
+# ---------------------------------------------------------------------------------------------
+# Face restoration (--faces): GFPGAN 1.4 or CodeFormer (ONNX models) redraws the faces of the
+# upscaled frames, which OpenCV's YuNet detector finds. It runs in a process of its own for each
+# chunk ("python dvd_upscale.py --faces-worker ...", see faces_worker_main), so a crash in
+# onnxruntime or the GPU driver can't take the run down, and its GPU memory is given back after
+# every chunk. numpy, OpenCV and onnxruntime are imported only in there: without --faces nothing
+# extra needs installing.
+
+FACE_STRENGTH = 0.6     # --faces without a number: how much of the restored face is used (0-1)
+FACE_MODEL = "gfpgan"   # --face-model default: gfpgan (GFPGAN 1.4) or codeformer
+FACE_FIDELITY = 0.7     # CodeFormer only: 0 = its own idea of the face, 1 = closest to the frame
+FACE_MODEL_FILES = {"gfpgan": "gfpgan_1.4.onnx", "codeformer": "codeformer.onnx"}
+FACE_MODEL_NAMES = {"gfpgan": "GFPGAN 1.4", "codeformer": "CodeFormer"}
+FACE_DETECTOR = "face_detection_yunet_2023mar.onnx"
+FACE_URLS = {
+    FACE_DETECTOR: "https://media.githubusercontent.com/media/opencv/opencv_zoo/main/models/"
+                   "face_detection_yunet/face_detection_yunet_2023mar.onnx",
+    "gfpgan_1.4.onnx": "https://github.com/facefusion/facefusion-assets/releases/download/"
+                       "models-3.0.0/gfpgan_1.4.onnx",
+    "codeformer.onnx": "https://github.com/facefusion/facefusion-assets/releases/download/"
+                       "models-3.0.0/codeformer.onnx"}
+# the 5-point face layout of the 512x512 crops GFPGAN and CodeFormer were trained on (FFHQ):
+# eye (image left), eye (image right), nose tip, mouth corner (image left), mouth corner (right)
+FACE_TEMPLATE = ((192.98138, 239.94708), (318.90277, 240.1936), (256.63416, 314.01935),
+                 (201.26117, 371.41043), (313.08905, 371.15118))
+FACE_EYES = 125.92      # eye distance in the template
+# eye distance in the source (DVD) frame, in its pixels - what the restorer has to work from:
+# smaller than MIN skipped (too little to go on), full strength from FULL; from TAPER on tapered
+# off, to none at the template's own size (the source has the detail itself)
+FACE_MIN_EYES, FACE_FULL_EYES, FACE_TAPER_EYES = 7, 10, 90
+# one face worker at a time, whichever GPU's chunk it is: two would compete with the upscalers
+# for the GPU's memory
+FACE_LOCK = threading.Lock()
+FACE_PROCS = []         # the face worker running now (killed if this run ends: no orphan)
+
+
+def face_read(path):
+    """A frame as a BGR picture. (cv2.imread can't open a path with letters outside the Windows
+    code page - a movie named "Amélie" - so the bytes are read by numpy and decoded.)"""
+    import numpy as np
+    import cv2
+    img = cv2.imdecode(np.fromfile(str(path), np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        raise RuntimeError(f"can't read the frame {path}")
+    return img
+
+
+def face_write(path, img):
+    """A frame saved as PNG under a temporary name, then renamed: never a half-written frame
+    under the real name. (Encoded in memory and written by numpy: any letters in the path.)"""
+    import cv2
+    ok, buf = cv2.imencode(".png", img, [cv2.IMWRITE_PNG_COMPRESSION, 1])
+    if not ok:
+        raise RuntimeError(f"can't encode the frame {path}")
+    tmp = str(path) + ".tmp"
+    buf.tofile(tmp)
+    os.replace(tmp, str(path))
+
+
+def face_soft_mask(size=512, blur=0.3):
+    """1 inside, falling smoothly to 0 at the crop's edges (the restorer's hair and background
+    stay out)."""
+    import numpy as np
+    import cv2
+    amount = int(size * 0.5 * blur)
+    area = max(amount // 2, 1)
+    m = np.ones((size, size), np.float32)
+    m[:area, :] = m[-area:, :] = m[:, :area] = m[:, -area:] = 0
+    return cv2.GaussianBlur(m, (0, 0), amount * 0.25)
+
+
+class FaceRestorer:
+    """The detector and the restoration model, loaded once for a folder of frames."""
+
+    def __init__(self, models, model=FACE_MODEL, fidelity=FACE_FIDELITY, providers=None):
+        import numpy as np
+        import cv2
+        import onnxruntime as ort
+        avail = ort.get_available_providers()
+        # the GPU if onnxruntime has a way to it (onnxruntime-gpu: CUDA, onnxruntime-directml:
+        # any GPU on Windows), else the processor
+        chosen = [p for p in (providers or ["CUDAExecutionProvider", "DmlExecutionProvider",
+                                            "CPUExecutionProvider"]) if p in avail]
+        opts = ort.SessionOptions()
+        opts.log_severity_level = 3         # (its warnings: the provider used is reported anyway)
+        if "DmlExecutionProvider" in chosen:
+            # DirectML can't run with these on (onnxruntime's documentation)
+            opts.enable_mem_pattern = False
+            opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+        self.sess = ort.InferenceSession(os.path.join(models, FACE_MODEL_FILES[model]), opts,
+                                         providers=chosen or ["CPUExecutionProvider"])
+        self.provider = self.sess.get_providers()[0]
+        self.input = self.sess.get_inputs()[0].name
+        # CodeFormer's second input "weight" is the fidelity: a float64 scalar in this export,
+        # taken as the model declares it
+        self.feed = {}
+        for i in self.sess.get_inputs()[1:]:
+            if i.name == "weight":
+                self.feed["weight"] = np.array(
+                    fidelity, np.float64 if "double" in i.type else np.float32).reshape(
+                    [1] * len(i.shape or []))
+        self.det_path = os.path.join(models, FACE_DETECTOR)
+        self.det = None
+        self.mask = face_soft_mask()
+        self.template = np.array(FACE_TEMPLATE, np.float32)
+
+    def detect(self, img):
+        """[(5x2 landmarks, score)] for the faces in a BGR frame."""
+        import cv2
+        h, w = img.shape[:2]
+        s = min(1.0, 1280 / max(w, h))        # (detection on a frame of at most 1280 px)
+        small = cv2.resize(img, (round(w * s), round(h * s)), interpolation=cv2.INTER_AREA) \
+            if s < 1 else img
+        if self.det is None:
+            self.det = cv2.FaceDetectorYN.create(self.det_path, "",
+                                                 (small.shape[1], small.shape[0]), 0.7, 0.3, 50)
+        self.det.setInputSize((small.shape[1], small.shape[0]))
+        _, faces = self.det.detect(small)
+        if faces is None:
+            return []
+        return [(f[4:14].reshape(5, 2) / s, float(f[14])) for f in faces]
+
+    def restore_crop(self, crop):
+        """A 512x512 aligned face (BGR) through the model."""
+        import numpy as np
+        x = crop[:, :, ::-1].astype(np.float32) / 255.0
+        x = np.ascontiguousarray(((x - 0.5) / 0.5).transpose(2, 0, 1)[None])
+        y = self.sess.run(None, {self.input: x, **self.feed})[0][0]
+        y = (np.clip(y, -1, 1) + 1) / 2
+        return (y.transpose(1, 2, 0) * 255).round().astype(np.uint8)[:, :, ::-1]
+
+    def paste(self, img, pts, strength):
+        """Restore the face at landmarks pts and blend it into img (in place), with a soft mask,
+        over only the face's part of the frame."""
+        import numpy as np
+        import cv2
+        M = cv2.estimateAffinePartial2D(pts.astype(np.float32), self.template,
+                                        method=cv2.LMEDS)[0]
+        if M is None:
+            return
+        crop = cv2.warpAffine(img, M, (512, 512), flags=cv2.INTER_CUBIC,
+                              borderMode=cv2.BORDER_CONSTANT, borderValue=(135, 133, 132))
+        out = self.restore_crop(crop)
+        IM = cv2.invertAffineTransform(M)
+        h, w = img.shape[:2]
+        corners = np.array([[0, 0, 1], [512, 0, 1], [0, 512, 1], [512, 512, 1]],
+                           np.float32) @ IM.T
+        x0, y0 = np.floor(corners.min(0)).astype(int)
+        x1, y1 = np.ceil(corners.max(0)).astype(int)
+        x0, y0, x1, y1 = max(0, x0), max(0, y0), min(w, x1), min(h, y1)
+        if x1 <= x0 or y1 <= y0:
+            return
+        IMs = IM.copy()
+        IMs[:, 2] -= (x0, y0)
+        size = (x1 - x0, y1 - y0)
+        face = cv2.warpAffine(out, IMs, size, flags=cv2.INTER_CUBIC,
+                              borderMode=cv2.BORDER_REPLICATE)
+        m = cv2.warpAffine(self.mask, IMs, size, flags=cv2.INTER_LINEAR)[:, :, None] * strength
+        region = img[y0:y1, x0:x1].astype(np.float32)
+        img[y0:y1, x0:x1] = np.clip(region * (1 - m) + face.astype(np.float32) * m + 0.5,
+                                    0, 255).astype(np.uint8)
+
+
+def face_eye_dist(pts):
+    import numpy as np
+    return float(np.linalg.norm(pts[1] - pts[0]))
+
+
+def face_tracks(dets):
+    """Link per-frame detections into tracks: [[(frame, landmarks)], ...]. A face continues a
+    track when its eye centre is within one eye distance of where the track was 1-2 frames ago."""
+    import numpy as np
+    tracks, live = [], []                     # live: indexes into tracks
+    for f, faces in enumerate(dets):
+        used, still = set(), []
+        for t in live:
+            lf, lp = tracks[t][-1]
+            if f - lf > 2:
+                continue
+            best, bd = None, None
+            for k, (pts, _) in enumerate(faces):
+                if k in used:
+                    continue
+                d = float(np.linalg.norm(pts[:2].mean(0) - lp[:2].mean(0)))
+                if d < face_eye_dist(lp) and (bd is None or d < bd):
+                    best, bd = k, d
+            if best is not None:
+                used.add(best)
+                tracks[t].append((f, faces[best][0]))
+            still.append(t)
+        for k, (pts, _) in enumerate(faces):
+            if k not in used:
+                tracks.append([(f, pts)])
+                still.append(len(tracks) - 1)
+        live = [t for t in still if f - tracks[t][-1][0] <= 2]
+    return tracks
+
+
+def face_plan(dets, n, strength, scale=2, smooth=2, fade=4, min_len=5):
+    """Per frame: [(landmarks, strength)], from steadied tracks (steady alignment = less
+    flicker). scale: the frames' size over the source's. A track that reaches the first or last
+    frame goes on in the next/previous chunk: no fade there, and kept however short (else a
+    pulse at every chunk seam)."""
+    out = [[] for _ in range(n)]
+    for tr in face_tracks(dets):
+        frames = [f for f, _ in tr]
+        open_start, open_end = frames[0] == 0, frames[-1] == n - 1
+        if len(tr) < min_len and not (open_start or open_end):
+            continue                           # a face seen for a moment: likely a false one
+        pts = {f: p for f, p in tr}
+        # fill gaps of a frame or two (a missed detection) by interpolation
+        for f in range(frames[0], frames[-1] + 1):
+            if f not in pts:
+                a = max(g for g in frames if g < f)
+                b = min(g for g in frames if g > f)
+                pts[f] = pts[a] + (pts[b] - pts[a]) * (f - a) / (b - a)
+        for f in range(frames[0], frames[-1] + 1):
+            win = [pts[g] for g in range(f - smooth, f + smooth + 1) if g in pts]
+            p = sum(win) / len(win)
+            d = face_eye_dist(p) / scale
+            if d < FACE_MIN_EYES:
+                continue
+            size = min(1.0, (d - FACE_MIN_EYES) / (FACE_FULL_EYES - FACE_MIN_EYES))
+            size *= 1.0 if d <= FACE_TAPER_EYES else max(
+                0.0, 1 - (d - FACE_TAPER_EYES) / (FACE_EYES - FACE_TAPER_EYES))
+            edge = min(1.0, 1.0 if open_start else (f - frames[0] + 1) / fade,
+                       1.0 if open_end else (frames[-1] - f + 1) / fade)
+            s = strength * size * edge
+            if s > 0.01:
+                out[f].append((p, s))
+    return out
+
+
+def restore_faces(folder, models, model=FACE_MODEL, strength=FACE_STRENGTH,
+                  fidelity=FACE_FIDELITY, scale=2, dest=None, providers=None, progress=None):
+    """Every PNG in folder, in name order (= frame order), with its faces restored. Two passes:
+    find every frame's faces, link them into tracks across frames and steady their landmarks,
+    then restore and blend each face back, fading in and out where a track starts and ends.
+    The frames with faces are written into dest under the same name (dest None: over the
+    originals); the others aren't written at all. progress(step, done, of), step "detect" or
+    "restore". Returns (faces restored, frames changed, the onnxruntime provider used)."""
+    r = FaceRestorer(models, model, fidelity, providers)
+    names = sorted(x for x in os.listdir(folder) if x.endswith(".png"))
+    dets = []
+    for i, name in enumerate(names):
+        dets.append(r.detect(face_read(os.path.join(folder, name))))
+        if progress:
+            progress("detect", i + 1, len(names))
+    todo = face_plan(dets, len(names), strength, scale)
+    faces = changed = 0
+    for i, (name, found) in enumerate(zip(names, todo)):
+        if found:
+            img = face_read(os.path.join(folder, name))
+            for pts, s in found:
+                r.paste(img, pts, s)
+            face_write(os.path.join(dest or folder, name), img)
+            faces, changed = faces + len(found), changed + 1
+        if progress:
+            progress("restore", i + 1, len(names))
+    return faces, changed, r.provider
+
+
+def faces_worker_main(argv):
+    """python dvd_upscale.py --faces-worker ...: the face restoration of one chunk's frames, in
+    a process of its own (started by Chunk.restore_faces, never by hand). It only reads the
+    frames folder and writes into --dest. --check: the packages and model files are there and
+    the models run; prints the provider used. Exit codes: 0 done, 3 a package is missing,
+    4 a model file is missing, 130 stopped (Ctrl+C), anything else a failure."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --faces-worker")
+    p.add_argument("--check", action="store_true")
+    p.add_argument("--frames")
+    p.add_argument("--dest")
+    p.add_argument("--models", required=True)
+    p.add_argument("--model", choices=sorted(FACE_MODEL_FILES), default=FACE_MODEL)
+    p.add_argument("--strength", type=float, default=FACE_STRENGTH)
+    p.add_argument("--fidelity", type=float, default=FACE_FIDELITY)
+    p.add_argument("--scale", type=float, default=2)
+    w = p.parse_args(argv)
+    os.environ.setdefault("OPENCV_LOG_LEVEL", "ERROR")     # (its warnings mean nothing to users)
+    if not w.check:
+        # the main run holds this process's input open: when it ends, however it ends (even
+        # killed), the input closes and this process stops too instead of running on alone
+        def watch_parent():
+            # (os.read, not sys.stdin: a thread still waiting in sys.stdin when this process
+            # exits makes Python abort the exit)
+            try:
+                while os.read(0, 4096):
+                    pass
+            except OSError:
+                pass
+            os._exit(1)
+        threading.Thread(target=watch_parent, daemon=True).start()
+    try:
+        missing = []
+        for module, package in (("numpy", "numpy"), ("cv2", "opencv-python-headless"),
+                                ("onnxruntime", "onnxruntime")):
+            try:
+                __import__(module)
+            except ImportError as e:
+                missing.append(package)
+                print(f"({module}: {e})", flush=True)
+        if missing:
+            print("MISSING-PACKAGES " + " ".join(missing), flush=True)
+            return 3
+        import cv2
+        if not hasattr(cv2, "FaceDetectorYN"):
+            print(f"OLD-OPENCV {cv2.__version__}", flush=True)
+            return 3
+        gone = [f for f in (FACE_DETECTOR, FACE_MODEL_FILES[w.model])
+                if not os.path.isfile(os.path.join(w.models, f))]
+        if gone:
+            print("MISSING-MODELS " + " ".join(gone), flush=True)
+            return 4
+        if w.check:
+            import numpy as np
+            r = FaceRestorer(w.models, w.model, w.fidelity)
+            r.detect(np.full((64, 64, 3), 128, np.uint8))     # both models load and run
+            r.restore_crop(np.full((512, 512, 3), 128, np.uint8))
+            print(f"PROVIDER {r.provider}", flush=True)
+            return 0
+
+        def progress(step, done, of):
+            print(f"{step} {done} {of}", flush=True)
+        faces, changed, provider = restore_faces(w.frames, w.models, w.model, w.strength,
+                                                 w.fidelity, w.scale, w.dest, progress=progress)
+        print(f"DONE {faces} {changed} {provider}", flush=True)
+        return 0
+    except KeyboardInterrupt:
+        return 130
+
+
+def face_models_dir(a):
+    """Where the face model files are: --face-models, else face_models next to this script."""
+    return Path(a.face_models or Path(__file__).resolve().parent / "face_models").resolve()
+
+
+def face_install_hint(gpu_only=False):
+    """What to pip install for --faces on this computer (the GPU version where there is one)."""
+    rest = "" if gpu_only else " opencv-python-headless numpy"
+    if os.name == "nt":
+        return (f"pip install onnxruntime-directml{rest}   (any GPU; with an NVIDIA card and "
+                f"CUDA installed, onnxruntime-gpu instead of onnxruntime-directml)")
+    if shutil.which("nvidia-smi"):
+        return f"pip install onnxruntime-gpu{rest}   (needs CUDA and cuDNN)"
+    return f"pip install onnxruntime{rest}" if not gpu_only else ""
+
+
+def faces_check(a):
+    """--faces, before anything long: the packages and model files are there and the models
+    load (in a worker, as for the chunks). Exits with what to install or download if not;
+    prints what it will use."""
+    models = face_models_dir(a)
+    a.face_models_path = str(models)
+    status_line("  checking the face restoration (loading its models)...")
+    rc, text = capture([sys.executable, str(Path(__file__).resolve()), "--faces-worker",
+                        "--check", "--models", models, "--model", a.face_model,
+                        "--fidelity", FACE_FIDELITY])
+    status_line()
+    lines = [x for x in text.splitlines() if x.strip()]
+    found = dict(x.split(" ", 1) for x in lines if " " in x and x.split(" ", 1)[0].isupper())
+    if rc == 3:
+        old_cv = found.get("OLD-OPENCV")
+        sys.exit("--faces needs a few Python packages" + (
+            f" (this OpenCV, {old_cv}, is too old for its face detector)" if old_cv else
+            f" ({found.get('MISSING-PACKAGES', 'see above')} missing)")
+            + ". Install them with:\n  " + face_install_hint()
+            + "\n(only one onnxruntime package: if another one is installed, "
+              "pip uninstall it first), then run the same command again.")
+    if rc == 4:
+        files = found.get("MISSING-MODELS", "").split()
+        sys.exit(f"--faces needs its model files in '{models}'"
+                 + ("" if a.face_models else " (a face_models folder next to dvd_upscale.py; "
+                    "--face-models DIR for another folder)")
+                 + ". Missing:\n" + "".join(f"  {f}  from  {FACE_URLS.get(f, '?')}\n"
+                                            for f in files)
+                 + "Download them into that folder, then run the same command again.")
+    provider = found.get("PROVIDER")
+    if rc or not provider:
+        sys.exit("--faces: the face restoration couldn't start. Its output (end):\n  "
+                 + "\n  ".join(lines[-15:])
+                 + "\nReinstalling its packages may help:\n  " + face_install_hint())
+    a.face_provider = provider.strip()
+    gpu = a.face_provider != "CPUExecutionProvider"
+    name = FACE_MODEL_NAMES[a.face_model] + (f" (fidelity {FACE_FIDELITY:g})"
+                                             if a.face_model == "codeformer" else "")
+    print(f"Faces: {name} at strength {a.faces:g} on {a.face_provider} "
+          f"({'GPU' if gpu else 'processor'})")
+    if a.face_model == "codeformer":
+        print("  (CodeFormer's licence, S-Lab License 1.0, allows non-commercial use only)")
+    if not gpu:
+        hint = face_install_hint(gpu_only=True)
+        print("NOTE: the face restoration runs on the processor: very slow (seconds per face, "
+              "so a chunk with many faces can take many minutes)."
+              + (f" For the GPU: pip uninstall onnxruntime, then {hint}" if hint else
+                 " There is no GPU version of onnxruntime set up for this computer."))
+
+
 class Chunk:
     """One chunk of the movie, in three steps: read its frames out of the source (extract), run
     them through the upscaler (upscale, on the GPU) and encode them into the chunk file
@@ -1195,11 +1598,14 @@ class Chunk:
             self.pre += (f",vidstabtransform=input=stab.trf:{a.stab_tf}"
                          + (f",trim=start_frame={stab[2]},setpts=PTS-STARTPTS" if stab[2] else ""))
         self.encode = None
+        # --faces: what finish is doing while the main GPU waits for it (None: not restoring
+        # faces), and the face restoration's time on the first chunk, shown once
+        self.stage = self.face_msg = None
 
     def clear_frames(self):
         # GBs of frames that a retry makes again anyway: don't leave them filling the drive
         # (upscaler_log.txt stays, for a look at what went wrong)
-        for d in ("in", "out"):
+        for d in ("in", "out", "faces"):
             shutil.rmtree(self.tmp / d, ignore_errors=True)
 
     def no_video(self):
@@ -1246,7 +1652,8 @@ class Chunk:
         try:
             w, h = png_size(tmp / "in" / "000001.png")
             frames = n_in * w * h * a.scale ** 2 * 1.8      # measured ~1.7 bytes a pixel
-            need = frames + 1e9
+            # (--faces: the frames with faces are written once more, next to them)
+            need = frames * (2 if a.faces else 1) + 1e9
             # a helper GPU (--gpu 0,1) also leaves room for the main GPU's next chunk
             want = need + frames if self.lane else need
             while True:
@@ -1360,9 +1767,12 @@ class Chunk:
         return got
 
     def finish(self):
-        """Encode (unless --fast did already) and keep the chunk. Returns (path, warning)."""
+        """Restore the faces (--faces), encode (unless --fast did already) and keep the chunk.
+        Returns (path, warning)."""
         if self.encode:
             try:
+                if self.a.faces:
+                    self.restore_faces()
                 run(self.encode)
             except BaseException:
                 self.clear_frames()
@@ -1376,23 +1786,152 @@ class Chunk:
                           if n != self.expected and not self.last else None)
 
 
+    def stopping(self):
+        """The run is stopping (Ctrl+C, a failure), or for a helper GPU, it is to stop."""
+        return self.a.stopping.is_set() or bool(self.lane) and lane_stopped(self.a, self.lane)
+
+    def restore_faces(self):
+        """--faces: the faces of the upscaled frames restored by a worker process (see
+        faces_worker_main), one at a time over all GPUs (FACE_LOCK). The worker only writes the
+        frames it changed, into tmp/faces; once it has finished they are moved over the ones in
+        tmp/out. So a worker that crashes leaves tmp/out as the upscaler wrote it, and a retry
+        never restores a frame twice. One retry with a fresh process (not on a helper GPU,
+        whose chunk the main GPU redoes), then the run stops: it resumes with this chunk."""
+        a, tmp, label = self.a, self.tmp, self.label
+        dest, key = tmp / "faces", self.lane or "faces"
+        self.stage = "waiting to restore the faces"
+        try:
+            while not FACE_LOCK.acquire(timeout=1):
+                if self.stopping():
+                    raise RuntimeError("stopped")
+            try:
+                self.stage = "starting the face restoration"
+                t0 = time.time()
+                for attempt in (1, 2):
+                    shutil.rmtree(dest, ignore_errors=True)
+                    dest.mkdir()
+                    rc, lines = self.face_worker(dest, key)
+                    done = [x.split() for x in lines if x.startswith("DONE ")]
+                    if rc == 0 and done:
+                        break
+                    if self.stopping() or rc in STOPPED or rc == -signal.SIGINT:
+                        raise RuntimeError("stopped")
+                    why = f"exit code {rc}" if rc else "it didn't report its result"
+                    tail = [x.strip() for x in lines
+                            if x.strip() and not re.match(r"(detect|restore) \d+ \d+$", x)]
+                    if self.lane:
+                        raise RuntimeError(f"the face restoration failed ({why}"
+                                           + (f": {tail[-1][:100]}" if tail else "") + ")")
+                    if attempt == 2:
+                        raise RuntimeError(
+                            f"the face restoration failed twice on {label} ({why}). Its output "
+                            "(end):\n  " + "\n  ".join(tail[-20:]) + "\n(--faces can be left "
+                            "out to upscale without it: start that in a new --work folder)")
+                    status_line()
+                    print(f"  {label}: the face restoration failed ({why}) - trying it once "
+                          "more.", flush=True)
+                took = time.time() - t0
+                if not getattr(a, "face_time_shown", False):
+                    a.face_time_shown = True
+                    _, faces, changed, provider = done[-1][:4]
+                    self.face_msg = (
+                        f"  Faces: {short_time(took)} for {label} ({faces} faces in {changed} "
+                        f"of its frames, on {provider}). This runs while the next chunk is "
+                        "upscaled, and slows the movie down only where it takes longer.")
+                    if self.note:           # (a helper GPU's messages go to the main one)
+                        self.note(self.face_msg)
+                        self.face_msg = None
+            finally:
+                FACE_LOCK.release()
+            for f in sorted(dest.glob("*.png")):
+                replace_file(f, tmp / "out" / f.name)
+            shutil.rmtree(dest, ignore_errors=True)
+        finally:
+            if not self.lane:
+                LANE_STATUS.pop(key, None)
+        self.stage = "encoding"
+
+    def face_worker(self, dest, key):
+        """One run of the face worker on this chunk's frames, its progress shown (main GPU: on
+        the progress line and while the main GPU waits for it; a helper GPU: as its status).
+        Killed if the run stops. Returns (exit code, its output lines)."""
+        a, tmp = self.a, self.tmp
+        log_path = tmp / "faces_log.txt"
+        cmd = [sys.executable, str(Path(__file__).resolve()), "--faces-worker",
+               "--frames", str(tmp / "out"), "--dest", str(dest), "--models", a.face_models_path,
+               "--model", a.face_model, "--strength", repr(float(a.faces)),
+               "--fidelity", repr(float(FACE_FIDELITY)), "--scale", str(a.scale)]
+        steps = {"detect": "finding the faces", "restore": "restoring the faces"}
+        with open(log_path, "wb") as log:
+            # (its input is a pipe this run holds open: see watch_parent)
+            p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=log, stderr=subprocess.STDOUT,
+                                 env=dict(os.environ, PYTHONUNBUFFERED="1"))
+            FACE_PROCS.append(p)
+            try:
+                offset, pending = 0, ""
+                while True:
+                    try:
+                        p.wait(timeout=1)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    if self.stopping():
+                        raise RuntimeError("stopped")
+                    offset, pending, lines = _read_log_updates(log_path, offset, pending)
+                    for line in lines:
+                        m = re.match(r"(detect|restore) (\d+) (\d+)$", line.strip())
+                        if m:
+                            self.stage = f"{steps[m[1]]}, frame {m[2]} of {m[3]}"
+                            LANE_STATUS[key] = (f"{self.lane}: {self.label} faces {m[2]}/{m[3]}"
+                                                if self.lane else
+                                                f"faces of {self.label}: {m[2]}/{m[3]}")
+            finally:
+                if p.poll() is None:        # stopping, or an error here: don't leave it running
+                    p.kill()
+                    p.wait()
+                FACE_PROCS.remove(p)
+                try:
+                    p.stdin.close()
+                except OSError:
+                    pass
+        return p.returncode, log_path.read_bytes().decode("utf-8", "replace").splitlines()
+
+
+def stop_face_workers():
+    """At exit: a face worker still running (its chunk's thread didn't get to stop it) is
+    stopped, never left running on its own."""
+    for p in list(FACE_PROCS):
+        try:
+            p.kill()
+        except OSError:
+            pass
+
+
+atexit.register(stop_face_workers)
+
+
 class Background:
     """One step running in another thread; wait() hands back its result or raises its error."""
 
     def __init__(self, fn):
-        self.box = {}
+        self.box, self.done = {}, threading.Event()
 
         def work_():
             try:
                 self.box["result"] = fn()
             except BaseException as e:
                 self.box["error"] = e
+            finally:
+                self.done.set()
         self.thread = threading.Thread(target=work_, daemon=True)
         self.thread.start()
 
     def wait(self):
-        while self.thread.is_alive():
-            self.thread.join(0.5)       # (a timeout keeps Ctrl+C working while it waits)
+        # (a timeout keeps Ctrl+C working while it waits. An Event, not thread.join(): a join
+        # that Ctrl+C interrupts leaves the thread looking ended while it still runs - Python
+        # 3.11 - and the wait after Ctrl+C then let the run exit before the step had stopped)
+        while not self.done.wait(0.5):
+            pass
         if "error" in self.box:
             raise self.box["error"]
         return self.box.get("result")
@@ -2989,6 +3528,8 @@ def check_values(a):
         sys.exit("--gpu-threads must be between 1 and 16")
     if not 1 <= a.gpu_jobs <= 4:
         sys.exit("--gpu-jobs must be between 1 and 4")
+    if a.faces is not None and (not math.isfinite(a.faces) or not 0 < a.faces <= 1):
+        sys.exit("--faces must be more than 0 and at most 1 (e.g. --faces 0.6)")
 
 
 def build_parser():
@@ -3064,6 +3605,22 @@ def build_parser():
                         "camera shake is measured once, then smoothed out, with the picture "
                         "zoomed in 4%% so no moving edges show (strong: 8%%, for very shaky "
                         "video). Not for films, whose camera moves are meant")
+    p.add_argument("--faces", nargs="?", type=float, const=FACE_STRENGTH, default=None,
+                   metavar="STRENGTH",
+                   help="restore faces after the upscale (GFPGAN or CodeFormer redraws each "
+                        "face with real detail: eyes, teeth, skin), for live action and home "
+                        f"video; not used for anime or 3D animation. STRENGTH 0-1 (default "
+                        f"{FACE_STRENGTH:g}): how much of the redrawn face is used. Needs "
+                        "pip install onnxruntime-directml (Windows; onnxruntime-gpu for NVIDIA "
+                        "with CUDA) opencv-python-headless numpy, and its model files in a "
+                        "face_models folder next to this script (the run says where to get them)")
+    p.add_argument("--face-model", choices=sorted(FACE_MODEL_FILES), default=FACE_MODEL,
+                   help=f"--faces: gfpgan (GFPGAN 1.4, the default) or codeformer (CodeFormer, "
+                        f"fidelity {FACE_FIDELITY:g}; its licence, S-Lab 1.0, allows "
+                        "non-commercial use only)")
+    p.add_argument("--face-models", default=None, metavar="DIR",
+                   help="--faces: the folder with its model files (default: face_models next "
+                        "to this script)")
     p.add_argument("--fix-combed", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--work", default=None,
                    help='folder for the temporary files (default: "<movie name>_work" next to '
@@ -3148,6 +3705,8 @@ USEFUL EXTRAS (add to any command above)
   --dar 16:9         fix a squeezed/stretched picture (or --dar 4:3)
   --ai-blend 0.5     gentler AI (less "painted" look; default 0.75 live, 1 anime)
   --fast             no AI: much quicker, ordinary resize
+  --faces            restore faces (live action and home video; --faces 0.8 for more, 1 = all);
+                     needs extra installs and model files: the run says which
   --cpu              encode without an NVIDIA GPU (slow)
   --tile 128         if the GPU runs out of memory
   --gpu-threads 4    frames the GPU works on at once (anime/VHS models; default 8, lowered to
@@ -3333,6 +3892,15 @@ def main():
         jobs_note = (f"up to {a.gpu_jobs} upscalers per GPU, a second kept only if faster"
                      if a.gpu_jobs > 1 else "one upscaler per GPU")
         print(f"GPU settings: {gpu_threads(a)} frames at once on the GPU; {jobs_note}")
+    if a.faces is not None and (a.fast or a.type in ("anime", "cgi")):
+        # (--all --faces on a folder of all kinds of movies: only the live-action ones and tapes
+        # get it)
+        if not a.analyze:
+            print("NOTE: --faces isn't used " + (
+                "with --fast (it works on the AI-upscaled frames)" if a.fast else
+                f"for {TYPE_NAMES[a.type]}: it would turn drawn or 3D-animated faces into "
+                "photographic ones"))
+        a.faces = None
     info = vhs_info if a.type == "vhs" else probe_or_exit(a.input)
     sar_txt = f"{info['sar'].numerator}:{info['sar'].denominator}"
     print(f"Source: {info['w']}x{info['h']}, SAR {sar_txt}, "
@@ -3448,6 +4016,8 @@ def main():
             Path(report).write_text(json.dumps(dict(type=a.type, mode=a.mode,
                                                     combed=bool(getattr(a, "combed", False)))))
         return
+    if a.faces:
+        faces_check(a)          # (exits with what to install or download if something's missing)
 
     if a.fps is None and a.type == "vhs":
         if a.mode == "telecine":
@@ -3556,6 +4126,10 @@ def main():
               denoise=a.denoise, ai_blend=a.ai_blend, smooth=a.smooth, sharpen=a.sharpen,
               **({"rgb": "interp"} if a.rgb_interp else {}),
               **({"stabilize": a.stab_tf} if a.stabilize else {}),
+              # (CodeFormer's fidelity: GFPGAN has none)
+              **({"faces": f"{a.face_model} {a.faces:g}" + (
+                  f" {FACE_FIDELITY:g}" if a.face_model == "codeformer" else "")}
+                 if a.faces else {}),
               # VHS: field order, crop, colour shift, mask, sizes, warm-up (anime/live unchanged)
               **({"vhs": f"{prefilter(a)} warm={a.vhs_warm[0]}:{a.vhs_warm[1]}"}
                  if a.type == "vhs" else {}))
@@ -3570,7 +4144,9 @@ def main():
             (old.get("size"), old.get("mtime")) == (fp["size"], fp["mtime"]):
         old["input"] = fp["input"]          # the same file, moved (or another drive letter)
     if old is not None and old != fp:
-        changed = [k for k in fp if old.get(k) != fp[k]]
+        # (both ways: a setting only the first run had, such as --stabilize, counts too)
+        changed = [k for k in [*fp, *(k for k in old if k not in fp)]
+                   if old.get(k) != fp.get(k)]
 
         def codec(enc):
             w = str(enc).split()
@@ -3590,6 +4166,13 @@ def main():
         if "mode" in changed and old.get("mode") in ("telecine", "interlaced", "progressive") \
                 and not queue:
             hint += f" (to continue it as it was started, add --mode {old['mode']})"
+        if "faces" in changed:
+            was_faces = str(old.get("faces") or "").split()
+            hint += (" (it was started without --faces)" if not was_faces else
+                     f" (it was started with --faces {was_faces[1]}"
+                     + (f" --face-model {was_faces[0]}" if was_faces[0] != FACE_MODEL else "")
+                     + (f" and CodeFormer fidelity {was_faces[2]}" if len(was_faces) > 2
+                        and float(was_faces[2]) != FACE_FIDELITY else "") + ")")
         sys.exit(f"Settings or input changed since the last run in '{work}': "
                  f"{', '.join(changed)}{hint}. "
                  + (f"Delete the folder '{work.resolve()}' to start this movie fresh." if queue
@@ -3688,6 +4271,7 @@ def main():
     lock, make_lock = threading.Lock(), threading.Lock()
     devices = gpu_list(a)
     a.stop_lanes = threading.Event()
+    a.stopping = threading.Event()          # the movie stops (Ctrl+C, a failure): see below
     a.cancel_lanes = set()                  # helpers whose chunk the main GPU took back
     main_secs, skipped, shown = [], set(), [0]  # main GPU's upscale times; chunks with no video
     progress = {"chunks": 0, "video": 0.0, "helped": 0, "frames": 0}
@@ -3826,11 +4410,16 @@ def main():
         nonlocal encoding
         if encoding:
             bg, job = encoding
-            encoding = None
+            while a.faces and not bg.done.wait(0.5):      # --faces: show what it is doing
+                if job.stage:
+                    status_line(f"  {job.label}: {job.stage}")
+            # (cleared only once it has ended: stopped meanwhile, it is waited for, see below)
             chunks[job.idx], warning = bg.wait()
-            if warning:
-                status_line()
-                print(warning, flush=True)
+            encoding = None
+            for msg in (job.face_msg, warning):
+                if msg:
+                    status_line()
+                    print(msg, flush=True)
 
     def show_notes():
         while notes:
@@ -3895,6 +4484,7 @@ def main():
             and threading.current_thread() is threading.main_thread():
         def ctrl_c(sig, frame):
             a.stop_lanes.set()      # the other GPUs stop now, before they start anything new
+            a.stopping.set()
             raise KeyboardInterrupt
         signal.signal(signal.SIGINT, ctrl_c)
     if count[devices[0]] > 1:
@@ -3986,8 +4576,10 @@ def main():
                 f"({progress['frames'] / took:.1f} frames/s)")
     except BaseException:
         # stopped (Ctrl+C) or failed: let the steps already running in the background end
-        # first, so nothing is left writing on its own (a finished encode keeps its chunk)
+        # first, so nothing is left writing on its own (a finished encode keeps its chunk; a
+        # face restoration is stopped, and its chunk made again next time)
         a.stop_lanes.set()
+        a.stopping.set()
         for bg in [x[0] for x in (encoding, reading) if x] + helpers:
             try:
                 bg.wait()
@@ -4156,7 +4748,7 @@ VALUE_OPTS = ("--type", "--mode", "--model", "--scale", "--height", "--dar", "--
               "--chunk-frames", "--test", "--esrgan", "--gpu", "--tile", "--gpu-threads",
               "--gpu-jobs",
               "--ai-blend", "--smooth",
-              "--sharpen", "--work", "--chroma-delay", "--mask")
+              "--sharpen", "--work", "--chroma-delay", "--mask", "--face-model", "--face-models")
 STOPPED = (130, 3221225786)     # a run stopped by Ctrl+C; Windows "terminated by Ctrl+C"
 VIDEO_EXT = (".mkv", ".mp4", ".m4v")
 # one word: a 'single-quoted' word ('' = one apostrophe, PowerShell style), or text in which
@@ -4874,6 +5466,8 @@ if __name__ == "__main__":
     _here = str(Path(__file__).resolve().parent)
     if not shutil.which("ffmpeg") and shutil.which("ffmpeg", path=_here):
         os.environ["PATH"] = _here + os.pathsep + os.environ.get("PATH", "")
+    if sys.argv[1:2] == ["--faces-worker"]:          # (a chunk's face restoration: see Chunk)
+        sys.exit(faces_worker_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--clip"]:
         try:
             clip_main(sys.argv[2:])
