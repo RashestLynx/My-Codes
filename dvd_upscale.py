@@ -59,7 +59,7 @@ VHS captures (--type vhs, normally detected by itself): a capture card's 720x480
   face it finds, steadied from frame to frame, as 0.6 of the final picture's face (or the
   strength given, up to the AI frames' share, --ai-blend: 0.75 for live and VHS). Needs pip
   install -U onnxruntime-directml opencv-python-headless numpy (onnxruntime-gpu for NVIDIA with
-  CUDA; plain onnxruntime runs on the processor, very slowly) and the model files in a
+  CUDA and cuDNN; plain onnxruntime runs on the processor, very slowly) and the model files in a
   face_models folder next to this script; the run says what is missing and where to get it.
 
 Every movie in a folder, one after another:
@@ -1268,7 +1268,8 @@ class FaceRestorer:
                 self.det = cv2.FaceDetectorYN.create(
                     "onnx", np.fromfile(self.det_path, np.uint8), np.empty(0, np.uint8), size,
                     0.7, 0.3, 5000)
-            except cv2.error:       # OpenCV 4.8 has only the path form
+            except (cv2.error, TypeError):  # OpenCV 4.8 has only the path form (its
+                # Python binding then refuses the arguments with a TypeError)
                 self.det = cv2.FaceDetectorYN.create(self.det_path, "", size, 0.7, 0.3, 5000)
         self.det.setInputSize(size)
         _, faces = self.det.detect(small)
@@ -1424,8 +1425,8 @@ def restore_faces(folder, models, model=FACE_MODEL, strength=FACE_STRENGTH,
     then restore and blend each face back, fading in and out where a track starts and ends.
     The frames with faces are written into dest under the same name (dest None: over the
     originals); the others aren't written at all. progress(step, done, of), step "detect" or
-    "restore". ai_blend: see FaceRestorer.paste. Returns (faces restored, frames changed, the
-    onnxruntime provider used)."""
+    "restore" (also after each face). ai_blend: see FaceRestorer.paste. Returns (faces
+    restored, frames changed, the onnxruntime provider used)."""
     import numpy as np
     import cv2
     r = FaceRestorer(models, model, fidelity, providers)
@@ -1459,6 +1460,10 @@ def restore_faces(folder, models, model=FACE_MODEL, strength=FACE_STRENGTH,
             img = face_read(os.path.join(folder, name))
             for pts, s in found:
                 r.paste(img, pts, s, ai_blend)
+                # after each face too (the frames done so far): a frame with a crowd can take
+                # many minutes on the processor, which mustn't be taken for a hang
+                if progress:
+                    progress("restore", i, len(names))
             face_write(os.path.join(dest or folder, name), img)
             faces, changed = faces + len(found), changed + 1
         if progress:
@@ -1526,13 +1531,21 @@ def faces_worker_main(argv):
             try:
                 __import__(module)
             except ImportError as e:
-                # missing only if the module itself isn't there: installed but failing to load
-                # (built for another numpy, a DLL missing, ...) is another matter
-                if isinstance(e, ModuleNotFoundError) and e.name == module:
+                # missing only if the module itself isn't there and pip doesn't list it either:
+                # installed but failing to load (built for another numpy, a DLL missing, its
+                # files deleted, ...) is another matter
+                if isinstance(e, ModuleNotFoundError) and e.name == module \
+                        and not face_dists(*dists):
                     missing.append(package)
                 else:
                     broken += face_dists(*dists) or [package]
                 print(f"({module}: {e})", flush=True)
+                continue
+            if getattr(sys.modules[module], "__file__", None) is None:
+                # only its folder is left (another package that shared it was uninstalled):
+                # Python takes a bare folder for a module, which then has nothing in it
+                print(f"({module}: its files are missing)", flush=True)
+                broken += face_dists(*dists) or [package]
         if missing:
             print("MISSING-PACKAGES " + " ".join(missing), flush=True)
         if broken:
@@ -1550,6 +1563,13 @@ def faces_worker_main(argv):
         if gone:
             print("MISSING-MODELS " + " ".join(gone), flush=True)
             return 4
+        # an empty or nearly empty file is a download that failed (every model is far bigger;
+        # onnxruntime and OpenCV report one in words that don't say so)
+        bad = [f for f in (FACE_DETECTOR, FACE_MODEL_FILES[w.model])
+               if os.path.getsize(os.path.join(w.models, f)) < 1024]
+        if bad:
+            print("(empty or nearly empty)\nBAD-MODEL " + " ".join(bad), flush=True)
+            return 5
         if w.check:
             import numpy as np
             import onnxruntime as ort
@@ -1559,14 +1579,15 @@ def faces_worker_main(argv):
                 r = FaceRestorer(w.models, w.model, w.fidelity)
             except Exception as e:
                 if type(e).__name__ not in ("InvalidProtobuf", "NoSuchFile", "InvalidGraph") \
-                        and "Protobuf parsing failed" not in str(e):
+                        and "Protobuf parsing failed" not in str(e) \
+                        and "does not have a graph" not in str(e):
                     raise
                 print(f"({e})\nBAD-MODEL {FACE_MODEL_FILES[w.model]}", flush=True)
                 return 5
             try:
                 r.detect(np.full((64, 64, 3), 128, np.uint8))
             except cv2.error as e:
-                if "parse" not in str(e).lower():
+                if "parse" not in str(e).lower() and "has_graph" not in str(e):
                     raise
                 print(f"({e})\nBAD-MODEL {FACE_DETECTOR}", flush=True)
                 return 5
@@ -1593,15 +1614,49 @@ def face_models_dir(a):
     return Path(a.face_models or Path(__file__).resolve().parent / "face_models").resolve()
 
 
-def face_install_hint(gpu_only=False):
-    """What to pip install for --faces on this computer (the GPU version where there is one)."""
-    rest = "" if gpu_only else " opencv-python-headless numpy"
+def pip_cmd():
+    """pip for the Python running this script, where the face worker looks for its packages:
+    "python -m pip" when that is the python on the PATH, else this Python's own path (a plain
+    "pip" can belong to another Python, or not be there at all)."""
+    exe = sys.executable
+    on_path = shutil.which("python")
+    # (the paths compared as they are: a venv's python is a link to the system one, which
+    # mustn't count as the same Python)
+    if on_path and os.path.normcase(os.path.abspath(on_path)) == \
+            os.path.normcase(os.path.abspath(exe)):
+        return "python -m pip"
+    if " " not in exe:
+        return f"{exe} -m pip"
+    if os.name == "nt" and sys.prefix == sys.base_prefix:
+        # (the py launcher: no quotes, which PowerShell would need an & in front of)
+        return f"py -{sys.version_info[0]}.{sys.version_info[1]} -m pip"
+    return f'"{exe}" -m pip'
+
+
+def face_install_hint(pkgs=("onnxruntime", "opencv-python-headless", "numpy"), gpu_only=False):
+    """The pip command that installs these packages for --faces on this computer, onnxruntime
+    as its GPU version where there is one (gpu_only: "" where there is none)."""
+    rest = "".join(" " + p for p in pkgs if p != "onnxruntime")
+    if "onnxruntime" not in pkgs:
+        return f"{pip_cmd()} install -U{rest}"
     if os.name == "nt":
-        return (f"pip install -U onnxruntime-directml{rest}   (any GPU; with an NVIDIA card and "
-                f"CUDA installed, onnxruntime-gpu instead of onnxruntime-directml)")
+        return (f"{pip_cmd()} install -U onnxruntime-directml{rest}   (any GPU; with an NVIDIA "
+                "card and CUDA and cuDNN installed, onnxruntime-gpu instead of "
+                "onnxruntime-directml)")
     if shutil.which("nvidia-smi"):
-        return f"pip install -U onnxruntime-gpu{rest}   (needs CUDA and cuDNN)"
-    return f"pip install -U onnxruntime{rest}" if not gpu_only else ""
+        return f"{pip_cmd()} install -U onnxruntime-gpu{rest}   (needs CUDA and cuDNN)"
+    return f"{pip_cmd()} install -U onnxruntime{rest}" if not gpu_only else ""
+
+
+def face_reinstall_hint():
+    """The pip command that reinstalls the --faces packages installed here: for files damaged
+    or deleted under a package pip still lists (pip install -U alone does nothing then)."""
+    ort = face_dists(*ORT_DISTS)
+    if len(ort) > 1:        # (they share one folder and break each other)
+        return f"{pip_cmd()} uninstall {' '.join(ort)}, then {face_install_hint()}"
+    got = ort + face_dists(*CV_DISTS) + face_dists("numpy")
+    return (f"{pip_cmd()} install -U --force-reinstall {' '.join(got)}" if got
+            else face_install_hint())
 
 
 def faces_check(a):
@@ -1619,27 +1674,32 @@ def faces_check(a):
     except subprocess.TimeoutExpired:
         status_line()
         sys.exit("--faces: the face restoration's check didn't finish (its models didn't load "
-                 "in 10 minutes). Reinstalling its packages may help:\n  " + face_install_hint())
+                 "in 10 minutes). Reinstalling its packages may help:\n  "
+                 + face_reinstall_hint())
     rc, text = p.returncode, (p.stdout + p.stderr).decode("utf-8", "replace")
     status_line()
     lines = [x for x in text.splitlines() if x.strip()]
     found = dict(x.split(" ", 1) for x in lines if " " in x and x.split(" ", 1)[0].isupper())
     if rc == 3:
         old_cv, broken = found.get("OLD-OPENCV"), found.get("BROKEN-PACKAGES")
+        miss = found.get("MISSING-PACKAGES", "").split()
         why = [x for x in (
             f"this OpenCV, {old_cv}, is too old for its face detector: it needs 4.8 or newer"
             if old_cv else "",
-            f"{found['MISSING-PACKAGES']} missing" if found.get("MISSING-PACKAGES") else "",
+            f"{' '.join(miss)} missing" if miss else "",
             f"{broken} installed but failing to load" if broken else "") if x]
+        # only the ones missing, and the OpenCV package installed if it is too old: a second
+        # onnxruntime (or OpenCV) package next to a working one shares its folder and breaks it
+        need = miss + ((face_dists(*CV_DISTS) or ["opencv-python-headless"]) if old_cv else [])
         sys.exit("--faces needs a few Python packages (" + "; ".join(why) + ")"
                  + "".join(f"\n  {x.strip()}" for x in lines if x.startswith("("))
-                 + "\nInstall them with:\n  " + face_install_hint()
-                 + (f"\nand reinstall the ones that fail to load:\n  pip install -U "
-                    f"--force-reinstall {broken}"
+                 + (f"\n{'Install them' if miss else 'Update it'} with:\n  "
+                    + face_install_hint(need) if need else "")
+                 + (f"\n{'and r' if need else 'R'}einstall the ones that fail to load:\n  "
+                    f"{pip_cmd()} install -U --force-reinstall {broken}"
                     + (" (and install the Microsoft Visual C++ Redistributable)"
                        if os.name == "nt" and "onnxruntime" in broken else "") if broken else "")
-                 + "\n(only one onnxruntime package: if another one is installed, "
-                   "pip uninstall it first), then run the same command again.")
+                 + "\nThen run the same command again.")
     if rc == 4:
         files = found.get("MISSING-MODELS", "").split()
         sys.exit(f"--faces needs its model files in '{models}'"
@@ -1658,7 +1718,7 @@ def faces_check(a):
     if rc or not provider:
         sys.exit("--faces: the face restoration couldn't start. Its output (end):\n  "
                  + "\n  ".join(lines[-15:])
-                 + "\nReinstalling its packages may help:\n  " + face_install_hint())
+                 + "\nReinstalling its packages may help:\n  " + face_reinstall_hint())
     a.face_provider = provider.strip()
     gpu = a.face_provider != "CPUExecutionProvider"
     name = FACE_MODEL_NAMES[a.face_model] + (f" (fidelity {FACE_FIDELITY:g})"
@@ -1670,7 +1730,7 @@ def faces_check(a):
     if a.face_model == "codeformer":
         print("  (CodeFormer's licence, S-Lab License 1.0, allows non-commercial use only)")
     if not gpu:
-        hint = face_install_hint(gpu_only=True)
+        hint = face_install_hint(["onnxruntime"], gpu_only=True)
         pkgs = found.get("PACKAGES", "").split() or ["onnxruntime"]
         gpu_ways = [x for x in found.get("AVAILABLE", "").split()
                     if x in ("CUDAExecutionProvider", "DmlExecutionProvider")]
@@ -1678,18 +1738,18 @@ def faces_check(a):
         failed = [x.strip() for x in lines if "Failed to create" in x or "EP Error" in x]
         if len(pkgs) > 1:
             how = (f" More than one onnxruntime package is installed ({', '.join(pkgs)}), which "
-                   f"share one folder and break each other: pip uninstall {' '.join(pkgs)}, "
-                   f"then {hint or 'pip install -U onnxruntime'}")
+                   f"share one folder and break each other: {pip_cmd()} uninstall "
+                   f"{' '.join(pkgs)}, then {hint or face_install_hint(['onnxruntime'])}")
         elif gpu_ways:
             how = (f" {pkgs[0]} can use the GPU ({gpu_ways[0]}), but that didn't start"
                    + (f": {failed[-1][:300]}" if failed else "") + "."
                    + (" It needs the CUDA and cuDNN versions it names installed."
                       if gpu_ways[0] == "CUDAExecutionProvider" else "")
-                   + (f" Or, for any GPU: pip uninstall {pkgs[0]}, then pip install -U "
-                      "onnxruntime-directml" if os.name == "nt"
+                   + (f" Or, for any GPU: {pip_cmd()} uninstall {pkgs[0]}, then {pip_cmd()} "
+                      "install -U onnxruntime-directml" if os.name == "nt"
                       and pkgs[0] != "onnxruntime-directml" else ""))
         elif hint:
-            how = f" For the GPU: pip uninstall {pkgs[0]}, then {hint}"
+            how = f" For the GPU: {pip_cmd()} uninstall {pkgs[0]}, then {hint}"
         else:
             how = " There is no GPU version of onnxruntime set up for this computer."
         print("NOTE: the face restoration runs on the processor: very slow (seconds per face, "
@@ -1989,12 +2049,17 @@ class Chunk:
                         fresh = (f"delete the folder '{self.tmp.parent.resolve()}' to start "
                                  "this movie fresh" if os.environ.get("DVD_UPSCALE_QUEUE") else
                                  "start that in a new --work folder")
+                        # (the GPU's memory only where it runs on the GPU: a run of the same
+                        # command tries the GPU first again; --gpu-threads only changes the
+                        # compact models)
+                        gpu_hint = "" if a.face_provider == "CPUExecutionProvider" else (
+                            "if the GPU is short of memory: run the same command again with "
+                            "--gpu-jobs 1" + (" and/or --gpu-threads 4" if compact_model(a)
+                                              else "") + "; it keeps the finished chunks. ")
                         raise RuntimeError(
                             f"the face restoration failed twice on {label} ({why}). Its output "
-                            "(end):\n  " + "\n  ".join(tail[-20:]) + "\n(if the GPU is short "
-                            "of memory: run the same command again with --gpu-jobs 1 and/or "
-                            "--gpu-threads 4, which keep the finished chunks. --faces can be "
-                            f"left out to upscale without it: {fresh})")
+                            "(end):\n  " + "\n  ".join(tail[-20:]) + "\n(" + gpu_hint
+                            + f"--faces can be left out to upscale without it: {fresh})")
                     status_line()
                     print(f"  {label}: the face restoration failed ({why}) - trying it once "
                           + ("more on the processor (slower; the GPU may be short of memory "
@@ -2042,7 +2107,8 @@ class Chunk:
             try:
                 # watchdog (as for the upscaler), counted in 1 s waits rather than clock time
                 # so a laptop that slept in between isn't taken for a stall: seconds since the
-                # last frame found or restored (no fixed limit: a slow processor is fine)
+                # last frame found or face restored (no fixed limit on a chunk or a frame: a slow
+                # processor is fine)
                 offset, pending, quiet, done, rc = 0, "", 0, False, None
                 while True:
                     try:
@@ -3801,8 +3867,9 @@ def build_parser():
                         f"{FACE_STRENGTH:g}): the redrawn face's share of the final picture, at "
                         "most the AI frames' share (--ai-blend: 0.75 live and VHS). Needs "
                         "pip install -U onnxruntime-directml (Windows; onnxruntime-gpu for NVIDIA "
-                        "with CUDA) opencv-python-headless numpy, and its model files in a "
-                        "face_models folder next to this script (the run says where to get them)")
+                        "with CUDA and cuDNN) opencv-python-headless numpy, and its model files "
+                        "in a face_models folder next to this script (the run says where to get "
+                        "them)")
     p.add_argument("--face-model", choices=sorted(FACE_MODEL_FILES), default=FACE_MODEL,
                    help=f"--faces: gfpgan (GFPGAN 1.4, the default) or codeformer (CodeFormer, "
                         f"fidelity {FACE_FIDELITY:g}; its licence, S-Lab 1.0, allows "
@@ -5365,10 +5432,13 @@ def queue_main(argv):
         a, extra = p.parse_known_args(argv)
         # folder-valued options are relative to the folder typed in, but each movie runs in
         # its own folder
+        # (a value left out, the next option there instead, is left for the check below to
+        # report, and an empty one to mean the default folder)
         for i, w in enumerate(extra):
-            if w == "--face-models" and i + 1 < len(extra):
+            if w == "--face-models" and i + 1 < len(extra) and extra[i + 1] \
+                    and not extra[i + 1].startswith("-"):
                 extra[i + 1] = str(Path(extra[i + 1]).resolve())
-            elif w.startswith("--face-models="):
+            elif w.startswith("--face-models=") and w.split("=", 1)[1]:
                 extra[i] = "--face-models=" + str(Path(w.split("=", 1)[1]).resolve())
         # the folder given anywhere ("--all --shutdown D:\Movies"), not only right after --all,
         # but never the value of an option such as --face-models

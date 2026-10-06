@@ -46,7 +46,9 @@ The user's changes:
 ## Face recovery (`--faces`, in dvd_upscale.py)
 
 - The face code is in `dvd_upscale.py` itself (`FaceRestorer`, `face_tracks`, `face_plan`,
-  `restore_faces`); `faces_core.py` was its prototype and computes the same frames.
+  `restore_faces`); `faces_core.py` was its first prototype (older rules: full from 10 px,
+  top_k 50, plain averaging, simpler chunk edges; it no longer gives the same frames and no
+  tool uses it).
   - YuNet detection (on frames at most 1280 px);
   - 5-landmark alignment to the FFHQ 512 template;
   - GFPGAN 1.4 or CodeFormer as ONNX (CodeFormer also takes the `weight` input, i.e. fidelity);
@@ -62,20 +64,24 @@ The user's changes:
   2. Restore and blend. The paste is made up for `--ai-blend` (mask × S / ai_blend, at most 1),
      so S is the face's share of the final picture, at most ai_blend.
 - Size gate by eye distance in source pixels (upscaled eye distance / scale): under 7 skipped,
-  7–10 ramps up, over 90 tapers off.
+  7–16 ramps up (full from 16), over 90 tapers off.
 - How it runs: `--faces [S]` (default 0.6), `--face-model gfpgan|codeformer`, `--face-models DIR`
   (default `face_models` next to the script). Live and VHS only (anime/CGI: a NOTE, turned off;
   `--fast` or `--ai-blend 0`: turned off). At the start of `Chunk.finish`, a worker process
   (`dvd_upscale.py --faces-worker ...`) writes the changed frames into `tmp/faces`; once it
   exits 0 they are moved over `tmp/out`. One worker at a time (`FACE_LOCK`), one retry (on the
   processor, `--cpu`), killed on Ctrl+C (and at exit; it also stops when the main run's pipe to
-  it closes) or after 10 minutes without a frame found or restored. A start-up check
+  it closes) or after 10 minutes without a frame found or a face restored. A start-up check
   (`--faces-worker --check`, 10-minute limit) reports missing, broken or too old packages,
   missing or damaged model files, and the provider used.
-- `evalfaces.py LAYOUT VARIANT...` (imports dvd_upscale.py) on the `closeup` and `medium` layouts.
+- `evalfaces.py LAYOUT VARIANT...` (imports dvd_upscale.py) on the `closeup`, `medium`, `small`
+  and `tiny` layouts (source eye distance about 65/36/17/14 px).
   - Variants: `none`, `gfpgan:S`, `codeformer:F:S`.
   - It compares each variant with the real HD face (PSNR, SSIM, sharpness, extra flicker, and
     SFace identity similarity; 0.36 or more means the same person).
+  - The 7/16 ramp came from the `small` and `tiny` runs: at 14 px, 0.6 drew more detail than
+    the real face had; from 17 px, 0.6 matched it (see the comment at `FACE_MIN_EYES` in
+    dvd_upscale.py; the result tables, `faces/eval*.txt`, are git-ignored).
 - `facerun.py LAYOUT [S]`: the whole script with and without `--faces` on `faces/LAYOUT/sd.mpg`
   (3 chunks of 20 frames, the bicubic stand-in upscaler); the difference inside and outside the
   face, and at the chunk seams against inside the chunks. `REUSE=1` measures the last runs again.

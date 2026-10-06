@@ -75,7 +75,8 @@ for what in "$@"; do
     # 60 frames of a real face: gt = the HD original at 1280x960 (the "2x upscale" size), sd =
     # the same shrunk to a DVD-sized 640x480 frame (MPEG-2), up = sd upscaled 2x. closeup: the
     # face fills the frame; medium, small, tiny: the shot smaller in the middle
-    # (eye distance in the 640x480 frame: closeup 65 px, medium 33, small 20, tiny 13)
+    # (eye distance in the 640x480 frame, as evalfaces.py measures it: closeup 65 px, medium 36,
+    # small 17, tiny 14)
     for layout in closeup medium small tiny; do
       d=faces/$layout; rm -rf $d; mkdir -p $d/gt $d/sd $d/up
       case $layout in
