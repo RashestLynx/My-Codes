@@ -761,6 +761,8 @@ GPU_ERRORS = re.compile(r"vk(QueueSubmit|WaitForFences|AllocateMemory|MapMemory)
 LANE_STATUS = {}     # what each helper GPU is doing, shown on the main progress line
 # each helper GPU's upscale while it runs: [frames done, of, started, last new frame] (times)
 LANE_PROGRESS = {}
+# every upscaler's frames so far while it runs, the main one's too (""): lane -> (GPU, frames)
+UPSCALER_FRAMES = {}
 # the chunks being upscaled right now (on any GPU): chunk -> (bytes of frames it writes, frames)
 UPSCALING = {}
 DISK_LOCK = threading.Lock()
@@ -801,6 +803,8 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
             last, same, all_there, tick = -1, 0, 0, 0
             while True:
                 n = sum(1 for _ in os.scandir(dst))
+                if n:           # (for the check of two upscalers on one GPU, see main)
+                    UPSCALER_FRAMES[lane or ""] = (gpu if gpu is not None else gpu_list(a)[0], n)
                 if lane:
                     LANE_STATUS[lane] = f"{lane}: {label} {n}/{n_in}"
                     now, tick = time.time(), tick + 1
@@ -837,6 +841,7 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
             if p.poll() is None:            # Ctrl+C or an error here: don't leave it running
                 p.kill()
                 p.wait()
+            UPSCALER_FRAMES.pop(lane or "", None)
             if lane:
                 LANE_PROGRESS.pop(lane, None)
     text = log_path.read_bytes().decode("utf-8", "replace")
@@ -866,8 +871,15 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
                                   if lines else ""))
         status_line()
         print("Upscaler output (end):\n" + "\n".join(lines[-25:]), flush=True)
-        if re.search(r"memory|vkAllocate", text, re.I):
-            print("(the GPU may have run out of memory: try adding --tile 128)", flush=True)
+        if re.search(r"invalid gpu device", text, re.I):
+            print("(no GPU with that --gpu number: leave --gpu out, or see the GPU list the "
+                  "upscaler prints at the top of its output)", flush=True)
+        elif re.search(r"vkCreateInstance|vkEnumeratePhysicalDevices|no vulkan", text, re.I):
+            print("(no usable Vulkan graphics driver: install or update the GPU's driver)",
+                  flush=True)
+        elif re.search(r"memory|vkAllocate", text, re.I):
+            print("(the GPU may have run out of memory: try adding --tile 128, or --gpu-jobs 1)",
+                  flush=True)
         elif re.search(r"encode image", text):
             print("(it couldn't write the frames: is the work folder's drive full?)", flush=True)
         if errors:
@@ -912,6 +924,10 @@ def check_frames(a, tmp, n_in, strict=False):
             raise RuntimeError("the check of the upscaled frames didn't finish")
         return [float(x) for x in re.findall(r"YAVG=([\d.]+)", txt)]
     before, after = brightness("in"), brightness("out")
+    if len(after) < len(before):
+        # (whole PNGs by their first and last bytes, but some can't be decoded: garbage inside)
+        raise RuntimeError(f"{len(before) - len(after)} of the upscaled frames checked can't be "
+                           "read (garbled - a GPU fault?)")
     if len(before) == len(after):
         for i, (x, y) in zip(picks, zip(before, after)):
             if abs(x - y) > 20:
@@ -931,12 +947,71 @@ def model_installed(a):
     return any((d / f"{n}.param").exists() and (d / f"{n}.bin").exists() for n in names)
 
 
+def check_ffmpeg():
+    """Exit with a clear message on an ffmpeg older than 5.1: its errors would only come later
+    and say little (-fps_mode, filter options). Builds named by date or git commit pass."""
+    rc, txt = capture(["ffmpeg", "-hide_banner", "-version"])
+    m = re.match(r"ffmpeg version n?(\d+)\.(\d+)", txt)
+    if m and (int(m[1]), int(m[2])) < (5, 1):
+        sys.exit(f"This ffmpeg is version {m[1]}.{m[2]}: 5.1 or newer is needed. Download a "
+                 "current build (ffmpeg.org lists them) and put it first on the PATH or next "
+                 "to this script.")
+
+
+def flush_to_disk(path):
+    """Make a finished file's data durable before it is renamed into place: else a power cut
+    soon after can leave a renamed but cut-short file that a resumed run trusts."""
+    try:
+        with open(path, "rb+") as f:
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+
+
+def replace_file(src, dst):
+    """os.replace, retried for a few seconds on Windows, where a virus scanner or the search
+    indexer briefly holds a file it has just seen written."""
+    for attempt in range(20):
+        try:
+            return os.replace(src, dst)
+        except PermissionError:
+            if os.name != "nt" or attempt == 19:
+                raise
+            time.sleep(0.5)
+
+
+def write_durably(path, text):
+    """Write a small file (settings.json) so that a crash or power cut never leaves it half
+    written (which used to mean starting the movie over): a temporary file, flushed to disk,
+    then renamed over it."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    replace_file(tmp, path)
+
+
 def keep_awake():
-    """CPU/GPU work doesn't count as activity for Windows: keep the PC from sleeping while this
-    runs (released automatically when it exits; closing the lid still sleeps)."""
+    """CPU/GPU work doesn't count as activity: keep the computer from sleeping while this runs
+    (released automatically when it exits; closing a laptop's lid still sleeps)."""
     if os.name == "nt":
         import ctypes
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+        return
+    # macOS: caffeinate, Linux with systemd: an inhibitor; each lasts until this run exits
+    pid = str(os.getpid())
+    for cmd in (["caffeinate", "-i", "-w", pid],
+                ["systemd-inhibit", "--what=sleep:idle", "--who=dvd_upscale.py",
+                 "--why=upscaling a video", "tail", f"--pid={pid}", "-f", "/dev/null"]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+            return
 
 
 def hold_lock(path, message):
@@ -1055,8 +1130,13 @@ class Chunk:
         try:
             (tmp / "in").mkdir(parents=True)
             (tmp / "out").mkdir()
-            # fast PNG compression: the same pixels, written several times faster
-            run(["ffmpeg", "-y", "-v", "error", *self.src, "-vf", self.pre,
+            # fast PNG compression: the same pixels, written several times faster. Into RGB with
+            # the colour interpolated (full_chroma_int): ffmpeg's default repeats each colour
+            # sample of the half-width DVD colour on two pixels, a stair-step on every colour
+            # edge that the upscaler then sharpens (not for a movie started without it)
+            rgb = (",scale=flags=bicubic+accurate_rnd+full_chroma_int,format=rgb24"
+                   if getattr(self.a, "rgb_interp", False) else "")
+            run(["ffmpeg", "-y", "-v", "error", *self.src, "-vf", self.pre + rgb,
                  "-frames:v", self.expected, "-compression_level", "1", pngs(tmp / "in")])
             n_in = len(list((tmp / "in").glob("*.png")))
             warning = None
@@ -1088,7 +1168,7 @@ class Chunk:
                     if free >= want:
                         UPSCALING[self] = (frames, n_in)
                         break
-                if self.make_room and self.make_room():
+                if self.make_room and self.make_room("disk"):
                     continue        # the other GPUs stopped and their frames are gone: again
                 if self.lane:
                     raise RuntimeError("the drive with the work folder is too full for two "
@@ -1113,7 +1193,10 @@ class Chunk:
                         if attempt == 2 or self.lane:
                             raise
                         # a new upscaler process gets a fresh GPU device (after a driver
-                        # reset, say)
+                        # reset, say). Another upscaler on the same GPU (--gpu-jobs) may have
+                        # taken the memory this one needed: it stops, and this one goes alone
+                        if self.make_room:
+                            self.make_room("retry")
                         status_line()
                         print(f"  {label}: {str(e).rstrip('.')} - trying this chunk once more.",
                               flush=True)
@@ -1175,7 +1258,8 @@ class Chunk:
                 self.clear_frames()
                 raise
         n = count_frames(self.part)
-        os.replace(self.part, self.out)
+        flush_to_disk(self.part)
+        replace_file(self.part, self.out)
         shutil.rmtree(self.tmp, ignore_errors=True)
         return self.out, (f"  WARNING: chunk {self.idx} has {n} frames, expected {self.expected} "
                           "(can cause small sync drift)"
@@ -2788,6 +2872,8 @@ def check_values(a):
         sys.exit("--test must be a number of seconds (0 = the whole movie)")
     if a.gpu_threads is not None and not 1 <= a.gpu_threads <= 16:
         sys.exit("--gpu-threads must be between 1 and 16")
+    if not 1 <= a.gpu_jobs <= 4:
+        sys.exit("--gpu-jobs must be between 1 and 4")
 
 
 def build_parser():
@@ -2840,6 +2926,12 @@ def build_parser():
                    help="frames the GPU upscales at once with the anime and VHS models "
                         "(default 4; the bigger live-action/CGI model always does 2): more can "
                         "keep a GPU busier. The picture is the same either way")
+    p.add_argument("--gpu-jobs", type=int, default=2,
+                   help="upscalers running at once on each GPU (default 2): the second keeps "
+                        "the GPU busy while the other starts up, checks its frames or waits for "
+                        "the next ones. The picture is the same either way; if two turn out "
+                        "slower than one (not enough video memory), it goes back to one by "
+                        "itself. 1 = one at a time")
     p.add_argument("--ai-blend", type=float, default=None,
                    help="share of the AI result mixed with a plain upscale, 0-1 "
                         "(lower = less flicker, less detail; default 1 anime, 0.75 live/vhs)")
@@ -2934,6 +3026,8 @@ USEFUL EXTRAS (add to any command above)
   --cpu              encode without an NVIDIA GPU (slow)
   --tile 128         if the GPU runs out of memory
   --gpu-threads 6    frames the GPU works on at once (default 4): try 6 or 8 for speed; same picture
+  --gpu-jobs 1       one upscaler at a time (default 2: the GPU waits less between chunks;
+                     same picture, and it goes back to one by itself if two are slower)
 
 MORE
   python dvd_upscale.py --help          every option, briefly
@@ -2960,6 +3054,8 @@ def main():
     here = str(Path(__file__).resolve().parent)
     # tools next to this script are found too, so --all/--queue on another folder still works
     find = lambda t: shutil.which(t) or shutil.which(t, path=here)
+    if find("ffmpeg"):
+        check_ffmpeg()
     resolve_type(a, find)
     # model, scale, chunk frames, pre-denoise (hqdn3d), ai blend, post smoothing, sharpen
     presets = {"anime": ("realesr-animevideov3", 2, 1440, "2:1.5:3:2.5", 1.0, 0, 0.6),
@@ -3299,10 +3395,15 @@ def main():
     st = Path(a.input).stat()
     # encoder args are included so a resumed run never mixes chunks from different encoder
     # settings (their stream headers differ, and joining them breaks playback)
+    # colour interpolated into the RGB pictures for the upscaler (see Chunk.extract); a movie
+    # started before that keeps its way, so its chunks match
+    prev = previous_settings(a)
+    a.rgb_interp = not a.fast and not (prev and "rgb" not in prev)
     fp = dict(input=str(Path(a.input).resolve()), size=st.st_size, mtime=int(st.st_mtime),
               mode=a.mode, fps=a.fps, model=a.model, scale=a.scale, height=a.height,
               chunk=a.chunk_frames, fast=a.fast, dar=a.dar, test=a.test, enc=" ".join(a.enc), w=a.out_w,
               denoise=a.denoise, ai_blend=a.ai_blend, smooth=a.smooth, sharpen=a.sharpen,
+              **({"rgb": "interp"} if a.rgb_interp else {}),
               # VHS: field order, crop, colour shift, mask, sizes, warm-up (anime/live unchanged)
               **({"vhs": f"{prefilter(a)} warm={a.vhs_warm[0]}:{a.vhs_warm[1]}"}
                  if a.type == "vhs" else {}))
@@ -3341,10 +3442,10 @@ def main():
                  f"{', '.join(changed)}{hint}. "
                  + (f"Delete the folder '{work.resolve()}' to start this movie fresh." if queue
                     else "Delete that folder (or use --work NEWNAME) to start fresh."))
-    sf.write_text(json.dumps(fp))
+    write_durably(sf, json.dumps(fp))
     # what it was detected as: a resumed run keeps it, and the --all/--queue log shows it
     if a.detected or not (work / "detected.json").exists():
-        (work / "detected.json").write_text(json.dumps(dict(type=a.type, **a.detected)))
+        write_durably(work / "detected.json", json.dumps(dict(type=a.type, **a.detected)))
 
     # video may start later than the container (audio-first files): cut on the video's own grid
     vo = info["vstart"] - info["cstart"]
@@ -3377,21 +3478,32 @@ def main():
             run_step(["ffmpeg", "-y", "-v", "error", "-fflags", "+genpts", "-i", a.input,
                       "-map", "0:v:0", "-c", "copy", *(["-t", a.test + 10] if a.test else []),
                       tmp], min(vlen, a.test + 10) if a.test else vlen, "copying the video")
-            os.replace(tmp, idx)
+            flush_to_disk(tmp)
+            replace_file(tmp, idx)
         a.chunk_input, cut = str(idx), 0.0
     try:            # set by --all / --queue: which movie this is, and how much video comes after
         queue = json.loads(os.environ.get("DVD_UPSCALE_QUEUE") or "null")
         later = float(queue["later_secs"]) if queue else 0.0
     except (ValueError, TypeError, KeyError):
         queue, later = None, 0.0
+    # a crash or power cut can leave the chunks written just before it cut short (versions
+    # before this one didn't flush them to disk first): the newest three are read through once,
+    # and a damaged one is made again (ffmpeg exits 0 on a cut-short .mkv, but reports it)
+    for p in sorted((p for p in (work / f"chunk_{i:05d}.mkv" for i, *_ in plan) if p.exists()),
+                    key=lambda p: p.stat().st_mtime)[-3:]:
+        rc, txt = capture(["ffmpeg", "-v", "error", "-i", p, "-map", "0:v", "-c", "copy",
+                           "-f", "null", "-"])
+        if rc or txt.strip() or not count_frames(p):
+            print(f"{p.name} is damaged (cut short by a crash?): it is made again")
+            p.unlink()
     done_before = sum((work / f"chunk_{i:05d}.mkv").exists() for i, *_ in plan)
     if done_before:
         print(f"Resuming: {done_before} of {len(plan)} chunks already done")
     chunks, notes = {}, []
     # three steps per chunk, overlapped: while chunk i is upscaled on the GPU, chunk i+1's frames
     # are read and chunk i-1 is encoded in the background, so the GPU doesn't wait for either.
-    # With --gpu 0,1 the other GPUs each take whole chunks alongside (see helper below). A
-    # failure on the main GPU stops the movie as before
+    # More upscalers (--gpu-jobs, and the other GPUs of --gpu 0,1) each take whole chunks
+    # alongside (see helper below). A failure on the main upscaler stops the movie as before
     todo = [entry for entry in plan if not (work / f"chunk_{entry[0]:05d}.mkv").exists()]
     for entry in plan:
         if entry not in todo:
@@ -3402,7 +3514,7 @@ def main():
     a.stop_lanes = threading.Event()
     a.cancel_lanes = set()                  # helpers whose chunk the main GPU took back
     main_secs, skipped, shown = [], set(), [0]  # main GPU's upscale times; chunks with no video
-    progress = {"chunks": 0, "video": 0.0, "helped": 0}
+    progress = {"chunks": 0, "video": 0.0, "helped": 0, "frames": 0}
     t_start = time.time()
     encoding = reading = current = None     # (Background, Chunk) / Chunk
 
@@ -3433,15 +3545,23 @@ def main():
             progress["chunks"] += 1
             progress["video"] += job.length
             progress["helped"] += helped
+            progress["frames"] += job.expected
 
-    def helper(dev):
-        """Another GPU: whole chunks, from reading the frames to the chunk file, alongside the
-        main one. The last few chunks are left to the main GPU (faster: nothing waits for a
-        slow GPU at the end). Whatever goes wrong, the chunk goes back to the main GPU (its
-        frames deleted first) and this GPU stops helping."""
-        lane = f"GPU {dev}"
-        while not a.stop_lanes.is_set():
-            entry = claim(keep=3)
+    def helper(dev, lane, keep, gated):
+        """Another upscaler, on another GPU or a second one on the same GPU (--gpu-jobs): whole
+        chunks, from reading the frames to the chunk file, alongside the main one. The last
+        `keep` chunks are left to the main one (another GPU may be slower: nothing waits for it
+        at the end). gated: a second upscaler on a GPU starts once that GPU's speed with one is
+        known (see meter). Whatever goes wrong, the chunk goes back to the main upscaler (its
+        frames deleted first) and this one stops helping; a retired one stops after its chunk."""
+        if gated:
+            while not solo_ready[dev].wait(1):
+                with lock:
+                    nothing_left = len(waiting) <= keep
+                if a.stop_lanes.is_set() or lane in a.retire_lanes or nothing_left:
+                    return
+        while not a.stop_lanes.is_set() and lane not in a.retire_lanes:
+            entry = claim(keep=keep)
             if entry is None:
                 return
             job = None
@@ -3462,7 +3582,7 @@ def main():
                 give_back(entry)
                 if not isinstance(e, HandBack) and not lane_stopped(a, lane):
                     notes.append(f"  NOTE: {lane} stopped helping ({str(e).rstrip('.')}); "
-                                 "the main GPU does the rest")
+                                 "the rest is done without it")
                 return
             finally:
                 LANE_STATUS.pop(lane, None)
@@ -3473,21 +3593,32 @@ def main():
                 if msg:
                     notes.append(msg)
 
-    def stop_helpers():
-        """The main GPU's chunk doesn't fit on the drive next to the other GPUs' frames: they
-        stop (their chunks come back to the main GPU, their frames are deleted) rather than the
-        movie failing. True if any were still running."""
-        busy = [h for h in helpers if h.thread.is_alive()]
+    def stop_helpers(why):
+        """why "disk": the main upscaler's chunk doesn't fit on the drive next to the other
+        upscalers' frames: they all stop rather than the movie failing. why "retry": the main
+        upscaler failed, and the others on its GPU may have taken the memory it needed: they
+        stop before it tries again. Their chunks come back to the main upscaler, their frames
+        are deleted. True if any were still running."""
+        busy = [(lane, h) for (dev, lane, *_), h in zip(lanes, helpers) if h.thread.is_alive()
+                and (why == "disk" or dev == devices[0])]
         if not busy:
             return False
-        a.stop_lanes.set()
-        for h in busy:
+        if why == "disk":
+            a.stop_lanes.set()
+        for lane, _ in busy:
+            a.retire_lanes.add(lane)
+            a.cancel_lanes.add(lane)        # (stops its upscale now)
+        for _, h in busy:
             try:
                 h.wait()
             except Exception:
                 pass
+        names = " and ".join(lane for lane, _ in busy)
         notes.append("  NOTE: the drive with the work folder is too full for two chunks at "
-                     "once: the other GPU stopped helping, the main GPU does the rest")
+                     f"once: {names} stopped helping, the main upscaler does the rest"
+                     if why == "disk" else
+                     f"  NOTE: {names} stopped, as it shares the GPU (which may be short of "
+                     "memory for two upscalers); the main upscaler goes on alone")
         return True
 
     def take_back():
@@ -3503,7 +3634,7 @@ def main():
             left = (of - done) * (now - started) / done if done else None
             if stuck or quick and left is not None and left > 1.5 * quick:
                 a.cancel_lanes.add(lane)
-                notes.append(f"  NOTE: the main GPU takes {lane}'s chunk back ("
+                notes.append(f"  NOTE: the main upscaler takes {lane}'s chunk back ("
                              + ("it stopped making progress)" if stuck else
                                 "it will be done with it sooner)"))
 
@@ -3522,15 +3653,69 @@ def main():
             status_line()
             print(notes.pop(0), flush=True)
 
-    others = [] if a.fast else [d for d in devices[1:] if d]
+    # the upscalers besides the main one, each taking whole chunks: --gpu-jobs on every GPU (a
+    # second one keeps the GPU busy while the other starts up, checks its frames or waits for
+    # the next ones; each frame is upscaled the same way either way), and the other GPUs of
+    # --gpu 0,1. Each: (GPU, name, chunks it leaves to the main one, gated: waits until its
+    # GPU's speed with one upscaler is known)
+    jobs = 1 if a.fast else a.gpu_jobs
+
+    def lane_name(dev, k):
+        return (f"GPU {dev}" if dev is not None else "upscaler") + (f" #{k + 1}" if k else "")
+    lanes = [(devices[0], lane_name(devices[0], k), 1, True) for k in range(1, jobs)]
+    for d in ([] if a.fast else dict.fromkeys(devices[1:])):
+        if d and d != devices[0]:
+            lanes += [(d, lane_name(d, k), 3, k > 0) for k in range(jobs)]
+    count = Counter([devices[0]] + [dev for dev, *_ in lanes])
+    solo_ready = {dev: threading.Event() for dev, c in count.items() if c > 1}
+    a.retire_lanes = set()                  # upscalers that stop after their current chunk
+    meter_stop = threading.Event()
+
+    def meter():
+        """Frames a second on each GPU with one upscaler running and with two, sampled every
+        second. A GPU's second upscaler waits until the speed with one is known (30 s of it),
+        and is retired after its chunk if two turn out slower than one over the next 60 s (a
+        GPU short of video memory, say)."""
+        last, rate, decided = {}, {}, set()
+        while not meter_stop.wait(1):
+            now = dict(UPSCALER_FRAMES)
+            new = {}                # GPU -> frames each of its upscalers made in that second
+            for k, (dev, n) in now.items():
+                if k in last and n >= last[k][1]:
+                    new.setdefault(dev, []).append(n - last[k][1])
+            last = now
+            for dev in solo_ready:
+                r = rate.setdefault(dev, {1: [0, 0], 2: [0, 0]})     # frames, seconds
+                if dev in new:
+                    s = r[min(2, len(new[dev]))]
+                    s[0], s[1] = s[0] + sum(new[dev]), s[1] + 1
+                if r[1][1] >= 30:
+                    solo_ready[dev].set()
+                if dev in decided or r[1][1] < 30 or r[2][1] < 60:
+                    continue
+                decided.add(dev)
+                one, two = r[1][0] / r[1][1], r[2][0] / r[2][1]
+                if two < 0.95 * one:
+                    a.retire_lanes.update(lane for d, lane, _, gated in lanes
+                                          if d == dev and gated)
+                    notes.append(f"  NOTE: two upscalers at once on "
+                                 f"{'the GPU' if dev is None else 'GPU ' + dev} were slower "
+                                 f"({two:.1f} frames/s against {one:.1f} for one): one at a "
+                                 "time from the next chunk on")
+
     old_ctrl_c = signal.getsignal(signal.SIGINT)
-    if others and old_ctrl_c is signal.default_int_handler \
+    if lanes and old_ctrl_c is signal.default_int_handler \
             and threading.current_thread() is threading.main_thread():
         def ctrl_c(sig, frame):
             a.stop_lanes.set()      # the other GPUs stop now, before they start anything new
             raise KeyboardInterrupt
         signal.signal(signal.SIGINT, ctrl_c)
-    helpers = [Background(lambda d=d: helper(d)) for d in others]
+    if count[devices[0]] > 1:
+        say(f"Up to {count[devices[0]]} upscalers at once on the GPU (--gpu-jobs; same picture, "
+            "the GPU waits less between chunks)")
+    helpers = [Background(lambda lane=lane: helper(*lane)) for lane in lanes]
+    if solo_ready:
+        Background(meter)
     try:
         while True:
             if reading:
@@ -3588,7 +3773,7 @@ def main():
             remaining = len(todo) - progress["chunks"]
             left = remaining * per_chunk
             movie = f" - movie {queue['n']} of {queue['of']} - this movie:" if queue else " -"
-            helped = (f" ({progress['helped']} by the other GPU)"
+            helped = (f" ({progress['helped']} by the other upscaler{'s' * (len(helpers) > 1)})"
                       if helpers and progress["helped"] else "")
             shown[0] = len(plan) - remaining
             say(f"[{len(plan) - remaining}/{len(plan)}] {per_chunk:.0f}s/chunk{helped}"
@@ -3605,9 +3790,13 @@ def main():
         status_line()
         show_notes()
         if helpers and progress["chunks"] and shown[0] != len(plan):
-            # (another GPU finished the last chunk to be counted)
-            say(f"[{len(plan)}/{len(plan)}] ({progress['helped']} by the other GPU), all "
-                "chunks done, finishing the file...")
+            # (another upscaler finished the last chunk to be counted)
+            say(f"[{len(plan)}/{len(plan)}] ({progress['helped']} by the other "
+                f"upscaler{'s' * (len(helpers) > 1)}), all chunks done, finishing the file...")
+        if progress["frames"] and not a.fast:
+            took = time.time() - t_start
+            say(f"Upscaled {progress['frames']} frames in {short_time(took)} "
+                f"({progress['frames'] / took:.1f} frames/s)")
     except BaseException:
         # stopped (Ctrl+C) or failed: let the steps already running in the background end
         # first, so nothing is left writing on its own (a finished encode keeps its chunk)
@@ -3622,6 +3811,7 @@ def main():
                 job.clear_frames()              # made again next time
         raise
     finally:
+        meter_stop.set()
         if signal.getsignal(signal.SIGINT) is not old_ctrl_c:
             signal.signal(signal.SIGINT, old_ctrl_c)
     # every chunk must be there (a chunk lost between GPUs would otherwise just be missing
@@ -3742,7 +3932,8 @@ def main():
              *(["-t", f"{vs + float(total):.3f}"] if a.test else []), *final, part],
              vs + float(total), "adding the subtitles")
     try:
-        os.replace(part, out)
+        flush_to_disk(part)
+        replace_file(part, out)
     except PermissionError:
         sys.exit(f"Can't replace '{out}': it's open in another program (a video player?). "
                  "Close it and run the same command again; only this last step is redone.")
@@ -3776,6 +3967,7 @@ def main():
 
 VALUE_OPTS = ("--type", "--mode", "--model", "--scale", "--height", "--dar", "--fps",
               "--chunk-frames", "--test", "--esrgan", "--gpu", "--tile", "--gpu-threads",
+              "--gpu-jobs",
               "--ai-blend", "--smooth",
               "--sharpen", "--work", "--chroma-delay", "--mask")
 STOPPED = (130, 3221225786)     # a run stopped by Ctrl+C; Windows "terminated by Ctrl+C"
@@ -4127,8 +4319,8 @@ def check_finished_movie(src, out):
 
 
 WORK_FILES = re.compile(r"chunk_\d{5}(\.part)?\.mkv|tmp_\d{5}|list\.txt|"
-                        r"video_(joined|audio)\.mkv|video_index(\.part)?\.mkv|settings\.json|"
-                        r"detected\.json|\.lock")
+                        r"video_(joined|audio)\.mkv|video_index(\.part)?\.mkv|"
+                        r"(settings|detected)\.json(\.tmp)?|\.lock")
 
 
 def clean_work_folder(work):
@@ -4334,12 +4526,20 @@ def queue_main(argv):
         if folder_mode and not analyze:
             (base / args[1]).parent.mkdir(parents=True, exist_ok=True)   # "1080p Upscale"
         t0 = time.time()
+        env = dict(os.environ, DVD_UPSCALE_QUEUE=json.dumps(
+            dict(n=pos, of=len(valid), later_secs=later_secs, folder=folder_mode)))
+        p = subprocess.Popen([sys.executable, str(script), *args], cwd=base, env=env)
         try:
-            env = dict(os.environ, DVD_UPSCALE_QUEUE=json.dumps(
-                dict(n=pos, of=len(valid), later_secs=later_secs, folder=folder_mode)))
-            rc = subprocess.run([sys.executable, str(script), *args], cwd=base,
-                                env=env).returncode
+            rc = p.wait()
         except KeyboardInterrupt:
+            # the movie's run got the Ctrl+C too: let it stop as a single movie does (its
+            # background steps end, its GBs of frames are deleted); a second Ctrl+C ends it now
+            # (subprocess.run gave it 0.25 s, then killed it mid-cleanup)
+            try:
+                p.wait(timeout=300)
+            except (KeyboardInterrupt, subprocess.TimeoutExpired):
+                p.kill()
+                p.wait()
             rc = STOPPED[0]
         mins = (time.time() - t0) / 60
         if rc in STOPPED:
