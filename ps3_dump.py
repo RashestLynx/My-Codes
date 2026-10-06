@@ -9,9 +9,12 @@ Keys come from you, not from the drive: a Redump key file or an IRD file for
 your exact disc version (see psdevwiki.com/ps3/Bluray_disc). Redump's "Disc
 Key" is the final 16-byte key (--key-type final); an IRD's data1 is d1.
 
-LEFT AS A TODO ON PURPOSE
-  derive_disc_key(): d1 -> final AES key. Fill in from psdevwiki, or pass
-  --key-type final if your key file is already the final 16-byte key.
+D1 KEYS
+  --key-type d1 derives the disc key from d1 (from --key-file, or the IRD's
+  data1 if no key file is given). The derivation's constant AES key and IV
+  are NOT included; put them in a file (16-byte key then 16-byte IV, raw or
+  hex) and pass --d1-secrets FILE or set PS3_D1_SECRETS. With a Redump disc
+  key you don't need any of this: use --key-type final.
 
 FORMAT NOTES
   - Region table (sector 0): u32 BE count of *unencrypted* regions, u32
@@ -27,7 +30,8 @@ COMMANDS
   drives                            list optical drives and whether a disc is in
   probe  [--device D] [--wait S]    identify the disc; no key needed
   ird-info game.ird                 inspect an IRD
-  dump   [--device D] --key-file K --key-type final|d1 --out game.iso
+  dump   [--device D] [--key-file K] --key-type final|d1 --out game.iso
+         [--d1-secrets FILE]
          [--ird game.ird] [--limit-sectors N] [--sectors N] [--force]
          [--resume] [--wait S]
   verify --ird game.ird game.iso    check a finished ISO against IRD hashes
@@ -84,10 +88,40 @@ def encrypt_sector(key: bytes, sector_no: int, data: bytes) -> bytes:
     return e.update(data) + e.finalize()
 
 
-def derive_disc_key(d1: bytes) -> bytes:
-    # TODO: d1 -> final AES key. See psdevwiki.com/ps3/Bluray_disc
-    raise Ps3Error("derive_disc_key() is not filled in. Implement it from "
-                   "psdevwiki, or use --key-type final.")
+def load_d1_secrets(path):
+    """Read the d1 -> disc key constants: 16-byte key then 16-byte IV.
+
+    Accepts 32 raw bytes or 64 hex characters (whitespace ignored). The
+    constants are not shipped with this tool; supply them yourself.
+    """
+    if not path:
+        raise Ps3Error("--key-type d1 needs --d1-secrets FILE (or the "
+                       "PS3_D1_SECRETS environment variable) holding the "
+                       "16-byte derivation key followed by the 16-byte IV. "
+                       "Or use a Redump disc key with --key-type final.")
+    try:
+        with open(path, "rb") as f:
+            raw = f.read()
+    except OSError as e:
+        raise Ps3Error(f"Cannot read d1 secrets file: {e}")
+    if len(raw) != 32:
+        txt = "".join(raw.decode("ascii", "ignore").split())
+        try:
+            raw = bytes.fromhex(txt) if len(txt) == 64 else b""
+        except ValueError:
+            raw = b""
+    if len(raw) != 32:
+        raise Ps3Error(f"{path}: expected 32 raw bytes or 64 hex chars "
+                       f"(16-byte key, then 16-byte IV)")
+    return raw[:16], raw[16:]
+
+
+def derive_disc_key(d1: bytes, secret_key: bytes, secret_iv: bytes) -> bytes:
+    """d1 -> final disc key: one AES-128-CBC encryption block."""
+    if len(d1) != 16:
+        raise Ps3Error(f"d1 must be 16 bytes, got {len(d1)}")
+    e = Cipher(algorithms.AES(secret_key), modes.CBC(secret_iv)).encryptor()
+    return e.update(d1) + e.finalize()
 
 
 # ------------------------------------------------------------------ keys ---
@@ -776,6 +810,12 @@ def selftest():
     assert decrypt_sector(key, 7, encrypt_sector(key, 7, plain)) == plain
     assert encrypt_sector(key, 7, plain) != encrypt_sector(key, 8, plain)
 
+    # d1 derivation = one CBC block: AES-ECB(k, d1 XOR iv). Dummy constants.
+    sk, siv, d1 = bytes(range(16, 32)), bytes(range(32, 48)), os.urandom(16)
+    ecb = Cipher(algorithms.AES(sk), modes.ECB()).encryptor()
+    assert derive_disc_key(d1, sk, siv) == ecb.update(
+        bytes(a ^ b for a, b in zip(d1, siv))) + ecb.finalize()
+
     hdr, original = _make_test_disc()
     regions = parse_regions(hdr)
     assert regions == [(0, 29, False), (30, 49, True), (50, 63, False)], regions
@@ -801,6 +841,14 @@ def selftest():
         with open(kp, "w") as f:
             f.write(key.hex() + "\n")
         assert load_key_file(kp) == key
+        with open(kp, "w") as f:
+            f.write((sk + siv).hex(" ") + "\n")
+        assert load_d1_secrets(kp) == (sk, siv)
+        try:
+            load_d1_secrets(None)
+            raise AssertionError("missing secrets should fail")
+        except Ps3Error:
+            pass
 
         with open_device(img) as dev:            # identification, with/without key
             assert device_sectors(dev) == 64
@@ -862,8 +910,11 @@ def main():
                         help="drive or image path (default: auto-detect)")
         sp.add_argument("--wait", type=float, default=0,
                         help="seconds to wait for a disc when auto-detecting")
-    d.add_argument("--key-file", required=True)
+    d.add_argument("--key-file",
+                   help="disc key or d1 (optional for d1 when --ird is given)")
     d.add_argument("--key-type", choices=["final", "d1"], required=True)
+    d.add_argument("--d1-secrets", default=os.environ.get("PS3_D1_SECRETS"),
+                   help="file with the d1 derivation key + IV (32 bytes / 64 hex)")
     d.add_argument("--ird")
     d.add_argument("--out", required=True)
     d.add_argument("--limit-sectors", type=int)
@@ -892,10 +943,16 @@ def main():
         elif a.cmd == "verify":
             verify(a.iso, read_ird(a.ird))
         else:
-            key = load_key_file(a.key_file)
-            if a.key_type == "d1":
-                key = derive_disc_key(key)
             ird = read_ird(a.ird) if a.ird else None
+            if a.key_file:
+                key = load_key_file(a.key_file)
+            elif a.key_type == "d1" and ird:
+                key = ird["data1"]
+                print("Using d1 from the IRD")
+            else:
+                raise Ps3Error("--key-file is required (or --ird with --key-type d1)")
+            if a.key_type == "d1":
+                key = derive_disc_key(key, *load_d1_secrets(a.d1_secrets))
             dump(choose_device(a.device, a.wait), key, a.out, ird,
                  a.limit_sectors, a.sectors, a.force, a.resume)
     except Ps3Error as e:
