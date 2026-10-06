@@ -1,0 +1,5 @@
+# Private keys / secrets: never commit
+d1_secrets*.txt
+*.key
+*.dkey
+__pycache__/

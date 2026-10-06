@@ -13,8 +13,11 @@ D1 KEYS
   --key-type d1 derives the disc key from d1 (from --key-file, or the IRD's
   data1 if no key file is given). The derivation's constant AES key and IV
   are NOT included; put them in a file (16-byte key then 16-byte IV, raw or
-  hex) and pass --d1-secrets FILE or set PS3_D1_SECRETS. With a Redump disc
-  key you don't need any of this: use --key-type final.
+  hex) and pass --d1-secrets FILE or set PS3_D1_SECRETS -- or run
+  `secrets --create` once and fill in the private file it makes
+  (~/.config/ps3_dump/d1_secrets.txt, or %APPDATA%\ps3_dump on Windows),
+  which is then loaded automatically. With a Redump disc key you don't need
+  any of this: use --key-type final.
 
 FORMAT NOTES
   - Region table (sector 0): u32 BE count of *unencrypted* regions, u32
@@ -30,6 +33,7 @@ COMMANDS
   drives                            list optical drives and whether a disc is in
   probe  [--device D] [--wait S]    identify the disc; no key needed
   ird-info game.ird                 inspect an IRD
+  secrets [--create]                show / create the auto-loaded d1 secrets file
   check-key [--device D] --key-file K --key-type final|d1 [--ird game.ird]
                                     spot-check a key on the disc in seconds
   dump   [--device D] [--key-file K] --key-type final|d1 --out game.iso
@@ -108,32 +112,91 @@ def encrypt_sector(key: bytes, sector_no: int, data: bytes) -> bytes:
     return e.update(data) + e.finalize()
 
 
-def load_d1_secrets(path):
+SECRETS_TEMPLATE = """\
+# ps3_dump d1 -> disc key derivation constants. Keep this file private:
+# never commit it or share it. Fill in both values as 32 hex characters.
+key =
+iv  =
+"""
+
+
+def default_secrets_path() -> str:
+    """Per-user config location: %APPDATA%\\ps3_dump or ~/.config/ps3_dump."""
+    if os.name == "nt" and os.environ.get("APPDATA"):
+        base = os.environ["APPDATA"]
+    else:
+        base = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return os.path.join(base, "ps3_dump", "d1_secrets.txt")
+
+
+def find_secrets_path(explicit=None):
+    """--d1-secrets, then $PS3_D1_SECRETS, then the default file if it exists."""
+    if explicit:
+        return explicit
+    if os.environ.get("PS3_D1_SECRETS"):
+        return os.environ["PS3_D1_SECRETS"]
+    path = default_secrets_path()
+    return path if os.path.exists(path) else None
+
+
+def create_secrets_template(path=None) -> str:
+    path = path or default_secrets_path()
+    if os.path.exists(path):
+        raise Ps3Error(f"{path} already exists; edit it instead")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(SECRETS_TEMPLATE)
+    return path
+
+
+def _parse_secrets_text(text: str) -> bytes:
+    """`key = <hex>` / `iv = <hex>` lines, or just 64 hex chars. '#' comments."""
+    lines = [ln.split("#", 1)[0].strip() for ln in text.splitlines()]
+    named = dict(ln.split("=", 1) for ln in lines if "=" in ln)
+    named = {k.strip().lower(): "".join(v.split()) for k, v in named.items()}
+    if named:
+        if not named.get("key") or not named.get("iv"):
+            raise ValueError("key and iv must both be filled in")
+        txt = named["key"] + named["iv"]
+    else:
+        txt = "".join("".join(lines).split())
+    if len(txt) != 64:
+        raise ValueError(f"expected 64 hex chars in total, found {len(txt)}")
+    return bytes.fromhex(txt)
+
+
+def load_d1_secrets(path=None):
     """Read the d1 -> disc key constants: 16-byte key then 16-byte IV.
 
-    Accepts 32 raw bytes or 64 hex characters (whitespace ignored). The
+    Looked up via find_secrets_path(). Accepts 32 raw bytes, 64 hex chars, or
+    the `key = ...` / `iv = ...` template made by `secrets --create`. The
     constants are not shipped with this tool; supply them yourself.
     """
+    path = find_secrets_path(path)
     if not path:
-        raise Ps3Error("--key-type d1 needs --d1-secrets FILE (or the "
-                       "PS3_D1_SECRETS environment variable) holding the "
-                       "16-byte derivation key followed by the 16-byte IV. "
-                       "Or use a Redump disc key with --key-type final.")
+        raise Ps3Error("--key-type d1 needs the derivation key + IV. Run "
+                       "`ps3_dump.py secrets --create` and fill in "
+                       f"{default_secrets_path()}, or pass --d1-secrets FILE / "
+                       "set PS3_D1_SECRETS. Or use a Redump disc key with "
+                       "--key-type final.")
     try:
         with open(path, "rb") as f:
             raw = f.read()
     except OSError as e:
         raise Ps3Error(f"Cannot read d1 secrets file: {e}")
     if len(raw) != 32:
-        txt = "".join(raw.decode("ascii", "ignore").split())
         try:
-            raw = bytes.fromhex(txt) if len(txt) == 64 else b""
-        except ValueError:
-            raw = b""
-    if len(raw) != 32:
-        raise Ps3Error(f"{path}: expected 32 raw bytes or 64 hex chars "
-                       f"(16-byte key, then 16-byte IV)")
+            raw = _parse_secrets_text(raw.decode("utf-8", "replace"))
+        except ValueError as e:
+            raise Ps3Error(f"{path}: {e} (16-byte key, then 16-byte IV)")
+    _warn_if_exposed(path)
     return raw[:16], raw[16:]
+
+
+def _warn_if_exposed(path):
+    if os.name == "posix" and os.stat(path).st_mode & 0o077:
+        print(f"WARNING: {path} is readable by other users; run chmod 600 on it")
 
 
 def derive_disc_key(d1: bytes, secret_key: bytes, secret_iv: bytes) -> bytes:
@@ -1338,7 +1401,28 @@ def selftest():
         with open(kp, "w") as f:
             f.write((sk + siv).hex(" ") + "\n")
         assert load_d1_secrets(kp) == (sk, siv)
-        _expect_fail(load_d1_secrets, None)
+        old_env = {k: os.environ.get(k) for k in ("PS3_D1_SECRETS", "XDG_CONFIG_HOME", "APPDATA")}
+        try:                                    # auto-loaded secrets file
+            os.environ.pop("PS3_D1_SECRETS", None)
+            os.environ["XDG_CONFIG_HOME"] = os.environ["APPDATA"] = td
+            assert find_secrets_path() is None
+            _expect_fail(load_d1_secrets)
+            sp = create_secrets_template()
+            assert sp == default_secrets_path() and find_secrets_path() == sp
+            _expect_fail(load_d1_secrets)       # template not filled in yet
+            _expect_fail(create_secrets_template)
+            with open(sp, "w") as f:
+                f.write(SECRETS_TEMPLATE.replace("key =", f"key = {sk.hex()}")
+                        .replace("iv  =", f"iv  = {siv.hex(' ')}  # comment"))
+            assert load_d1_secrets() == (sk, siv)
+            os.environ["PS3_D1_SECRETS"] = kp   # env var wins over default file
+            assert find_secrets_path() == kp
+        finally:
+            for k, v in old_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
 
         ip = os.path.join(td, "t.ird")
         with open(ip, "wb") as f:
@@ -1443,8 +1527,9 @@ def main():
         sp.add_argument("--key-file",
                         help="disc key or d1 (optional for d1 when --ird is given)")
         sp.add_argument("--key-type", choices=["final", "d1"], required=True)
-        sp.add_argument("--d1-secrets", default=os.environ.get("PS3_D1_SECRETS"),
-                        help="file with the d1 derivation key + IV (32 bytes / 64 hex)")
+        sp.add_argument("--d1-secrets",
+                        help="file with the d1 derivation key + IV (default: "
+                             "$PS3_D1_SECRETS, then the `secrets` file)")
         sp.add_argument("--ird")
     d.add_argument("--out", required=True)
     d.add_argument("--limit-sectors", type=int)
@@ -1459,6 +1544,9 @@ def main():
     d.add_argument("--no-hash", action="store_true",
                    help="skip CRC32/MD5/SHA-1 hashing")
     add_redump_args(d)
+    sc = sub.add_parser("secrets", help="show or create the d1 secrets file")
+    sc.add_argument("--create", action="store_true",
+                    help="write a private template to fill in")
     v = sub.add_parser("verify", help="full integrity check of a finished ISO")
     v.add_argument("iso")
     v.add_argument("--ird")
@@ -1481,6 +1569,17 @@ def main():
             print("regions:", parse_regions(info["header"][:SECTOR]))
             print(f"{len(info['region_hashes'])} region hashes, "
                   f"{len(info['file_hashes'])} file hashes")
+        elif a.cmd == "secrets":
+            if a.create:
+                path = create_secrets_template()
+                print(f"Created {path} (private to you). Fill in key and iv.")
+            else:
+                path = find_secrets_path()
+                print(f"Default file: {default_secrets_path()}")
+                print(f"In use:       {path or 'none found'}")
+                if path:
+                    load_d1_secrets(path)
+                    print("Status:       OK, file parses")
         elif a.cmd == "verify":
             verify_cmd(a.iso, read_ird(a.ird) if a.ird else None,
                        redump_args(a), a.hashes)
