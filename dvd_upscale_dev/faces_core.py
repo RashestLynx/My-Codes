@@ -15,7 +15,10 @@ import onnxruntime as ort
 TEMPLATE = np.array([[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935],
                      [201.26117, 371.41043], [313.08905, 371.15118]], np.float32)
 EYES = 125.92                     # eye distance in the template
-MIN_EYES, FULL_EYES, MAX_EYES = 14, 20, 110   # faces smaller: skipped; larger: tapered off
+# eye distance in the source (DVD) frame, in its pixels - what the restorer has to work from:
+# smaller than MIN_EYES skipped (too little to go on), full strength from FULL_EYES; from
+# TAPER_EYES on tapered off, to none at the template's own size (the source has the detail)
+MIN_EYES, FULL_EYES, TAPER_EYES = 7, 10, 90
 
 
 def soft_mask(size=512, blur=0.3):
@@ -127,13 +130,16 @@ def tracks_of(dets):
     return tracks
 
 
-def plan(dets, n, strength, smooth=2, fade=4, min_len=5):
-    """Per frame: [(landmarks, strength)], from steadied tracks."""
+def plan(dets, n, strength, scale=2, smooth=2, fade=4, min_len=5):
+    """Per frame: [(landmarks, strength)], from steadied tracks. scale: the frames' size over
+    the source's. A track that reaches the first or last frame goes on in the next/previous
+    chunk: no fade there, and kept however short (else a pulse at every chunk seam)."""
     out = [[] for _ in range(n)]
     for tr in tracks_of(dets):
-        if len(tr) < min_len:                  # a face seen for a moment: likely a false one
-            continue
         frames = [f for f, _ in tr]
+        open_start, open_end = frames[0] == 0, frames[-1] == n - 1
+        if len(tr) < min_len and not (open_start or open_end):
+            continue                           # a face seen for a moment: likely a false one
         pts = {f: p for f, p in tr}
         # fill gaps of a frame or two (a missed detection) by interpolation
         for f in range(frames[0], frames[-1] + 1):
@@ -145,12 +151,13 @@ def plan(dets, n, strength, smooth=2, fade=4, min_len=5):
         for f in span:
             win = [pts[g] for g in range(f - smooth, f + smooth + 1) if g in pts]
             p = sum(win) / len(win)
-            d = eye_dist(p)
+            d = eye_dist(p) / scale
             if d < MIN_EYES:
                 continue
             size = min(1.0, (d - MIN_EYES) / (FULL_EYES - MIN_EYES))
-            size *= 1.0 if d <= MAX_EYES else max(0.0, 1 - (d - MAX_EYES) / (EYES - MAX_EYES))
-            edge = min(1.0, (f - frames[0] + 1) / fade, (frames[-1] - f + 1) / fade)
+            size *= 1.0 if d <= TAPER_EYES else max(0.0, 1 - (d - TAPER_EYES) / (EYES - TAPER_EYES))
+            edge = min(1.0, 1.0 if open_start else (f - frames[0] + 1) / fade,
+                       1.0 if open_end else (frames[-1] - f + 1) / fade)
             s = strength * size * edge
             if s > 0.01:
                 out[f].append((p, s))
@@ -158,11 +165,11 @@ def plan(dets, n, strength, smooth=2, fade=4, min_len=5):
 
 
 def restore_folder(folder, models_dir, model="gfpgan", strength=0.6, fidelity=0.7,
-                   providers=None, progress=None):
+                   providers=None, progress=None, scale=2):
     r = Restorer(models_dir, model, fidelity, providers)
     names = sorted(x for x in os.listdir(folder) if x.endswith(".png"))
     dets = [r.detect(cv2.imread(os.path.join(folder, x))) for x in names]
-    todo = plan(dets, len(names), strength)
+    todo = plan(dets, len(names), strength, scale)
     done = 0
     for i, (name, faces) in enumerate(zip(names, todo)):
         if faces:

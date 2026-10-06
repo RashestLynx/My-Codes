@@ -74,13 +74,20 @@ for what in "$@"; do
     get https://github.com/facefusion/facefusion-assets/releases/download/examples-3.0.0/target-1080p.mp4 faces/target-1080p.mp4
     # 60 frames of a real face: gt = the HD original at 1280x960 (the "2x upscale" size), sd =
     # the same shrunk to a DVD-sized 640x480 frame (MPEG-2), up = sd upscaled 2x. closeup: the
-    # face fills the frame; medium: the shot at half size in the middle (a small face)
-    for layout in closeup medium; do
+    # face fills the frame; medium, small, tiny: the shot smaller in the middle
+    # (eye distance in the 640x480 frame: closeup 65 px, medium 33, small 20, tiny 13)
+    for layout in closeup medium small tiny; do
       d=faces/$layout; rm -rf $d; mkdir -p $d/gt $d/sd $d/up
-      if [ $layout = closeup ]; then pad="scale=640:338:flags=area,pad=640:480:0:71"
-        gtpad="scale=1280:676:flags=area,pad=1280:960:0:142"
-      else pad="scale=320:169:flags=area,pad=640:480:160:155"
-        gtpad="scale=640:338:flags=area,pad=1280:960:320:310"; fi
+      case $layout in
+      closeup) pad="scale=640:338:flags=area,pad=640:480:0:71"
+               gtpad="scale=1280:676:flags=area,pad=1280:960:0:142" ;;
+      medium)  pad="scale=320:169:flags=area,pad=640:480:160:155"
+               gtpad="scale=640:338:flags=area,pad=1280:960:320:310" ;;
+      small)   pad="scale=192:101:flags=area,pad=640:480:224:189"
+               gtpad="scale=384:202:flags=area,pad=1280:960:448:378" ;;
+      tiny)    pad="scale=128:68:flags=area,pad=640:480:256:206"
+               gtpad="scale=256:136:flags=area,pad=1280:960:512:412" ;;
+      esac
       ff -ss 1 -i faces/target-1080p.mp4 -frames:v 60 -vf "$gtpad" $d/gt/%06d.png
       ff -ss 1 -i faces/target-1080p.mp4 -frames:v 60 -vf "$pad,format=yuv420p" -c:v mpeg2video \
          -b:v 4M -g 12 -bf 2 $d/sd.mpg
