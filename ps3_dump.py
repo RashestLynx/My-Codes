@@ -22,19 +22,32 @@ FORMAT NOTES
     unencrypted region. The gaps between them are the encrypted regions.
     All-zero sectors are left alone. (Matches ps3dec / redump tooling.)
   - Per-sector CBC IV = sector number, 16-byte big-endian.
-  - IRD layout (read_ird) and IRD region hashes are still UNVERIFIED -- a
-    hash mismatch may mean the parser is wrong rather than the dump.
+  - IRD layout (read_ird) and IRD region/file hashes are still UNVERIFIED --
+    an IRD mismatch may mean the parser is wrong rather than the dump.
 
 COMMANDS
   selftest                          offline checks, no disc needed
   drives                            list optical drives and whether a disc is in
   probe  [--device D] [--wait S]    identify the disc; no key needed
   ird-info game.ird                 inspect an IRD
+  check-key [--device D] --key-file K --key-type final|d1 [--ird game.ird]
+                                    spot-check a key on the disc in seconds
   dump   [--device D] [--key-file K] --key-type final|d1 --out game.iso
-         [--d1-secrets FILE]
-         [--ird game.ird] [--limit-sectors N] [--sectors N] [--force]
-         [--resume] [--wait S]
-  verify --ird game.ird game.iso    check a finished ISO against IRD hashes
+         [--d1-secrets FILE] [--ird game.ird] [--redump-dat redump.dat]
+         [--redump-sha1 H] [--verify] [--limit-sectors N] [--sectors N]
+         [--force] [--resume] [--wait S] [--no-spot-check] [--no-hash]
+  verify game.iso [--ird game.ird] [--redump-dat redump.dat] [--hashes F]
+                                    full integrity check of a finished ISO
+
+VERIFICATION
+  - Key spot check (before dumping): decrypts samples of the encrypted
+    regions and checks IRD file MD5s, file magics (SCE\0, \0PSF, ...) and
+    entropy. A wrong key aborts here instead of after an hour.
+  - Hashes: CRC32, MD5 and SHA-1 of the raw disc (encrypted, exactly what
+    Redump lists) and of the decrypted ISO, saved to game.iso.hashes.txt.
+  - Redump: raw hashes compared to a Redump .dat or --redump-sha1/md5/crc32.
+  - IRD: per-region MD5s and per-file MD5s of the decrypted ISO.
+  - --verify / verify: re-read the finished ISO from storage and recheck it.
 
   --device defaults to "auto": the drive holding a PS3 disc is picked for
   you. Explicit examples: /dev/sr0 (Linux, may need sudo), \\.\E: (Windows,
@@ -45,10 +58,14 @@ Requires: pip install cryptography
 """
 import argparse
 import bisect
+import collections
 import glob
 import gzip
 import hashlib
+import math
 import os
+import queue
+import random
 import re
 import shutil
 import stat
@@ -56,7 +73,9 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import xml.etree.ElementTree as ET
 import zlib
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -67,6 +86,7 @@ ISO_MAGIC = b"\x01CD001"     # ISO 9660 primary volume descriptor, sector 16
 PS3_VOLUME_ID = "PS3VOLUME"
 RETRIES = 3
 ZERO_SECTOR = bytes(SECTOR)
+PASS, WARN, FAIL, SKIP = "PASS", "WARN", "FAIL", "SKIP"
 
 
 class Ps3Error(Exception):
@@ -226,19 +246,18 @@ class RegionHasher:
         return [m.digest() for m in self.md5]
 
 
-def compare_ird_hashes(digests, ird_hashes) -> bool:
+def compare_ird_hashes(digests, ird_hashes, regions):
+    """Return a (status, detail) check result."""
     if len(digests) != len(ird_hashes):
-        print(f"IRD hash check: skipped (IRD has {len(ird_hashes)} region "
-              f"hashes, disc has {len(digests)} regions)")
-        return False
+        return WARN, (f"skipped: IRD has {len(ird_hashes)} region hashes, "
+                      f"disc has {len(digests)} regions")
     bad = [i for i, (a, b) in enumerate(zip(digests, ird_hashes)) if a != b]
     if not bad:
-        print(f"IRD hash check: all {len(digests)} regions match -- dump and key are good")
-        return True
-    print(f"IRD hash check: {len(bad)}/{len(digests)} regions differ (indexes "
-          f"{bad[:8]}). If only encrypted regions differ the key is likely "
-          f"wrong; the IRD hash layout itself is also unverified.")
-    return False
+        return PASS, f"all {len(digests)} region MD5s match"
+    enc_only = all(regions[i][2] for i in bad)
+    return FAIL, (f"{len(bad)}/{len(digests)} regions differ (indexes {bad[:8]})"
+                  + ("; only encrypted regions differ (wrong key, or damage there)"
+                     if enc_only else ""))
 
 
 # ------------------------------------------------------------------- IRD ---
@@ -264,8 +283,11 @@ def read_ird(path: str) -> dict:
         rcount = data[pos]; pos += 1
         hashes = [data[pos + 16 * i:pos + 16 * (i + 1)] for i in range(rcount)]
         pos += 16 * rcount
-        fcount = struct.unpack("<I", data[pos:pos + 4])[0]
-        pos += 4 + fcount * (8 + 16)
+        fcount = struct.unpack("<I", data[pos:pos + 4])[0]; pos += 4
+        files = {}
+        for _ in range(fcount):                 # u64 start sector, MD5
+            files[struct.unpack("<Q", data[pos:pos + 8])[0]] = data[pos + 8:pos + 24]
+            pos += 24
         pos += 4                              # extra config + attachments
         if version >= 9:
             pos += 115                        # PIC
@@ -276,7 +298,8 @@ def read_ird(path: str) -> dict:
             IndexError) as e:
         raise Ps3Error(f"Could not parse IRD ({e}); layout assumption may be wrong")
     return {"version": version, "game_id": game_id, "name": name,
-            "header": header, "region_hashes": hashes, "data1": data1}
+            "header": header, "region_hashes": hashes, "file_hashes": files,
+            "data1": data1}
 
 
 def normalize_title_id(tid) -> str:
@@ -513,7 +536,7 @@ def choose_device(device, wait=0.0) -> str:
 
 # ------------------------------------------------- disc identification ---
 def _iso_dir(read, lba: int, size: int):
-    """Yield (NAME, lba, size, is_dir) for an ISO 9660 directory."""
+    """Yield (NAME, lba, size, flags) for an ISO 9660 directory."""
     data = read(lba, (min(size, 1 << 20) + SECTOR - 1) // SECTOR)
     pos = 0
     while pos < len(data):
@@ -529,7 +552,7 @@ def _iso_dir(read, lba: int, size: int):
         if name not in (b"\0", b"\1"):
             yield (name.decode("ascii", "replace").split(";")[0].upper(),
                    int.from_bytes(rec[2:6], "little"),
-                   int.from_bytes(rec[10:14], "little"), bool(rec[25] & 2))
+                   int.from_bytes(rec[10:14], "little"), rec[25])
         pos += ln
 
 
@@ -539,13 +562,46 @@ def _iso_find(read, pvd: bytes, path: str):
     size = int.from_bytes(pvd[166:170], "little")
     parts = path.upper().split("/")
     for i, part in enumerate(parts):
-        for name, elba, esize, is_dir in _iso_dir(read, lba, size):
-            if name == part and is_dir == (i < len(parts) - 1):
+        for name, elba, esize, flags in _iso_dir(read, lba, size):
+            if name == part and bool(flags & 2) == (i < len(parts) - 1):
                 lba, size = elba, esize
                 break
         else:
             return None
     return read(lba, (min(size, 1 << 20) + SECTOR - 1) // SECTOR)[:size]
+
+
+def walk_iso(read, pvd: bytes):
+    """Return [(path, lba, size)] for every file on the ISO 9660 tree.
+
+    Multi-extent files (> 4 GiB) are merged; their extents are assumed to
+    be contiguous, which is how PS3 discs are mastered.
+    """
+    files, seen = [], set()
+    stack = [("", int.from_bytes(pvd[158:162], "little"),
+              int.from_bytes(pvd[166:170], "little"))]
+    while stack:
+        prefix, lba, size = stack.pop()
+        if lba in seen:
+            continue
+        seen.add(lba)
+        pending = None
+        for name, elba, esize, flags in _iso_dir(read, lba, size):
+            if flags & 2:
+                stack.append((prefix + name + "/", elba, esize))
+                continue
+            if pending and pending[0] == prefix + name:
+                pending[2] += esize
+            else:
+                if pending:
+                    files.append(tuple(pending))
+                pending = [prefix + name, elba, esize]
+            if not flags & 0x80:                 # last extent of this file
+                files.append(tuple(pending))
+                pending = None
+        if pending:
+            files.append(tuple(pending))
+    return sorted(files, key=lambda f: f[1])
 
 
 def parse_sfb_title_id(data):
@@ -639,9 +695,380 @@ def probe(device: str):
         print_disc_info(identify_disc(make_reader(dev)))
 
 
+
+
+# --------------------------------------------------------------- hashing ---
+HASH_KEYS = ("size", "crc32", "md5", "sha1")
+
+
+class MultiHash:
+    """CRC32 + MD5 + SHA-1 of one byte stream (the set Redump publishes)."""
+
+    def __init__(self):
+        self.size, self.crc = 0, 0
+        self.md5, self.sha1 = hashlib.md5(), hashlib.sha1()
+
+    def update(self, data):
+        self.size += len(data)
+        self.crc = zlib.crc32(data, self.crc)
+        self.md5.update(data)
+        self.sha1.update(data)
+
+    def result(self) -> dict:
+        return {"size": str(self.size), "crc32": f"{self.crc:08x}",
+                "md5": self.md5.hexdigest(), "sha1": self.sha1.hexdigest()}
+
+
+class FileHasher:
+    """MD5 per file, fed chunk by chunk. `files` = [(path, lba, size)] by lba."""
+
+    def __init__(self, files):
+        self.files = files
+        self.starts = [f[1] * SECTOR for f in files]
+        self.md5 = [hashlib.md5() for _ in files]
+
+    def feed(self, first: int, view: memoryview):
+        a = first * SECTOR
+        b = a + len(view)
+        i = max(bisect.bisect_right(self.starts, a) - 1, 0)
+        while i < len(self.files) and self.starts[i] < b:
+            fs = self.starts[i]
+            lo, hi = max(fs, a), min(fs + self.files[i][2], b)
+            if lo < hi:
+                self.md5[i].update(view[lo - a:hi - a])
+            i += 1
+
+    def digests(self):
+        return [m.digest() for m in self.md5]
+
+
+def write_hashes(path, hashes: dict):
+    with open(path, "w") as f:
+        f.write("# ps3_dump hashes. raw = disc exactly as read (encrypted; what "
+                "Redump lists), iso = decrypted output\n")
+        for prefix, h in hashes.items():
+            for k in HASH_KEYS:
+                f.write(f"{prefix}.{k} {h[k]}\n")
+
+
+def read_hashes(path) -> dict:
+    out = {}
+    with open(path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) == 2 and not parts[0].startswith("#"):
+                prefix, _, field = parts[0].partition(".")
+                out.setdefault(prefix, {})[field] = parts[1].lower()
+    return out
+
+
+def print_hashes(label, h):
+    pad = " " * len(label)
+    print(f"{label}  size  {h['size']}\n{pad}  crc32 {h['crc32']}\n"
+          f"{pad}  md5   {h['md5']}\n{pad}  sha1  {h['sha1']}")
+
+
+# ---------------------------------------------------------------- redump ---
+def load_redump(dat=None, sha1=None, md5=None, crc32=None) -> list:
+    """Expected Redump entries from a .dat (XML) and/or command-line hashes."""
+    entries = []
+    if dat:
+        try:
+            root = ET.parse(dat).getroot()
+        except (OSError, ET.ParseError) as e:
+            raise Ps3Error(f"Cannot read Redump dat {dat}: {e}")
+        for game in root.iter("game"):
+            for rom in game.iter("rom"):
+                if not (rom.get("name") or "").lower().endswith(".iso"):
+                    continue
+                e = {"name": game.get("name") or rom.get("name")}
+                for attr, key in (("size", "size"), ("crc", "crc32"),
+                                  ("md5", "md5"), ("sha1", "sha1")):
+                    if rom.get(attr):
+                        e[key] = rom.get(attr).lower()
+                entries.append(e)
+        if not entries:
+            raise Ps3Error(f"{dat}: no .iso entries found")
+    given = {k: v.lower().removeprefix("0x") for k, v in
+             (("sha1", sha1), ("md5", md5), ("crc32", crc32)) if v}
+    if given:
+        entries.append({"name": "command line", **given})
+    return entries
+
+
+def compare_redump(raw: dict, entries):
+    for e in entries:
+        fields = [k for k in HASH_KEYS if k in e]
+        if fields and all(raw[k] == e[k] for k in fields):
+            return PASS, f"matches '{e['name']}' ({', '.join(fields)})"
+    same_size = [e for e in entries if e.get("size") == raw["size"]]
+    hint = (f"; '{same_size[0]['name']}' has the same size but other hashes "
+            f"(bad read, or a different revision)" if same_size else "")
+    return FAIL, f"raw sha1 {raw['sha1']} matches no Redump entry{hint}"
+
+
+def redump_args(a) -> list:
+    return load_redump(a.redump_dat, a.redump_sha1, a.redump_md5, a.redump_crc32)
+
+
+# ------------------------------------------------------------ verification -
+def compare_ird_files(files, digests, ird_files):
+    bad = [f[0] for f, d in zip(files, digests) if ird_files.get(f[1]) != d]
+    missing = len(set(ird_files) - {f[1] for f in files})
+    if not files:
+        return WARN, "no IRD file entries matched files on the disc"
+    note = f"; {missing} IRD entries not checked" if missing else ""
+    if bad:
+        return FAIL, f"{len(bad)}/{len(files)} files differ, e.g. {bad[:3]}{note}"
+    return PASS, f"all {len(files)} file MD5s match{note}"
+
+
+def print_summary(checks):
+    if not checks:
+        return
+    print("\nSummary")
+    w = max(len(c[0]) for c in checks)
+    for name, status, detail in checks:
+        print(f"  {status:4}  {name:<{w}}  {detail}")
+
+
+class Progress:
+    def __init__(self, label, total, start=0):
+        self.label, self.total, self.start = label, max(total, 1), start
+        self.t0, self.last = time.time(), 0.0
+
+    def update(self, done, extra=""):
+        now = time.time()
+        if now - self.last < 0.5 and done < self.total:
+            return
+        self.last = now
+        rate = (done - self.start) * SECTOR / max(now - self.t0, 1e-6)
+        eta = (self.total - done) * SECTOR / max(rate, 1)
+        print(f"\r{self.label}: {done * 100 // self.total:3d}%  {rate / 1e6:6.1f} MB/s  "
+              f"ETA {int(eta // 60)}m{int(eta % 60):02d}s  {extra}   ",
+              end="", flush=True)
+
+    def done(self):
+        print()
+
+
+def iter_file_chunks(f, start, end):
+    """Yield (sector, view) over sectors [start, end) of an open image file."""
+    buf = bytearray(CHUNK_SECTORS * SECTOR)
+    sector = start
+    f.seek(start * SECTOR)
+    while sector < end:
+        n = min(CHUNK_SECTORS, end - sector)
+        got = read_into(f, sector, memoryview(buf)[:n * SECTOR])
+        got -= got % SECTOR
+        if not got:
+            return
+        yield sector, memoryview(buf)[:got]
+        sector += got // SECTOR
+
+
+def scan_iso(iso_path, ird=None):
+    """One pass over a decrypted ISO: hashes plus IRD region / file MD5s."""
+    with open(iso_path, "rb", buffering=0) as f:
+        regions = parse_regions(read_at(f, 0, 1))
+        total = os.fstat(f.fileno()).st_size // SECTOR
+        files = []
+        if ird and ird["file_hashes"]:
+            pvd = read_at(f, 16, 1)
+            if pvd[:6] == ISO_MAGIC:
+                files = [x for x in walk_iso(lambda s, n: read_at(f, s, n), pvd)
+                         if x[1] in ird["file_hashes"]]
+        mh, rh, fh = MultiHash(), RegionHasher(regions), FileHasher(files)
+        prog = Progress("Verifying", total)
+        for sector, view in iter_file_chunks(f, 0, total):
+            mh.update(view)
+            rh.feed(sector, view)
+            fh.feed(sector, view)
+            prog.update(sector + len(view) // SECTOR)
+        prog.done()
+    return {"regions": regions, "iso": mh.result(), "region_md5": rh.digests(),
+            "files": files, "file_md5": fh.digests()}
+
+
+def ird_checks(ird, regions, region_md5, files, file_md5):
+    out = []
+    if region_md5 is not None:
+        out.append(("IRD region MD5s", *compare_ird_hashes(region_md5, ird["region_hashes"], regions)))
+    if ird["file_hashes"]:
+        out.append(("IRD file MD5s", *compare_ird_files(files, file_md5, ird["file_hashes"])))
+    return out
+
+
+def verify_cmd(iso_path, ird=None, redump=None, hashes_path=None):
+    """Full check of a finished ISO against everything we have."""
+    res = scan_iso(iso_path, ird)
+    print_hashes("Decrypted ISO", res["iso"])
+    checks = []
+    hashes_path = hashes_path or iso_path + ".hashes.txt"
+    saved = read_hashes(hashes_path) if os.path.exists(hashes_path) else {}
+    if "iso" in saved:
+        same = saved["iso"] == res["iso"]
+        checks.append(("Dump-time hashes", PASS if same else FAIL,
+                       "ISO unchanged since it was dumped" if same else
+                       f"ISO differs from {hashes_path} -- file corrupted or modified"))
+    if ird:
+        checks += ird_checks(ird, res["regions"], res["region_md5"],
+                             res["files"], res["file_md5"])
+    if redump:
+        if "raw" in saved:
+            checks.append(("Redump", *compare_redump(saved["raw"], redump)))
+        else:
+            checks.append(("Redump", SKIP, "Redump hashes cover the encrypted disc; "
+                           "they're recorded by `dump` in the .hashes.txt file"))
+    if not checks:
+        checks.append(("Verification", WARN, "nothing to compare against: pass "
+                       "--ird, --redump-dat or keep the .hashes.txt from the dump"))
+    print_summary(checks)
+    if any(c[1] == FAIL for c in checks):
+        raise Ps3Error("Verification failed")
+
+
+# ---------------------------------------------------------- spot checks ----
+MAGIC_BY_EXT = {".SELF": b"SCE\0", ".SPRX": b"SCE\0", ".EDAT": b"NPD\0",
+                ".SDAT": b"NPD\0", ".SFO": b"\0PSF", ".PNG": b"\x89PNG",
+                ".PAM": b"PAMF", ".PMF": b"PAMF", ".AT3": b"RIFF"}
+
+
+def _magic_for(path):
+    base = path.rsplit("/", 1)[-1]
+    if base == "EBOOT.BIN":
+        return b"SCE\0"
+    return MAGIC_BY_EXT.get(os.path.splitext(base)[1])
+
+
+def sector_entropy(data) -> float:
+    n = len(data)
+    return -sum(c / n * math.log2(c / n) for c in collections.Counter(data).values())
+
+
+def spot_check(dev, regions, key, ird=None, samples=48):
+    """Quick key check on the encrypted regions, before the long dump.
+
+    1. IRD MD5s of small files in encrypted regions (definitive).
+    2. Known magics (SCE\\0, NPD\\0, \\0PSF, PNG, ...) at encrypted file starts.
+    3. Entropy of sampled decrypted sectors: a wrong key turns everything into
+       noise (~7.9 bits/byte); real data usually has some structure.
+    """
+    enc = [r for r in regions if r[2]]
+    if not enc:
+        return SKIP, "disc has no encrypted regions"
+    read = make_reader(dev, regions, key)
+    files = []
+    pvd = read(16, 1)
+    if pvd[:6] == ISO_MAGIC:
+        try:
+            files = walk_iso(read, pvd)
+        except (struct.error, ValueError, IndexError):
+            pass
+    enc_files = [f for f in files if f[2] and is_encrypted(f[1], regions)]
+
+    ird_files = (ird or {}).get("file_hashes") or {}
+    cands = sorted((f for f in enc_files if f[1] in ird_files and f[2] <= 4 << 20),
+                   key=lambda f: f[2])[:3]
+    ird_note = None
+    if cands:
+        for path, lba, size in cands:
+            if hashlib.md5(read(lba, -(-size // SECTOR))[:size]).digest() == ird_files[lba]:
+                return PASS, f"IRD MD5 matches for {path} (definitive)"
+        ird_note = f"IRD MD5 mismatch on {len(cands)} encrypted files"
+
+    hits = checked = 0
+    for path, lba, size in enc_files:
+        magic = _magic_for(path)
+        if not magic or size < len(magic):
+            continue
+        checked += 1
+        hits += read(lba, 1)[:len(magic)] == magic
+        if checked >= 8:
+            break
+
+    rng = random.Random(0)
+    total_enc = sum(e - s + 1 for s, e, _ in enc)
+    low = tested = 0
+    for _ in range(samples):
+        k = rng.randrange(total_enc)
+        for s, e, _ in enc:
+            if k <= e - s:
+                sec = s + k
+                break
+            k -= e - s + 1
+        raw = read_at(dev, sec, 1)
+        if len(raw) != SECTOR or raw == ZERO_SECTOR:
+            continue
+        tested += 1
+        low += sector_entropy(decrypt_sector(key, sec, raw)) < 7.5
+
+    detail = (f"file magics {hits}/{checked}, structured sectors {low}/{tested}"
+              + (f"; {ird_note}" if ird_note else ""))
+    if hits or low:
+        return (WARN if ird_note else PASS), detail
+    if checked >= 2 or ird_note:
+        return FAIL, detail + " -- decrypted data is noise, key looks wrong"
+    return WARN, detail + " -- not enough evidence either way"
+
+
+def check_key(device, key, ird=None):
+    with open_device(device) as dev:
+        regions = parse_regions(read_at(dev, 0, 1))
+        status, detail = spot_check(dev, regions, key, ird)
+    print(f"Key spot check: {status} -- {detail}")
+    if status == FAIL:
+        raise Ps3Error("Key spot check failed")
+
+
+# ----------------------------------------------------------- read-ahead ----
+def iter_chunks(dev, start, total, depth=4):
+    """Yield (sector, view, bad_sectors) while a thread reads ahead.
+
+    Disc reads block in the kernel, so overlapping them with decryption and
+    hashing keeps the drive streaming instead of idling between chunks.
+    """
+    free, full = queue.Queue(), queue.Queue()
+    for _ in range(depth):
+        free.put(bytearray(CHUNK_SECTORS * SECTOR))
+    stop = threading.Event()
+
+    def worker():
+        try:
+            s = start
+            while s < total:
+                buf = free.get()
+                if stop.is_set():
+                    break
+                n = min(CHUNK_SECTORS, total - s)
+                full.put((s, buf, n, read_chunk(dev, s, memoryview(buf)[:n * SECTOR])))
+                s += n
+            full.put(None)
+        except BaseException as e:               # hand errors to the consumer
+            full.put(e)
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    try:
+        while True:
+            item = full.get()
+            if item is None:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            s, buf, n, bad = item
+            yield s, memoryview(buf)[:n * SECTOR], bad
+            free.put(buf)
+    finally:
+        stop.set()
+        free.put(bytearray(0))                   # wake a worker waiting on a buffer
+        t.join()
+
+
 # ----------------------------------------------------------------- dump ----
 def dump(device, key, out_path, ird=None, limit=None, sectors=None,
-         force=False, resume=False):
+         force=False, resume=False, redump=None, spot=True,
+         full_verify=False, hashing=True):
     part = out_path + ".part"
     if os.path.exists(out_path) and not force:
         raise Ps3Error(f"{out_path} exists (use --force to overwrite)")
@@ -651,11 +1078,11 @@ def dump(device, key, out_path, ird=None, limit=None, sectors=None,
     elif os.path.exists(part) and not force:
         raise Ps3Error(f"{part} exists from an earlier run; use --resume to "
                        f"continue it or --force to start over")
-    bad = []
+    checks, bad, raw_bad = [], [], []
     with open_device(device) as dev:
-        total = device_sectors(dev, sectors)
-        if limit:
-            total = min(total, limit)
+        disc_total = device_sectors(dev, sectors)
+        total = min(disc_total, limit) if limit else disc_total
+        complete = total == disc_total
         start = min(start, total)
         free = shutil.disk_usage(os.path.dirname(os.path.abspath(out_path))).free
         if free < (total - start) * SECTOR:
@@ -676,89 +1103,122 @@ def dump(device, key, out_path, ird=None, limit=None, sectors=None,
         n_enc = sum(1 for r in regions if r[2])
         print(f"{total} sectors, {len(regions)} regions, {n_enc} encrypted")
 
-        disc = identify_disc(make_reader(dev, regions, key))
+        reader = make_reader(dev, regions, key)
+        disc = identify_disc(reader)
         print_disc_info(disc)
         if ird and disc["title_id"] and \
                 normalize_title_id(disc["title_id"]) != normalize_title_id(ird["game_id"]):
             raise Ps3Error(f"Disc is {disc['title_id']} but the IRD is for "
                            f"{ird['game_id']}; wrong IRD/key for this disc")
 
-        aes = algorithms.AES(key)
-        index = EncryptedIndex(regions)
-        hasher = RegionHasher(regions) if (ird and start == 0 and not limit) else None
-        buf = bytearray(CHUNK_SECTORS * SECTOR)
-        mv = memoryview(buf)
+        if spot:
+            status, detail = spot_check(dev, regions, key, ird)
+            print(f"Key spot check: {status} -- {detail}")
+            checks.append(("Key spot check", status, detail))
+            if status == FAIL:
+                raise Ps3Error("Key spot check failed: the encrypted regions "
+                               "decrypt to noise. Wrong key, or wrong "
+                               "--key-type? (--no-spot-check to dump anyway)")
 
+        files = []
+        if hashing and ird and ird["file_hashes"]:
+            pvd = reader(16, 1)
+            if pvd[:6] == ISO_MAGIC:
+                files = [f for f in walk_iso(reader, pvd) if f[1] in ird["file_hashes"]
+                         and f[1] * SECTOR + f[2] <= total * SECTOR]
+        raw_h, iso_h = MultiHash(), MultiHash()
+        region_h, file_h = RegionHasher(regions), FileHasher(files)
+
+        def feed_output(sector, view):
+            iso_h.update(view)
+            region_h.feed(sector, view)
+            file_h.feed(sector, view)
+
+        if start and hashing:                    # rebuild hash state for resume
+            with open(part, "rb", buffering=0) as pf:
+                prog = Progress("Re-hashing partial dump", start)
+                for s, view in iter_file_chunks(pf, 0, start):
+                    feed_output(s, view)
+                    prog.update(s + len(view) // SECTOR)
+                prog.done()
+            prog = Progress("Re-reading disc for raw hashes", start)
+            for s, view, b in iter_chunks(dev, 0, start):
+                raw_bad += b
+                raw_h.update(view)
+                prog.update(s + len(view) // SECTOR)
+            prog.done()
+
+        aes, index = algorithms.AES(key), EncryptedIndex(regions)
         if start:
             print(f"Resuming at sector {start} ({start * 100 // max(total, 1)}%)")
         with open(part, "r+b" if start else "wb") as out:
             out.truncate(start * SECTOR)
             out.seek(start * SECTOR)
-            sector, t0, last_print = start, time.time(), 0.0
-            while sector < total:
-                n = min(CHUNK_SECTORS, total - sector)
-                view = mv[:n * SECTOR]
-                bad += read_chunk(dev, sector, view)
-                decrypt_chunk(aes, view, sector, index)
-                if hasher:
-                    hasher.feed(sector, view)
+            prog = Progress("Dumping", total, start)
+            for s, view, b in iter_chunks(dev, start, total):
+                bad += b
+                if hashing:
+                    raw_h.update(view)           # before decryption = Redump hash
+                decrypt_chunk(aes, view, s, index)
+                if hashing:
+                    feed_output(s, view)
                 out.write(view)
-                sector += n
-                now = time.time()
-                if now - last_print >= 0.5 or sector == total:
-                    last_print = now
-                    rate = (sector - start) * SECTOR / max(now - t0, 1e-6)
-                    eta = (total - sector) * SECTOR / max(rate, 1)
-                    print(f"\r{sector * 100 // total:3d}%  {rate / 1e6:6.1f} MB/s  "
-                          f"ETA {int(eta // 60)}m{int(eta % 60):02d}s  "
-                          f"bad {len(bad)}   ", end="", flush=True)
-        print()
+                prog.update(s + len(view) // SECTOR, f"bad {len(bad)}")
+            prog.done()
     os.replace(part, out_path)
 
     if bad:
         bad_list = out_path + ".bad-sectors.txt"
         with open(bad_list, "w") as f:
             f.write("\n".join(map(str, bad)) + "\n")
-        print(f"WARNING: {len(bad)} unreadable sectors zero-filled "
-              f"(first: {bad[:5]}, full list in {bad_list}). Clean the disc and retry.")
+        checks.append(("Readable sectors", FAIL, f"{len(bad)} unreadable sectors "
+                       f"zero-filled (first {bad[:5]}, list in {bad_list}); "
+                       f"clean the disc and retry"))
     if total > 16:
         with open(out_path, "rb") as f:
             f.seek(16 * SECTOR)
             ok = f.read(6) == ISO_MAGIC
-        print("ISO 9660 header check:", "OK" if ok else "FAILED -- bad read or wrong regions")
-        if not ok:
-            raise Ps3Error("Output failed the basic header check")
-    if ird and not limit:
-        digests = hasher.digests() if hasher else hash_iso_regions(out_path, regions)
-        compare_ird_hashes(digests, ird["region_hashes"])
-    else:
-        print("Note: the ISO header sits in a plain region, so it does NOT prove "
-              "the key is right. Pass --ird for a hash check, or load the ISO in RPCS3.")
-    if bad:
-        raise Ps3Error("Dump finished with unreadable sectors")
+        checks.append(("ISO 9660 header", PASS if ok else FAIL,
+                       "present" if ok else "missing -- bad read or wrong regions"))
+
+    hashes = {}
+    if hashing:
+        hashes["iso"] = iso_h.result()
+        print_hashes("Decrypted ISO", hashes["iso"])
+        if complete and not bad and not raw_bad:
+            hashes["raw"] = raw_h.result()
+            print_hashes("Raw disc (Redump)", hashes["raw"])
+        write_hashes(out_path + ".hashes.txt", hashes)
+        print(f"Hashes saved to {out_path}.hashes.txt")
+
+    if redump:
+        if "raw" in hashes:
+            checks.append(("Redump", *compare_redump(hashes["raw"], redump)))
+        else:
+            checks.append(("Redump", SKIP, "needs a complete dump with no bad "
+                           "sectors and hashing on"))
+    if ird and hashing:
+        checks += ird_checks(ird, regions, region_h.digests() if complete else None,
+                             files, file_h.digests())
+
+    if full_verify:
+        res = scan_iso(out_path, ird)
+        if hashing:
+            same = res["iso"] == hashes["iso"]
+            checks.append(("Re-read of output", PASS if same else FAIL,
+                           "ISO on disk matches what was written" if same else
+                           "ISO on disk differs from what was written -- storage problem?"))
+        elif ird:
+            checks += ird_checks(ird, res["regions"], res["region_md5"] if complete
+                                 else None, res["files"], res["file_md5"])
+
+    if not redump and not ird:
+        checks.append(("Key proof", SKIP, "pass --ird or --redump-dat for a "
+                       "hash check, or load the ISO in RPCS3"))
+    print_summary(checks)
+    if any(c[1] == FAIL for c in checks):
+        raise Ps3Error("Dump finished with failed checks (see summary)")
     print("Done:", out_path)
-
-
-def hash_iso_regions(iso_path, regions):
-    hasher = RegionHasher(regions)
-    buf = bytearray(CHUNK_SECTORS * SECTOR)
-    with open(iso_path, "rb", buffering=0) as f:
-        sector = 0
-        while True:
-            n = f.readinto(buf)
-            if not n:
-                break
-            n -= n % SECTOR
-            hasher.feed(sector, memoryview(buf)[:n])
-            sector += n // SECTOR
-    return hasher.digests()
-
-
-def verify(iso_path, ird):
-    with open(iso_path, "rb") as f:
-        regions = parse_regions(f.read(SECTOR))
-    if not compare_ird_hashes(hash_iso_regions(iso_path, regions), ird["region_hashes"]):
-        raise Ps3Error("Verification failed")
 
 
 # ------------------------------------------------------------- selftest ----
@@ -779,7 +1239,7 @@ def _make_test_disc():
     root = dirrec(b"\0", 20, SECTOR, True) + dirrec(b"\1", 20, SECTOR, True) \
         + dirrec(b"PS3_DISC.SFB;1", 22, 0x300) + dirrec(b"PS3_GAME", 21, SECTOR, True)
     game = dirrec(b"\0", 21, SECTOR, True) + dirrec(b"\1", 20, SECTOR, True) \
-        + dirrec(b"PARAM.SFO;1", 35, 64)
+        + dirrec(b"PARAM.SFO;1", 35, 64) + dirrec(b"EBOOT.BIN;1", 36, 3 * SECTOR - 100)
     sfb = bytearray(0x300)
     sfb[0:4] = b".SFB"
     sfb[0x20:0x28] = b"TITLE_ID"
@@ -801,7 +1261,28 @@ def _make_test_disc():
     original[21] = game.ljust(SECTOR, b"\0")
     original[22] = bytes(sfb).ljust(SECTOR, b"\0")
     original[35] = bytes(sfo).ljust(SECTOR, b"\0")    # inside the encrypted region
+    original[36] = b"SCE\0" + original[36][4:]        # EBOOT.BIN, encrypted too
     return hdr, original
+
+
+def _make_test_ird(hdr, region_md5, file_md5, key):
+    hdr_c = gzip.compress(hdr)
+    body = b"3IRD" + bytes([9]) + b"BLUS00000" + bytes([4]) + b"Test"
+    body += b"0100" + b"01.00" + b"01.00"
+    body += struct.pack("<I", len(hdr_c)) + hdr_c + struct.pack("<I", 0)
+    body += bytes([len(region_md5)]) + b"".join(region_md5)
+    body += struct.pack("<I", len(file_md5))
+    body += b"".join(struct.pack("<Q", lba) + md5 for lba, md5 in file_md5.items())
+    body += b"\0\0\0\0" + b"\0" * 115 + key + b"\0" * 16
+    return gzip.compress(body)
+
+
+def _expect_fail(fn, *args, **kw):
+    try:
+        fn(*args, **kw)
+    except Ps3Error:
+        return
+    raise AssertionError(f"{fn.__name__} should have failed")
 
 
 def selftest():
@@ -816,6 +1297,13 @@ def selftest():
     assert derive_disc_key(d1, sk, siv) == ecb.update(
         bytes(a ^ b for a, b in zip(d1, siv))) + ecb.finalize()
 
+    m = MultiHash()
+    m.update(b"abc")
+    assert m.result() == {"size": "3", "crc32": "352441c2",
+                          "md5": "900150983cd24fb0d6963f7d28e17f72",
+                          "sha1": "a9993e364706816aba3e25717850c26c9cd0d89d"}
+    assert sector_entropy(bytes(SECTOR)) == 0 and sector_entropy(os.urandom(SECTOR)) > 7.8
+
     hdr, original = _make_test_disc()
     regions = parse_regions(hdr)
     assert regions == [(0, 29, False), (30, 49, True), (50, 63, False)], regions
@@ -828,6 +1316,12 @@ def selftest():
                      if is_encrypted(s, regions) and original[s] != ZERO_SECTOR
                      else original[s] for s in range(64))
     expected = b"".join(original)
+    raw_sha1 = hashlib.sha1(image).hexdigest()
+    region_md5 = [hashlib.md5(expected[s * SECTOR:(e + 1) * SECTOR]).digest()
+                  for s, e, _ in regions]
+    eboot_size = 3 * SECTOR - 100
+    file_md5 = {35: hashlib.md5(original[35][:64]).digest(),
+                36: hashlib.md5(expected[36 * SECTOR:36 * SECTOR + eboot_size]).digest()}
 
     with tempfile.TemporaryDirectory() as td:
         img, outp = os.path.join(td, "disc.img"), os.path.join(td, "out.iso")
@@ -844,59 +1338,93 @@ def selftest():
         with open(kp, "w") as f:
             f.write((sk + siv).hex(" ") + "\n")
         assert load_d1_secrets(kp) == (sk, siv)
-        try:
-            load_d1_secrets(None)
-            raise AssertionError("missing secrets should fail")
-        except Ps3Error:
-            pass
+        _expect_fail(load_d1_secrets, None)
 
-        with open_device(img) as dev:            # identification, with/without key
+        ip = os.path.join(td, "t.ird")
+        with open(ip, "wb") as f:
+            f.write(_make_test_ird(hdr, region_md5, file_md5, key))
+        ird = read_ird(ip)
+        assert ird["data1"] == key and ird["game_id"] == "BLUS00000", ird
+        assert ird["file_hashes"] == file_md5
+        assert parse_regions(ird["header"][:SECTOR]) == regions
+
+        with open_device(img) as dev:            # identification + spot checks
             assert device_sectors(dev) == 64
             info = identify_disc(make_reader(dev))
             assert info["volume_id"] == PS3_VOLUME_ID, info
             assert info["title_id"] == "BLUS-00000" and info["title"] is None, info
-            info = identify_disc(make_reader(dev, regions, key))
-            assert info["title"] == "Test Game", info
+            reader = make_reader(dev, regions, key)
+            assert identify_disc(reader)["title"] == "Test Game"
+            assert [f[0] for f in walk_iso(reader, reader(16, 1))] == \
+                ["PS3_DISC.SFB", "PS3_GAME/PARAM.SFO", "PS3_GAME/EBOOT.BIN"]
+            assert spot_check(dev, regions, key)[0] == PASS
+            assert "definitive" in spot_check(dev, regions, key, ird)[1]
+            wrong = bytes(16)
+            assert spot_check(dev, regions, wrong)[0] == FAIL
+            assert spot_check(dev, regions, wrong, ird)[0] == FAIL
+            got = b"".join(bytes(v) for _, v, _ in iter_chunks(dev, 0, 64))
+            assert got == image
 
-        dump(img, key, outp)                    # end-to-end on a fake disc
+        dat = os.path.join(td, "redump.dat")
+        with open(dat, "w") as f:
+            f.write(f'<?xml version="1.0"?><datafile><game name="Test Game (USA)">'
+                    f'<rom name="Test Game (USA).iso" size="{len(image)}" '
+                    f'crc="{zlib.crc32(image):08x}" md5="{hashlib.md5(image).hexdigest()}" '
+                    f'sha1="{raw_sha1}"/></game></datafile>')
+        redump = load_redump(dat)
+        assert redump[0]["name"] == "Test Game (USA)" and redump[0]["sha1"] == raw_sha1
+
+        dump(img, key, outp, redump=redump, full_verify=True)   # end-to-end
         with open(outp, "rb") as f:
             assert f.read() == expected, "dump mismatch"
-        try:
-            dump(img, key, outp)
-            raise AssertionError("should refuse to overwrite")
-        except Ps3Error:
-            pass
+        saved = read_hashes(outp + ".hashes.txt")
+        assert saved["raw"]["sha1"] == raw_sha1
+        assert saved["iso"]["sha1"] == hashlib.sha1(expected).hexdigest()
+        _expect_fail(dump, img, key, outp)                      # no overwrite
+        _expect_fail(dump, img, key, outp, force=True,          # Redump mismatch
+                     redump=load_redump(sha1="00" * 20))
+        _expect_fail(dump, img, bytes(16), outp, force=True)    # wrong key
 
         os.remove(outp)                         # interrupted dump, then resume
         dump(img, key, outp, limit=37)
         os.replace(outp, outp + ".part")
-        dump(img, key, outp, resume=True)
+        dump(img, key, outp, resume=True, ird=ird, redump=redump)
         with open(outp, "rb") as f:
             assert f.read() == expected, "resume mismatch"
+        assert read_hashes(outp + ".hashes.txt") == saved, "resume hashes differ"
 
-        region_md5 = [hashlib.md5(expected[s * SECTOR:(e + 1) * SECTOR]).digest()
-                      for s, e, _ in regions]
-        assert hash_iso_regions(outp, regions) == region_md5
-
-        hdr_c = gzip.compress(hdr)              # synthetic IRD (self-consistency only)
-        body = b"3IRD" + bytes([9]) + b"BLUS00000" + bytes([4]) + b"Test"
-        body += b"0100" + b"01.00" + b"01.00"
-        body += struct.pack("<I", len(hdr_c)) + hdr_c + struct.pack("<I", 0)
-        body += bytes([len(region_md5)]) + b"".join(region_md5)
-        body += struct.pack("<I", 1) + b"\0" * 24
-        body += b"\0\0\0\0" + b"\0" * 115 + key + b"\0" * 16
-        ip = os.path.join(td, "t.ird")
-        with open(ip, "wb") as f:
-            f.write(gzip.compress(body))
-        ird = read_ird(ip)
-        assert ird["data1"] == key and ird["game_id"] == "BLUS00000", ird
-        assert parse_regions(ird["header"][:SECTOR]) == regions
-        verify(outp, ird)
-        dump(img, key, outp, ird=ird, force=True)   # inline hashing path
+        dump(img, key, outp, ird=ird, force=True, full_verify=True)
+        verify_cmd(outp, ird, redump)
+        res = scan_iso(outp, ird)
+        assert res["region_md5"] == region_md5 and len(res["files"]) == 2
+        with open(outp, "r+b") as f:                            # corrupt EBOOT
+            f.seek(37 * SECTOR)
+            f.write(b"X")
+        _expect_fail(verify_cmd, outp, ird)
     print("selftest OK")
 
 
 # ------------------------------------------------------------------ main ---
+def add_redump_args(sp):
+    sp.add_argument("--redump-dat", help="Redump .dat (XML) to compare against")
+    sp.add_argument("--redump-sha1")
+    sp.add_argument("--redump-md5")
+    sp.add_argument("--redump-crc32")
+
+
+def resolve_key(a, ird):
+    if a.key_file:
+        key = load_key_file(a.key_file)
+    elif a.key_type == "d1" and ird:
+        key = ird["data1"]
+        print("Using d1 from the IRD")
+    else:
+        raise Ps3Error("--key-file is required (or --ird with --key-type d1)")
+    if a.key_type == "d1":
+        key = derive_disc_key(key, *load_d1_secrets(a.d1_secrets))
+    return key
+
+
 def main():
     ap = argparse.ArgumentParser(description="PS3 disc dump tool")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -905,26 +1433,37 @@ def main():
     p = sub.add_parser("probe")
     i = sub.add_parser("ird-info"); i.add_argument("ird")
     d = sub.add_parser("dump")
-    for sp in (p, d):
+    c = sub.add_parser("check-key", help="spot-check a key on the disc, no dump")
+    for sp in (p, d, c):
         sp.add_argument("--device", default="auto",
                         help="drive or image path (default: auto-detect)")
         sp.add_argument("--wait", type=float, default=0,
                         help="seconds to wait for a disc when auto-detecting")
-    d.add_argument("--key-file",
-                   help="disc key or d1 (optional for d1 when --ird is given)")
-    d.add_argument("--key-type", choices=["final", "d1"], required=True)
-    d.add_argument("--d1-secrets", default=os.environ.get("PS3_D1_SECRETS"),
-                   help="file with the d1 derivation key + IV (32 bytes / 64 hex)")
-    d.add_argument("--ird")
+    for sp in (d, c):
+        sp.add_argument("--key-file",
+                        help="disc key or d1 (optional for d1 when --ird is given)")
+        sp.add_argument("--key-type", choices=["final", "d1"], required=True)
+        sp.add_argument("--d1-secrets", default=os.environ.get("PS3_D1_SECRETS"),
+                        help="file with the d1 derivation key + IV (32 bytes / 64 hex)")
+        sp.add_argument("--ird")
     d.add_argument("--out", required=True)
     d.add_argument("--limit-sectors", type=int)
     d.add_argument("--sectors", type=int, help="override detected disc size")
     d.add_argument("--force", action="store_true")
     d.add_argument("--resume", action="store_true",
                    help="continue an interrupted dump from OUT.part")
-    v = sub.add_parser("verify")
-    v.add_argument("--ird", required=True)
+    d.add_argument("--verify", action="store_true",
+                   help="re-read the finished ISO and check it end to end")
+    d.add_argument("--no-spot-check", action="store_true",
+                   help="skip the key check on encrypted regions before dumping")
+    d.add_argument("--no-hash", action="store_true",
+                   help="skip CRC32/MD5/SHA-1 hashing")
+    add_redump_args(d)
+    v = sub.add_parser("verify", help="full integrity check of a finished ISO")
     v.add_argument("iso")
+    v.add_argument("--ird")
+    v.add_argument("--hashes", help="hash file from dump (default ISO.hashes.txt)")
+    add_redump_args(v)
     a = ap.parse_args()
 
     try:
@@ -940,21 +1479,21 @@ def main():
             info = read_ird(a.ird)
             print(info["game_id"], info["name"], f"(IRD v{info['version']})")
             print("regions:", parse_regions(info["header"][:SECTOR]))
+            print(f"{len(info['region_hashes'])} region hashes, "
+                  f"{len(info['file_hashes'])} file hashes")
         elif a.cmd == "verify":
-            verify(a.iso, read_ird(a.ird))
+            verify_cmd(a.iso, read_ird(a.ird) if a.ird else None,
+                       redump_args(a), a.hashes)
+        elif a.cmd == "check-key":
+            ird = read_ird(a.ird) if a.ird else None
+            check_key(choose_device(a.device, a.wait), resolve_key(a, ird), ird)
         else:
             ird = read_ird(a.ird) if a.ird else None
-            if a.key_file:
-                key = load_key_file(a.key_file)
-            elif a.key_type == "d1" and ird:
-                key = ird["data1"]
-                print("Using d1 from the IRD")
-            else:
-                raise Ps3Error("--key-file is required (or --ird with --key-type d1)")
-            if a.key_type == "d1":
-                key = derive_disc_key(key, *load_d1_secrets(a.d1_secrets))
+            key = resolve_key(a, ird)
             dump(choose_device(a.device, a.wait), key, a.out, ird,
-                 a.limit_sectors, a.sectors, a.force, a.resume)
+                 a.limit_sectors, a.sectors, a.force, a.resume,
+                 redump=redump_args(a), spot=not a.no_spot_check,
+                 full_verify=a.verify, hashing=not a.no_hash)
     except Ps3Error as e:
         sys.exit(f"error: {e}")
     except KeyboardInterrupt:
