@@ -764,13 +764,19 @@ def compact_model(a):
 #   100, 32: 80%), so a reset after a good stretch of frames doesn't step down (Chunk.upscale)
 GPU_STEPS = {True: ((8, None), (6, None), (4, None), (2, None), (1, None), (1, 100), (1, 64)),
              False: ((2, None), (1, None), (1, 100), (1, 64), (1, 32))}  # compact?: steps
+# the current ncnn (see ncnn_upscaler_main) does one frame at a time anyway
+NCNN_STEPS = ((1, None), (1, 100), (1, 64), (1, 32))
 GPU_STEP = [0]          # how many steps down this run has gone
+
+
+def gpu_steps(a):
+    return NCNN_STEPS if getattr(a, "engine", "exe") == "ncnn" else GPU_STEPS[compact_model(a)]
 
 
 def gpu_load(a, step=None):
     """(frames at once, tile size or None) at a step (default: the current one); --gpu-threads
     and --tile, when given, are kept at every step"""
-    steps = GPU_STEPS[compact_model(a)]
+    steps = gpu_steps(a)
     threads, tile = steps[min(GPU_STEP[0] if step is None else step, len(steps) - 1)]
     return (a.gpu_threads if a.gpu_threads is not None else threads,
             a.tile or tile)
@@ -790,7 +796,7 @@ def gpu_load_text(a):
 def lower_gpu_load(a):
     """One step less on the GPU at once for the rest of the run (steps that don't change
     anything next to --gpu-threads/--tile are passed over); False if there is none left."""
-    steps = GPU_STEPS[compact_model(a)]
+    steps = gpu_steps(a)
     now = gpu_load(a)
     for k in range(GPU_STEP[0] + 1, len(steps)):
         if gpu_load(a, k) != now:
@@ -810,15 +816,22 @@ def gpu_step_file():
 
 
 def gpu_step_key(a):
-    return a.model + (f"@{a.gpu}" if a.gpu else "")      # (per model: x4plus is 4x the work)
+    # (per model, x4plus being 4x the work; per engine; per --gpu)
+    return (a.model + ("/ncnn" if getattr(a, "engine", "exe") == "ncnn" else "")
+            + (f"@{a.gpu}" if a.gpu else ""))
+
+
+FRAMES_OK = [0]         # frames upscaled since the last GPU reset (this model and engine)
 
 
 def load_gpu_step(a):
     """The first step no bigger than the one saved: (frames, tile) is kept, not the step number,
-    so a changed list of steps still reads it right"""
+    so a changed list of steps still reads it right. Also the frames since the last reset."""
     try:
-        threads, tile = json.loads(gpu_step_file().read_text(encoding="utf-8"))[gpu_step_key(a)]
-        for k, (t2, p2) in enumerate(GPU_STEPS[compact_model(a)]):
+        saved = json.loads(gpu_step_file().read_text(encoding="utf-8"))
+        FRAMES_OK[0] = int(saved.get(gpu_step_key(a) + "#ok", 0))
+        threads, tile = saved[gpu_step_key(a)]
+        for k, (t2, p2) in enumerate(gpu_steps(a)):
             # (no tile: whole frames for the compact models, 200 for the big ones)
             if t2 <= int(threads) and (p2 or 10 ** 4) <= (int(tile) if tile else 10 ** 4):
                 GPU_STEP[0] = k
@@ -828,15 +841,21 @@ def load_gpu_step(a):
     return False
 
 
-def save_gpu_step(a):
+def save_gpu_step(a, frames_only=False):
+    """frames_only: just the frames since the last reset (after each chunk, once the file
+    exists: a run with no reset ever leaves no file)"""
     path = gpu_step_file()
     try:
         try:
             saved = json.loads(path.read_text(encoding="utf-8"))
             saved = saved if isinstance(saved, dict) else {}
         except (OSError, ValueError):
+            if frames_only:
+                return
             saved = {}
-        saved[gpu_step_key(a)] = list(GPU_STEPS[compact_model(a)][GPU_STEP[0]])
+        if not frames_only:
+            saved[gpu_step_key(a)] = list(gpu_steps(a)[GPU_STEP[0]])
+        saved[gpu_step_key(a) + "#ok"] = FRAMES_OK[0]
         path.write_text(json.dumps(saved, indent=1), encoding="utf-8")
     except OSError:
         pass
@@ -846,9 +865,12 @@ def esrgan_cmd(a, src, dst, size=None, gpu=None):
     compact = compact_model(a)
     gpu = gpu if gpu is not None else gpu_list(a)[0]
     threads, tile = gpu_load(a)
+    # (the current ncnn: this script as the upscaler, with the same command line)
+    exe = ([sys.executable, Path(__file__).resolve(), "--ncnn-upscaler"]
+           if getattr(a, "engine", "exe") == "ncnn" else [a.esrgan_path])
     # threads to load:upscale:save frames (default 1:2:2): reading and writing the PNGs is CPU
     # work that otherwise leaves the GPU waiting
-    cmd = [a.esrgan_path, "-i", src, "-o", dst, "-n", a.model, "-s", a.scale, "-f", "png",
+    cmd = [*exe, "-i", src, "-o", dst, "-n", a.model, "-s", a.scale, "-f", "png",
            "-j", f"2:{threads}:4"]
     models = models_dir(a)
     if models.is_dir():
@@ -869,7 +891,8 @@ def esrgan_cmd(a, src, dst, size=None, gpu=None):
 # reset, out of video memory) or a frame can't be read or written: its frames are then black,
 # garbled or missing
 GPU_ERRORS = re.compile(r"vk(QueueSubmit|WaitForFences|AllocateMemory|MapMemory)\w* failed|"
-                        r"VK_ERROR_DEVICE_LOST|device lost|(en|de)code image .* failed", re.I)
+                        r"VK_ERROR_DEVICE_LOST|device lost|(en|de)code image .* failed|"
+                        r"ncnn: GPU error", re.I)
 
 
 def upscaler_log_tail(path, limit=8):
@@ -1235,6 +1258,8 @@ def check_upscaler(a):
             status_line()
             lines = errors or [x.strip() for x in text.splitlines()
                                if x.strip() and not x.strip().endswith("%")]
+            if getattr(a, "engine", "exe") == "ncnn":
+                return ncnn_fallback(a, lines[-1][:120] if lines else f"exit code {rc}")
             reset = re.search(r"QueueSubmit failed -4\b|DEVICE_LOST|device lost", text, re.I)
             sys.exit(f"The upscaler failed on a small test picture, before the movie started "
                      f"({lines[-1][:120] if lines else f'exit code {rc}'}).\n"
@@ -1259,10 +1284,24 @@ def check_upscaler(a):
                 diffs.append(model - plain)
         if len(diffs) == 2 and sum(diffs) / 2 < -5.5:
             status_line()
+            if getattr(a, "engine", "exe") == "ncnn":
+                return ncnn_fallback(a, f"a smeared picture, {-sum(diffs) / 2:.1f} dB worse "
+                                        "than a plain resize")
             sys.exit(f"The upscaler's model {a.model} gives a smeared or garbled picture: two "
                      f"small test pictures came out {-sum(diffs) / 2:.1f} dB worse than a plain "
                      "resize (a working model: within 4). Its files are damaged or don't belong "
                      f"together. {files}.")
+
+
+def ncnn_fallback(a, why):
+    """The current ncnn failed the start-up test: realesrgan-ncnn-vulkan instead (tested too)."""
+    print(f"NOTE: the current ncnn didn't work here ({why}): using realesrgan-ncnn-vulkan's own "
+          "engine instead (--engine exe)", flush=True)
+    a.engine, GPU_STEP[0], FRAMES_OK[0] = "exe", 0, 0
+    load_gpu_step(a)
+    print(f"GPU settings: {gpu_load_text(a)}; "
+          + (f"up to {a.gpu_jobs} upscalers per GPU" if a.gpu_jobs > 1 else "one upscaler per GPU"))
+    return check_upscaler(a)
 
 
 def check_ffmpeg():
@@ -1765,6 +1804,155 @@ CV_DISTS = ("opencv-python-headless", "opencv-python", "opencv-contrib-python",
             "opencv-contrib-python-headless")
 
 
+NCNN_INSTALL = "python -m pip install --no-deps ncnn numpy"
+ESRGAN_DEFAULT = "realesrgan-ncnn-vulkan"
+
+
+def ncnn_available():
+    """The current ncnn from pip is installed (it isn't loaded here: the GPU is used by the
+    upscaler processes only)"""
+    import importlib.util
+    return all(importlib.util.find_spec(m) for m in ("ncnn", "numpy"))
+
+
+def write_png(path, rgb):
+    """An 8-bit RGB PNG (rows "Up"-filtered, zlib level 1), written to a temporary name next to
+    the folder and then renamed: a frame in the folder is always whole."""
+    import numpy as np
+    h, w, _ = rgb.shape
+    rows = rgb.reshape(h, w * 3)
+    raw = np.empty((h, w * 3 + 1), np.uint8)
+    raw[:, 0] = 2                                           # (filter type Up)
+    raw[0, 1:] = rows[0]
+    np.subtract(rows[1:], rows[:-1], out=raw[1:, 1:])       # (uint8: modulo 256, as PNG wants)
+
+    import zlib
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw.tobytes(), 1)) + chunk(b"IEND", b""))
+    tmp = Path(path).parent.parent / f".{Path(path).name}.{os.getpid()}.part"
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def ncnn_upscaler_main(argv):
+    """python dvd_upscale.py --ncnn-upscaler -i IN -o OUT -n MODEL -s SCALE [-m MODELS] [-t TILE]
+    [-g GPU] [-j L:P:S] [-f png]: realesrgan-ncnn-vulkan's job done with the current ncnn from
+    pip (NCNN_INSTALL) instead of the April 2022 ncnn built into it.
+    Why: NVIDIA drivers from 570 on give a program robust buffer access only when it asks, and
+    the 2022 ncnn doesn't ask (fixed in ncnn 20250916, "fix hangs with NVIDIA >565 drivers").
+    Big networks (x2plus, x4plus) then hang the GPU now and then and Windows resets it
+    ("vkWaitForFences/vkQueueSubmit failed -4"; seen on an RTX 3060 laptop, driver 610, after
+    10-200 frames, while the small anime model ran for hours).
+    The same command line (so run_upscaler and all around it work unchanged) and the same
+    picture: realesrgan.cpp's tiling ported as is. Tiles of -t pixels (0: by the GPU's memory,
+    200 above 1.9 GB) overlap by 10 pixels, mirrored at the frame edges; in RGB / 255, out x 255
+    rounded; fp16 storage, fp32 arithmetic. Only fp16 rounding differs (55 dB). One frame at a
+    time (ncnn's Python module holds the interpreter while the GPU works); frames are read in
+    one ffmpeg stream and written by 3 threads. A GPU error ends it at once, with a line
+    run_upscaler knows (GPU_ERRORS)."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-upscaler")
+    for opt in ("-i", "-o", "-n", "-s", "-m", "-t", "-g", "-j", "-f"):
+        p.add_argument(opt)
+    w = p.parse_args(argv)
+    try:
+        import numpy as np
+        import ncnn
+    except ImportError as e:
+        print(f"ncnn: can't load the current ncnn ({e}): {NCNN_INSTALL}", flush=True)
+        return 1
+    from concurrent.futures import ThreadPoolExecutor
+    scale, tile, pad = int(w.s), int(w.t or 0), 10
+    models = Path(w.m or "models")
+    for name in (w.n, f"{w.n}-x{scale}"):           # (the anime models carry the scale)
+        if (models / f"{name}.param").exists():
+            break
+    else:
+        print(f"ncnn: {w.n}.param not found in {models}", flush=True)
+        return 1
+    if ncnn.get_gpu_count() == 0:       # (ncnn has printed the Vulkan problem)
+        print("ncnn: no Vulkan GPU found (no vulkan)", flush=True)
+        return 1
+    gpu = int(w.g) if w.g not in (None, "") else ncnn.get_default_gpu_index()
+    net = ncnn.Net()
+    o = net.opt
+    o.use_vulkan_compute = True
+    o.use_fp16_packed = o.use_fp16_storage = True
+    o.use_fp16_arithmetic = o.use_bf16_storage = o.use_bf16_packed = False
+    o.use_int8_storage = True
+    net.set_vulkan_device(gpu)
+    if net.load_param(str(models / f"{name}.param")) or net.load_model(str(models / f"{name}.bin")):
+        print(f"ncnn: can't load {models / name}.param/.bin", flush=True)
+        return 1
+    if not tile:        # (realesrgan-ncnn-vulkan's own rule, main.cpp)
+        budget = ncnn.get_gpu_device(gpu).get_heap_budget()
+        tile = 200 if budget > 1900 else 100 if budget > 550 else 64 if budget > 190 else 32
+    src_dir, dst_dir = Path(w.i), Path(w.o)
+    files = sorted(f for f in os.listdir(src_dir) if f.lower().endswith(".png"))
+    print(f"ncnn {ncnn.__version__}: GPU {gpu} {ncnn.get_gpu_info(gpu).device_name()}, "
+          f"{name}, x{scale}, {tile}-pixel tiles, {len(files)} frames", flush=True)
+    if not files:
+        return 0
+    iw, ih = png_size(src_dir / files[0])
+    lst = Path(tempfile.gettempdir()) / f"dvd_upscale_ncnn_{os.getpid()}.txt"
+    lst.write_text("".join("file '" + (src_dir / f).resolve().as_posix().replace("'", "'\\''")
+                           + "'\n" for f in files), encoding="utf-8")
+    reader = subprocess.Popen(["ffmpeg", "-v", "error", "-nostdin", "-f", "concat", "-safe", "0",
+                               "-i", str(lst), "-fps_mode", "passthrough", "-f", "rawvideo",
+                               "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
+    saver = ThreadPoolExecutor(3)
+    pending = []
+    # (the tests: a GPU error after this many frames, in a process started with a tile size
+    # above 100; see dvd_upscale_dev)
+    fail_at = int(os.environ.get("DVD_UPSCALE_TEST_NCNN_FAIL", "-1")) if tile > 100 else -1
+    try:
+        for k, f in enumerate(files):
+            buf = reader.stdout.read(iw * ih * 3)
+            if len(buf) < iw * ih * 3:
+                print(f"ncnn: decode image {f} failed", flush=True)
+                return 1
+            img = np.frombuffer(buf, np.uint8).reshape(ih, iw, 3)
+            src = np.pad(img, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
+            src = np.ascontiguousarray(src.transpose(2, 0, 1), dtype=np.float32) * (1 / 255)
+            out = np.empty((ih * scale, iw * scale, 3), np.uint8)
+            for y0 in range(0, ih, tile):
+                th = min(tile, ih - y0)
+                for x0 in range(0, iw, tile):
+                    tw = min(tile, iw - x0)
+                    part = np.ascontiguousarray(src[:, y0:y0 + th + 2 * pad, x0:x0 + tw + 2 * pad])
+                    ex = net.create_extractor()
+                    mat = ncnn.Mat(part)            # (borrows part's memory: keep it alive)
+                    ex.input("data", mat)
+                    ret, res = ex.extract("output")
+                    if k == fail_at:
+                        ret = -4
+                    if ret:
+                        print(f"ncnn: GPU error (extract returned {ret}) on {f}", flush=True)
+                        return 1
+                    res = np.array(res)[:, pad * scale:(pad + th) * scale,
+                                        pad * scale:(pad + tw) * scale]
+                    out[y0 * scale:(y0 + th) * scale, x0 * scale:(x0 + tw) * scale] = \
+                        np.clip(np.floor(res * 255 + 0.5), 0, 255).astype(np.uint8).transpose(1, 2, 0)
+                    del ex, mat, part
+            pending.append(saver.submit(write_png, dst_dir / f"{Path(f).stem}.png", out))
+            while len(pending) > 6:     # (frames waiting to be written: a few)
+                pending.pop(0).result()
+        for fut in pending:
+            fut.result()
+        return 0
+    except OSError as e:
+        print(f"ncnn: encode image failed ({e})", flush=True)
+        return 1
+    finally:
+        saver.shutdown()        # (the frames finished before an error are good: written)
+        reader.kill()
+        reader.wait()
+        lst.unlink(missing_ok=True)
+
+
 def faces_worker_main(argv):
     """python dvd_upscale.py --faces-worker ...: the face restoration of one chunk's frames, in
     a process of its own (started by Chunk.restore_faces, never by hand). It only reads the
@@ -2184,6 +2372,9 @@ class Chunk:
                                                + ("" if self.lane else upscaler_log_tail(
                                                    tmp / "upscaler_log.txt")))
                         check_frames(a, tmp, n_in, strict=bool(self.lane))
+                        if not self.lane:
+                            FRAMES_OK[0] += n_in - kept
+                            save_gpu_step(a, frames_only=True)
                         break
                     except (RuntimeError, subprocess.CalledProcessError) as e:
                         # (no second try on a helper GPU: the main GPU redoes its chunk)
@@ -2205,7 +2396,12 @@ class Chunk:
                         # new frames or more, a reset costs less (~25 s) than a step down would
                         # for the rest of the run
                         gpu_err = isinstance(e, GPUError)
-                        lower = gpu_err and new < 120 and lower_gpu_load(a)
+                        # (counted across chunks and runs: one reset early in a chunk after
+                        # hours without one doesn't step down for good)
+                        since = FRAMES_OK[0] + max(0, new)
+                        if gpu_err:
+                            FRAMES_OK[0] = 0
+                        lower = gpu_err and since < 120 and lower_gpu_load(a)
                         if attempt >= 2 and not lower and not (further and attempt < 12):
                             if GPU_STEP[0] and isinstance(e, GPUError):
                                 raise RuntimeError(
@@ -4160,7 +4356,12 @@ def build_parser():
     p.add_argument("--fps", default=None, help="override output fps, e.g. 24000/1001")
     p.add_argument("--chunk-frames", type=int, default=None)
     p.add_argument("--test", type=int, default=0, help="only process first N seconds")
-    p.add_argument("--esrgan", default="realesrgan-ncnn-vulkan")
+    p.add_argument("--esrgan", default=ESRGAN_DEFAULT)
+    p.add_argument("--engine", choices=("auto", "exe", "ncnn"), default="auto", dest="engine_choice",
+                   help="what runs the big models (x2plus, x4plus): ncnn, the current ncnn from "
+                        f"pip ({NCNN_INSTALL}; fixes the GPU resets of current NVIDIA drivers), "
+                        "or exe, realesrgan-ncnn-vulkan's own (ncnn from 2022). auto (default): "
+                        "ncnn when it is installed (and --esrgan names no upscaler of its own)")
     p.add_argument("--gpu", default=None,
                    help="Vulkan GPU index for the upscaler (-g). Several, e.g. 0,1 (a laptop's "
                         "NVIDIA plus the processor's built-in graphics): the first works through "
@@ -4178,10 +4379,11 @@ def build_parser():
                         "is tried again one step lower (anime 6, 4, 2, 1; live action 1), and "
                         "the rest of the run keeps that")
     p.add_argument("--gpu-jobs", type=int, default=None,
-                   help="upscalers running at once on each GPU (default: 2 for live action, "
-                        "CGI and movie tapes, whose model does 2 frames at once; 1 for anime and "
-                        "camcorder tapes, whose 8 frames at once keep the GPU busy already: two "
-                        "of those were 5.5x slower on a 6 GB laptop GPU). A second one keeps the "
+                   help="upscalers running at once on each GPU (default 1: the anime and "
+                        "camcorder models' 8 frames at once keep the GPU busy already, two of "
+                        "those were 5.5x slower on a 6 GB laptop GPU, and on a GPU that the big "
+                        "models get reset, more work at once makes a reset likelier: 2 frames "
+                        "at once failed several times sooner than 1). A second one keeps the "
                         "GPU busy while the other starts up, checks its frames or waits for the "
                         "next ones. The picture is the same either way; if two turn out slower "
                         "than one, it goes back to one by itself")
@@ -4311,8 +4513,10 @@ USEFUL EXTRAS (add to any command above)
                      (lowered by itself to 100, 64, 32 if fewer frames at once didn't help)
   --gpu-threads 4    frames the GPU works on at once (anime/camcorder default 8, lowered to
                      6, 4, 2, 1 by itself if a chunk fails; live action 2, then 1); same picture
-  --gpu-jobs 1       one upscaler at a time (default 2 for live action: the GPU waits less
-                     between chunks; 1 for anime); same picture, back to one if two are slower
+  --gpu-jobs 2       two upscalers at once (default 1): the GPU waits less between chunks;
+                     same picture, back to one if two are slower
+  --engine exe       live action/CGI on realesrgan-ncnn-vulkan's own engine (2022) even when
+                     the current one is installed (python -m pip install --no-deps ncnn numpy)
 
 MORE
   python dvd_upscale.py --help          every option, briefly
@@ -4485,13 +4689,32 @@ def main():
         if "x2plus" in a.model and a.scale != 2:
             sys.exit("realesrgan-x2plus needs --scale 2")
 
+    if not a.fast and not a.analyze:
+        # the big models: the current ncnn if it is there (see ncnn_upscaler_main); the small
+        # anime/camcorder ones stay on realesrgan-ncnn-vulkan, which runs them fine
+        a.engine = "exe"
+        if not compact_model(a) and a.engine_choice != "exe":
+            if ncnn_available() and (a.engine_choice == "ncnn"
+                                     or a.esrgan == ESRGAN_DEFAULT):
+                a.engine = "ncnn"
+            elif a.engine_choice == "ncnn":
+                sys.exit(f"--engine ncnn: the ncnn Python module isn't installed: {NCNN_INSTALL}")
+            elif a.esrgan == ESRGAN_DEFAULT:
+                print(f"NOTE: for {a.model}, '{NCNN_INSTALL}' gives the upscaler a current "
+                      "GPU engine: the one built into realesrgan-ncnn-vulkan (2022) makes NVIDIA "
+                      "drivers from 570 on reset the GPU now and then (\"vkQueueSubmit failed -4\")")
     if not a.fast:
         kind = (a.type if a.type != "vhs" else
                 f"vhs {'movie tape' if a.mode == 'telecine' else 'camcorder tape'}")
-        print(f"Upscaler: {a.model} x{a.scale} ({kind} preset)")
+        print(f"Upscaler: {a.model} x{a.scale} ({kind} preset)"
+              + (", run by the current ncnn (pip)" if getattr(a, "engine", "exe") == "ncnn"
+                 else ""))
         load_gpu_step(a)        # (as far down as earlier runs had to go, see gpu_step_file)
-        if a.gpu_jobs is None:          # (see --gpu-jobs; one on a GPU that was reset before)
-            a.gpu_jobs = 1 if compact_model(a) or GPU_STEP[0] else 2
+        if a.gpu_jobs is None:          # (see --gpu-jobs)
+            # one: the small models keep the GPU busy at 8 frames at once (two anime upscalers
+            # starved NVENC on a laptop), and where the big ones get the GPU reset, more work at
+            # once makes it likelier (2 frames at once failed several times sooner than 1)
+            a.gpu_jobs = 1
         jobs_note = (f"up to {a.gpu_jobs} upscalers per GPU, a second kept only if faster"
                      if a.gpu_jobs > 1 else "one upscaler per GPU")
         print(f"GPU settings: {gpu_load_text(a)}; {jobs_note}"
@@ -5355,7 +5578,7 @@ def main():
 
 VALUE_OPTS = ("--type", "--mode", "--model", "--scale", "--height", "--dar", "--fps",
               "--chunk-frames", "--test", "--esrgan", "--gpu", "--tile", "--gpu-threads",
-              "--gpu-jobs",
+              "--gpu-jobs", "--engine",
               "--ai-blend", "--smooth",
               "--sharpen", "--work", "--chroma-delay", "--mask", "--face-model", "--face-models")
 STOPPED = (130, 3221225786)     # a run stopped by Ctrl+C; Windows "terminated by Ctrl+C"
@@ -6097,6 +6320,8 @@ if __name__ == "__main__":
         os.environ["PATH"] = _here + os.pathsep + os.environ.get("PATH", "")
     if sys.argv[1:2] == ["--faces-worker"]:          # (a chunk's face restoration: see Chunk)
         sys.exit(faces_worker_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-upscaler"]:         # (the current ncnn: see esrgan_cmd)
+        sys.exit(ncnn_upscaler_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--clip"]:
         try:
             clip_main(sys.argv[2:])
