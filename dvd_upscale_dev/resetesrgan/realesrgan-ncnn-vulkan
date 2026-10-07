@@ -3,8 +3,9 @@
 TDR watchdog fires: on frames wider than 300 pixels (so the start-up test on small pictures
 passes), unless the tile size (-t) is at most RESET_TILE_MAX and the frames at once (-j x:N:x)
 at most RESET_THREADS_MAX. After a reset it goes on as Real-ESRGAN does: one "vkQueueSubmit
-failed -4" per piece of work, black frames, slowly, exit code 0. Each call's -j and -t are
-appended to RESET_LOG."""
+failed -4" per piece of work, black frames, slowly, exit code 0. RESET_AFTER=N: the reset
+comes after N good frames of each call (as on a laptop where it comes after a while). Each
+call's -j and -t are appended to RESET_LOG."""
 import os, struct, subprocess, sys, time
 args = sys.argv[1:]
 opt = {args[i]: args[i + 1] for i in range(0, len(args) - 1, 2)}
@@ -27,7 +28,14 @@ if ok:
                         f"scale=iw*{s}:ih*{s}:flags=bicubic", "-compression_level", "1",
                         os.path.join(dst, "%06d.png")])
     sys.exit(r.returncode)
-for name in frames:
+after = int(os.environ.get("RESET_AFTER", "0"))
+for name in frames[:after]:
+    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", os.path.join(src, name),
+                    "-vf", f"scale=iw*{s}:ih*{s}:flags=bicubic", "-compression_level", "1",
+                    os.path.join(dst, name)])
+    print("50.00%\n100.00%", flush=True)
+    time.sleep(float(os.environ.get("RESET_FRAME_SECS", "0.2")))
+for name in frames[after:]:
     for _ in range(3):
         print("vkQueueSubmit failed -4", flush=True)
     subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "lavfi", "-i",
