@@ -1805,6 +1805,18 @@ CV_DISTS = ("opencv-python-headless", "opencv-python", "opencv-contrib-python",
 
 
 NCNN_INSTALL = "python -m pip install --no-deps ncnn numpy"
+NCNN_VERSION = "1.0.20260526"           # (the one tested)
+
+
+def ncnn_install_hint():
+    """How to install the current ncnn for the Python running this script: setup.bat for the
+    one-folder install (its private Python isn't on the PATH), else pip for this Python. --no-deps:
+    ncnn itself needs only numpy; its other listed packages include opencv-python, which can
+    clash with the opencv-python-headless that --faces uses."""
+    here = Path(__file__).resolve().parent
+    if Path(sys.executable).resolve().parent == here / "python":
+        return "run setup.bat again"
+    return f"{pip_cmd()} install --no-deps ncnn=={NCNN_VERSION} numpy"
 ESRGAN_DEFAULT = "realesrgan-ncnn-vulkan"
 
 
@@ -1834,8 +1846,11 @@ def write_png(path, rgb):
     data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
             + chunk(b"IDAT", zlib.compress(raw.tobytes(), 1)) + chunk(b"IEND", b""))
     tmp = Path(path).parent.parent / f".{Path(path).name}.{os.getpid()}.part"
-    tmp.write_bytes(data)
-    os.replace(tmp, path)
+    try:
+        tmp.write_bytes(data)
+        replace_file(tmp, path)         # (retried: a virus scanner may hold the new file)
+    except OSError as e:
+        raise OSError(f"encode image {Path(path).name} failed ({e})") from e
 
 
 def ncnn_upscaler_main(argv):
@@ -1862,7 +1877,7 @@ def ncnn_upscaler_main(argv):
         import numpy as np
         import ncnn
     except ImportError as e:
-        print(f"ncnn: can't load the current ncnn ({e}): {NCNN_INSTALL}", flush=True)
+        print(f"ncnn: can't load the current ncnn ({e}): {ncnn_install_hint()}", flush=True)
         return 1
     from concurrent.futures import ThreadPoolExecutor
     scale, tile, pad = int(w.s), int(w.t or 0), 10
@@ -1884,7 +1899,18 @@ def ncnn_upscaler_main(argv):
     o.use_fp16_arithmetic = o.use_bf16_storage = o.use_bf16_packed = False
     o.use_int8_storage = True
     net.set_vulkan_device(gpu)
-    if net.load_param(str(models / f"{name}.param")) or net.load_model(str(models / f"{name}.bin")):
+    # (loaded from inside the models folder, by bare file names: ncnn's fopen takes a path in
+    # Windows' ANSI code page, so a folder like "Vidéos" in it would fail; the folder itself the
+    # system finds by its real name)
+    here = os.getcwd()
+    try:
+        os.chdir(models)
+        bad = net.load_param(f"{name}.param") or net.load_model(f"{name}.bin")
+    except OSError:
+        bad = True
+    finally:
+        os.chdir(here)
+    if bad:
         print(f"ncnn: can't load {models / name}.param/.bin", flush=True)
         return 1
     if not tile:        # (realesrgan-ncnn-vulkan's own rule, main.cpp)
@@ -1897,12 +1923,21 @@ def ncnn_upscaler_main(argv):
     if not files:
         return 0
     iw, ih = png_size(src_dir / files[0])
-    lst = Path(tempfile.gettempdir()) / f"dvd_upscale_ncnn_{os.getpid()}.txt"
-    lst.write_text("".join("file '" + (src_dir / f).resolve().as_posix().replace("'", "'\\''")
-                           + "'\n" for f in files), encoding="utf-8")
-    reader = subprocess.Popen(["ffmpeg", "-v", "error", "-nostdin", "-f", "concat", "-safe", "0",
-                               "-i", str(lst), "-fps_mode", "passthrough", "-f", "rawvideo",
-                               "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
+    # (the PNGs fed in one stream, not named in a list: image2 would read a "%20d" in a movie's
+    # name as a frame-number pattern)
+    reader = subprocess.Popen(["ffmpeg", "-v", "error", "-f", "image2pipe", "-c:v", "png",
+                               "-i", "-", "-fps_mode", "passthrough", "-f", "rawvideo",
+                               "-pix_fmt", "rgb24", "-"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+
+    def feed():
+        try:
+            for f in files:
+                reader.stdin.write((src_dir / f).read_bytes())
+            reader.stdin.close()
+        except (OSError, ValueError):
+            pass
+    threading.Thread(target=feed, daemon=True).start()
     saver = ThreadPoolExecutor(3)
     pending = []
     # (the tests: a GPU error after this many frames, in a process started with a tile size
@@ -1924,7 +1959,10 @@ def ncnn_upscaler_main(argv):
                     tw = min(tile, iw - x0)
                     part = np.ascontiguousarray(src[:, y0:y0 + th + 2 * pad, x0:x0 + tw + 2 * pad])
                     ex = net.create_extractor()
-                    mat = ncnn.Mat(part)            # (borrows part's memory: keep it alive)
+                    # (a copy: ncnn.Mat(array) keeps numpy's channel stride, h*w, but the GPU
+                    # upload wants each channel to start at a multiple of 4 values: a tile of
+                    # odd size, padding included, would get its green and blue shifted)
+                    mat = ncnn.Mat(part).clone()
                     ex.input("data", mat)
                     ret, res = ex.extract("output")
                     if k == fail_at:
@@ -1944,13 +1982,12 @@ def ncnn_upscaler_main(argv):
             fut.result()
         return 0
     except OSError as e:
-        print(f"ncnn: encode image failed ({e})", flush=True)
+        print(f"ncnn: {e}", flush=True)
         return 1
     finally:
         saver.shutdown()        # (the frames finished before an error are good: written)
         reader.kill()
         reader.wait()
-        lst.unlink(missing_ok=True)
 
 
 def faces_worker_main(argv):
@@ -2401,6 +2438,7 @@ class Chunk:
                         since = FRAMES_OK[0] + max(0, new)
                         if gpu_err:
                             FRAMES_OK[0] = 0
+                            save_gpu_step(a, frames_only=True)
                         lower = gpu_err and since < 120 and lower_gpu_load(a)
                         if attempt >= 2 and not lower and not (further and attempt < 12):
                             if GPU_STEP[0] and isinstance(e, GPUError):
@@ -4698,9 +4736,10 @@ def main():
                                      or a.esrgan == ESRGAN_DEFAULT):
                 a.engine = "ncnn"
             elif a.engine_choice == "ncnn":
-                sys.exit(f"--engine ncnn: the ncnn Python module isn't installed: {NCNN_INSTALL}")
+                sys.exit("--engine ncnn: the ncnn Python module isn't installed: "
+                         + ncnn_install_hint())
             elif a.esrgan == ESRGAN_DEFAULT:
-                print(f"NOTE: for {a.model}, '{NCNN_INSTALL}' gives the upscaler a current "
+                print(f"NOTE: for {a.model}, '{ncnn_install_hint()}' gives the upscaler a current "
                       "GPU engine: the one built into realesrgan-ncnn-vulkan (2022) makes NVIDIA "
                       "drivers from 570 on reset the GPU now and then (\"vkQueueSubmit failed -4\")")
     if not a.fast:

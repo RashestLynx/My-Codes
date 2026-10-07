@@ -138,27 +138,35 @@ if ((Have (Join-Path $Here 'realesrgan-ncnn-vulkan.exe') 1MB) -and (Have (Join-P
 
 Step 'realesrgan-x2plus model (live action and movie tapes)'
 $zip = Join-Path $Here 'realesrgan-x2plus.zip'
+$installed = (Have (Join-Path $Models 'realesrgan-x2plus.bin') 1MB) -and (Have (Join-Path $Models 'realesrgan-x2plus.param') 1KB)
 if (Test-Path -LiteralPath $zip) {
     # both files from the zip whenever either differs (a newer zip, or a pair that doesn't belong
     # together): they must come from the same download
-    $dir = Expand-Fresh $zip 'x2plus'
-    $same = $true
-    foreach ($n in 'realesrgan-x2plus.param', 'realesrgan-x2plus.bin') {
-        $dst = Join-Path $Models $n
-        if (-not (Test-Path -LiteralPath $dst) -or
-            (Get-FileHash -LiteralPath (Find-In $dir $n).FullName).Hash -ne (Get-FileHash -LiteralPath $dst).Hash) {
-            $same = $false
-        }
-    }
-    if ($same) {
-        Write-Host '  already here'
-    } else {
+    try {
+        $dir = Expand-Fresh $zip 'x2plus'
+        $same = $true
         foreach ($n in 'realesrgan-x2plus.param', 'realesrgan-x2plus.bin') {
-            Copy-Item -LiteralPath (Find-In $dir $n).FullName -Destination (Join-Path $Models $n) -Force
+            $dst = Join-Path $Models $n
+            if (-not (Test-Path -LiteralPath $dst) -or
+                (Get-FileHash -LiteralPath (Find-In $dir $n).FullName).Hash -ne (Get-FileHash -LiteralPath $dst).Hash) {
+                $same = $false
+            }
         }
-        Write-Host '  done (from realesrgan-x2plus.zip)'
+        if ($same) {
+            Write-Host '  already here'
+        } else {
+            foreach ($n in 'realesrgan-x2plus.param', 'realesrgan-x2plus.bin') {
+                Copy-Item -LiteralPath (Find-In $dir $n).FullName -Destination (Join-Path $Models $n) -Force
+            }
+            Write-Host '  done (from realesrgan-x2plus.zip)'
+        }
+    } catch {
+        # (a damaged zip: the rest of the setup still runs)
+        Write-Host "  realesrgan-x2plus.zip can't be read ($($_.Exception.Message))" -ForegroundColor Yellow
+        if ($installed) { Write-Host '  keeping the installed model' -ForegroundColor Yellow }
+        [void]$Problems.Add('realesrgan-x2plus.zip is damaged: download it again')
     }
-} elseif ((Have (Join-Path $Models 'realesrgan-x2plus.bin') 1MB) -and (Have (Join-Path $Models 'realesrgan-x2plus.param') 1KB)) {
+} elseif ($installed) {
     Write-Host '  already here'
 } else {
     Write-Host '  realesrgan-x2plus.zip is not in this folder: live action uses the slower' -ForegroundColor Yellow
