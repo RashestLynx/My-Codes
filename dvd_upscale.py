@@ -742,49 +742,108 @@ def compact_model(a):
     return any(m in a.model for m in ("animevideov3", "general"))
 
 
-# frames the GPU upscales at once without --gpu-threads, first choice first: a chunk the
-# upscaler fails on is tried again one step down, and the rest of the run keeps that (see
-# Chunk.upscale). Each frame is upscaled on its own: the same picture with any count.
-# - the small (compact) anime/VHS-camcorder models: 8 (21.5 frames/s on an RTX 3060 laptop)
-# - the big x2plus/x4plus: 2, the upscaler's own default. More frames at once make each piece
-#   of GPU work take that much longer, and Windows resets a GPU whose work takes over 2
-#   seconds ("vkQueueSubmit failed -4"): 8 and 6 did that on the same laptop. These models
-#   keep the GPU busy at 2 already
-THREAD_STEPS = {True: (8, 6, 4, 2), False: (2, 1)}     # compact model?: counts
-THREAD_STEP = [0]       # how many steps down this run has gone
+# what the GPU is given at once without --gpu-threads/--tile, first choice first: (frames at
+# once, tile size). A chunk the upscaler fails on is tried again one step down, and the rest of
+# the run keeps that (see Chunk.upscale; a movie of --all/--queue starts where the one before it
+# ended, see gpu_step_file).
+# - Frames at once: each frame is upscaled on its own, the same picture with any count. Lowered
+#   first.
+# - Tiles: the upscaler cuts each frame into tiles with a 10-pixel overlap, and the model sees
+#   only its tile, so the tile size changes the picture a little all over (no visible grid):
+#   x2plus on a DVD frame against the frame in one piece: 200 pixels 49 dB, 100 44 dB, 64 42 dB,
+#   32 40 dB (faces a touch crisper or softer). Smaller tiles only when fewer frames didn't
+#   help: the alternative is no movie at all.
+# - the small (compact) anime/VHS-camcorder models: 8 frames, each in one piece (None: whole
+#   frames; 21.5 frames/s on an RTX 3060 laptop)
+# - the big x2plus/x4plus: 2 frames, the upscaler's own default, in its own tiles (None: 200
+#   pixels on most GPUs). Windows resets a GPU whose piece of work takes over 2 seconds, and a
+#   GPU can fault on a large piece ("vkQueueSubmit failed -4"): that laptop did that with x2plus
+#   at 8, 6 and 2 frames. A tile is one piece of work: smaller tiles, shorter pieces
+GPU_STEPS = {True: ((8, None), (6, None), (4, None), (2, None), (1, None), (1, 100), (1, 64)),
+             False: ((2, None), (1, None), (1, 100), (1, 64), (1, 32))}  # compact?: steps
+GPU_STEP = [0]          # how many steps down this run has gone
+
+
+def gpu_load(a, step=None):
+    """(frames at once, tile size or None) at a step (default: the current one); --gpu-threads
+    and --tile, when given, are kept at every step"""
+    steps = GPU_STEPS[compact_model(a)]
+    threads, tile = steps[min(GPU_STEP[0] if step is None else step, len(steps) - 1)]
+    return (a.gpu_threads if a.gpu_threads is not None else threads,
+            a.tile or tile)
 
 
 def gpu_threads(a):
-    """frames the GPU upscales at once: --gpu-threads, else the model's current step"""
-    if a.gpu_threads is not None:
-        return a.gpu_threads
-    steps = THREAD_STEPS[compact_model(a)]
-    return steps[min(THREAD_STEP[0], len(steps) - 1)]
+    """frames the GPU upscales at once"""
+    return gpu_load(a)[0]
 
 
-def lower_gpu_threads(a):
-    """One step fewer frames at once for the rest of the run; False if there is none left
-    (or the count was given with --gpu-threads, which is kept)."""
-    if a.gpu_threads is not None or THREAD_STEP[0] >= len(THREAD_STEPS[compact_model(a)]) - 1:
-        return False
-    THREAD_STEP[0] += 1
-    return True
+def gpu_load_text(a):
+    threads, tile = gpu_load(a)
+    return (f"{threads} frame{'s' if threads > 1 else ''} at once on the GPU"
+            + (f", in {tile}-pixel tiles" if tile else ""))
+
+
+def lower_gpu_load(a):
+    """One step less on the GPU at once for the rest of the run (steps that don't change
+    anything next to --gpu-threads/--tile are passed over); False if there is none left."""
+    steps = GPU_STEPS[compact_model(a)]
+    now = gpu_load(a)
+    for k in range(GPU_STEP[0] + 1, len(steps)):
+        if gpu_load(a, k) != now:
+            GPU_STEP[0] = k
+            save_gpu_step(a)
+            return True
+    return False
+
+
+def gpu_step_file():
+    """--all/--queue: the file in which each movie's run leaves how far it had to step down, so
+    the next movie starts there instead of resetting the GPU again (one per model kind)"""
+    return os.environ.get("DVD_UPSCALE_GPU_STEPS")
+
+
+def load_gpu_step(a):
+    path = gpu_step_file()
+    if path:
+        try:
+            k = int(json.loads(Path(path).read_text(encoding="utf-8"))
+                    .get("compact" if compact_model(a) else "big", 0))
+            GPU_STEP[0] = max(0, min(k, len(GPU_STEPS[compact_model(a)]) - 1))
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+
+
+def save_gpu_step(a):
+    path = gpu_step_file()
+    if path:
+        try:
+            try:
+                saved = json.loads(Path(path).read_text(encoding="utf-8"))
+                saved = saved if isinstance(saved, dict) else {}
+            except (OSError, ValueError):
+                saved = {}
+            saved["compact" if compact_model(a) else "big"] = GPU_STEP[0]
+            Path(path).write_text(json.dumps(saved), encoding="utf-8")
+        except OSError:
+            pass
 
 
 def esrgan_cmd(a, src, dst, size=None, gpu=None):
     compact = compact_model(a)
     gpu = gpu if gpu is not None else gpu_list(a)[0]
+    threads, tile = gpu_load(a)
     # threads to load:upscale:save frames (default 1:2:2): reading and writing the PNGs is CPU
     # work that otherwise leaves the GPU waiting
     cmd = [a.esrgan_path, "-i", src, "-o", dst, "-n", a.model, "-s", a.scale, "-f", "png",
-           "-j", f"2:{gpu_threads(a)}:4"]
+           "-j", f"2:{threads}:4"]
     models = models_dir(a)
     if models.is_dir():
         cmd += ["-m", models]
     if gpu is not None:
         cmd += ["-g", gpu]
-    if a.tile:
-        cmd += ["-t", a.tile]
+    if tile:
+        cmd += ["-t", tile]
     elif size and compact:
         # the small (compact) models need little GPU memory: a whole frame in one piece instead
         # of the default 200-pixel tiles, whose overlaps cost ~20% extra work (and leave no
@@ -824,6 +883,10 @@ UPSCALING = {}
 DISK_LOCK = threading.Lock()
 
 
+class GPUError(RuntimeError):
+    """The upscaler reported a GPU failure (a reset, out of video memory)."""
+
+
 class HandBack(Exception):
     """A helper GPU gives its chunk back to the main one (stopping, or the end of the video)."""
 
@@ -849,7 +912,8 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
     lane: a helper GPU (--gpu 0,1): its progress goes into LANE_STATUS instead, and it stops
     when a.stop_lanes is set."""
     log_path = Path(dst).parent / "upscaler_log.txt"
-    hung = False
+    hung = stopped = False
+    n_ok = 0
     with open(log_path, "wb") as log:
         p = subprocess.Popen([str(c) for c in esrgan_cmd(a, src, dst, size, gpu)],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
@@ -862,27 +926,33 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
                 n = sum(1 for _ in os.scandir(dst))
                 if n:           # (for the check of two upscalers on one GPU, see main)
                     UPSCALER_FRAMES[lane or ""] = (gpu if gpu is not None else gpu_list(a)[0], n)
+                tick += 1
                 if lane:
                     LANE_STATUS[lane] = f"{lane}: {label} {n}/{n_in}"
-                    now, tick = time.time(), tick + 1
+                    now = time.time()
                     prog = LANE_PROGRESS.setdefault(lane, [0, n_in, now, now])
                     if n > prog[0]:
                         prog[0], prog[3] = n, now
                     if lane_stopped(a, lane):
                         raise RuntimeError("stopped")
-                    # a GPU error: the chunk goes back now, not once the upscaler gives up (or
-                    # hangs), and the main GPU does it
-                    if tick % 5 == 0:
-                        log_offset, pending_log, log_lines = _read_log_updates(
-                            log_path, log_offset, pending_log)
-                        bad = [line for line in (*log_lines, pending_log)
-                               if GPU_ERRORS.search(line)]
-                        if bad:
-                            raise RuntimeError(f"the upscaler reported errors: "
-                                               f"{bad[0].strip()[:100]}")
                 else:
                     status_line(f"  {label}: upscaling frame {n} of {n_in}"
                                 + "".join(f" | {x}" for x in list(LANE_STATUS.values())))
+                # a GPU error: the upscaler would go on to the last frame (black or garbled
+                # frames, a few seconds each after a GPU reset): stopped now instead. A helper
+                # GPU's chunk goes back to the main GPU; the main GPU's chunk is tried again
+                if tick % 5 == 0:
+                    log_offset, pending_log, log_lines = _read_log_updates(
+                        log_path, log_offset, pending_log)
+                    bad = [line for line in (*log_lines, pending_log) if GPU_ERRORS.search(line)]
+                    if not bad:
+                        n_ok = n            # (frames written after a GPU error are garbage)
+                    if bad and lane:
+                        raise RuntimeError(f"the upscaler reported errors: "
+                                           f"{bad[0].strip()[:100]}")
+                    if bad:
+                        stopped = True
+                        break
                 try:
                     p.wait(timeout=1)
                     break
@@ -923,6 +993,15 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
     if (p.returncode and not hung) or errors:
         lines = errors or [x for x in text.splitlines()
                            if x.strip() and not x.strip().endswith("%")]
+        # (a GPU reset gives one line per piece of work left: shown once, with a count)
+        same = []
+        for x in lines:
+            if same and same[-1][0] == x:
+                same[-1][1] += 1
+            else:
+                same.append([x, 1])
+        lines = [x if k == 1 else f"{x}   (x{k})" for x, k in same]
+        reset = re.search(r"QueueSubmit failed -4\b|DEVICE_LOST|device lost", text, re.I)
         if lane:        # a helper GPU: one line, in the note that it stopped helping
             raise RuntimeError(("the upscaler reported errors" if errors else
                                 f"the upscaler failed (exit code {p.returncode})")
@@ -936,17 +1015,23 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
         elif re.search(r"vkCreateInstance|vkEnumeratePhysicalDevices|no vulkan", text, re.I):
             print("(no usable Vulkan graphics driver: install or update the GPU's driver)",
                   flush=True)
-        elif re.search(r"QueueSubmit failed -4\b|DEVICE_LOST|device lost", text, re.I):
-            print("(the GPU was reset: Windows resets a graphics card whose work takes over 2 "
-                  "seconds. Fewer frames at once and smaller tiles give shorter work: try "
-                  "--gpu-threads 1 --tile 100, and --gpu-jobs 1)", flush=True)
+        elif reset:
+            print("(the GPU was reset: Windows resets a graphics card whose piece of work takes "
+                  "over 2 seconds, or that faults on it; smaller tiles are smaller pieces of "
+                  "work)", flush=True)
         elif re.search(r"memory|vkAllocate", text, re.I):
             print("(the GPU may have run out of memory: try adding --tile 128, or --gpu-jobs 1)",
                   flush=True)
         elif re.search(r"encode image", text):
             print("(it couldn't write the frames: is the work folder's drive full?)", flush=True)
+        how = "stopped at the first one" if stopped else f"exit code {p.returncode}"
+        if reset:
+            raise GPUError(f"the GPU was reset ({(errors or lines)[0].strip()[:60]}"
+                           + (f", after {n_ok} of {n_in} frames" if stopped else "") + ")")
+        if any(not re.search(r"(en|de)code image", x) for x in errors):
+            raise GPUError(f"the upscaler reported GPU errors ({how})")
         if errors:
-            raise RuntimeError(f"the upscaler reported errors (exit code {p.returncode})")
+            raise RuntimeError(f"the upscaler reported errors ({how})")
         raise subprocess.CalledProcessError(p.returncode, f"{a.esrgan} (upscaler)")
 
 
@@ -1997,23 +2082,26 @@ class Chunk:
                         # (no second try on a helper GPU: the main GPU redoes its chunk)
                         if self.lane:
                             raise
-                        # fewer frames on the GPU at once need less of its memory and give
-                        # shorter pieces of GPU work: one step down per failed try, for the
-                        # rest of the run (see THREAD_STEPS; a count given with --gpu-threads
-                        # is kept). Tried again once in any case, and as long as there is a
-                        # step left
-                        steps = THREAD_STEPS[compact_model(a)]
-                        lower = a.gpu_threads is None and THREAD_STEP[0] < len(steps) - 1
+                        # less on the GPU at once needs less of its memory and gives shorter
+                        # pieces of GPU work: one step down per failed try, for the rest of the
+                        # run (see GPU_STEPS; --gpu-threads and --tile are kept). Tried again
+                        # once in any case, and as long as there is a step left
+                        lower = lower_gpu_load(a)
                         if attempt >= 2 and not lower:
+                            if GPU_STEP[0] and isinstance(e, GPUError):
+                                raise RuntimeError(
+                                    f"{str(e).rstrip('.')}, also with {gpu_load_text(a)} (the "
+                                    "least this script tries). Update the graphics driver, plug "
+                                    "the laptop in, and close other programs that use the GPU"
+                                    + ("; or try --model realesrgan-x4plus" if "x2plus" in a.model
+                                       else "")) from e
                             raise
                         # a new upscaler process gets a fresh GPU device (after a driver
                         # reset, say). Another upscaler on the same GPU (--gpu-jobs) may have
                         # taken the memory this one needed: it stops, and this one goes alone
                         if self.make_room:
                             self.make_room("retry")
-                        retry_note = ""
-                        if lower and lower_gpu_threads(a):
-                            retry_note = f"lowering the GPU thread count to {gpu_threads(a)} and "
+                        retry_note = f"going down to {gpu_load_text(a)} and " if lower else ""
                         status_line()
                         print(f"  {label}: {str(e).rstrip('.')} - {retry_note}"
                               "trying this chunk once more.",
@@ -3924,12 +4012,18 @@ def build_parser():
                    help="Vulkan GPU index for the upscaler (-g). Several, e.g. 0,1 (a laptop's "
                         "NVIDIA plus the processor's built-in graphics): the first works through "
                         "the movie, the others upscale whole chunks alongside it")
-    p.add_argument("--tile", default=None, help="tile size if GPU runs out of memory (-t)")
+    p.add_argument("--tile", default=None,
+                   help="tile size in pixels (-t; default: whole frames for anime, the "
+                        "upscaler's own 200 for live action). Smaller tiles need less GPU memory "
+                        "and are shorter pieces of GPU work; they change the picture a little. "
+                        "Without --tile, a chunk the GPU fails on is tried again with fewer "
+                        "frames at once and then with 100-, 64- and 32-pixel tiles")
     p.add_argument("--gpu-threads", type=int, default=None,
-                   help="frames the GPU upscales at once (default 8): more can keep a GPU "
-                        "busier, fewer need less GPU memory. The picture is the same either "
-                        "way. When a chunk fails with the default, it is tried again with 6, "
-                        "then 4, then 2 (and the rest of the run keeps the lower count)")
+                   help="frames the GPU upscales at once (default 8 for anime, 2 for live "
+                        "action): more can keep a GPU busier, fewer need less GPU memory. The "
+                        "picture is the same either way. When a chunk fails with the default, it "
+                        "is tried again one step lower (anime 6, 4, 2, 1; live action 1), and "
+                        "the rest of the run keeps that")
     p.add_argument("--gpu-jobs", type=int, default=None,
                    help="upscalers running at once on each GPU (default: 2 for live action, "
                         "CGI and movie tapes, whose model does 2 frames at once; 1 for anime and "
@@ -4060,9 +4154,10 @@ USEFUL EXTRAS (add to any command above)
                      the --ai-blend share, 0.75); needs extra installs and model files: the run
                      says which
   --cpu              encode without an NVIDIA GPU (slow)
-  --tile 128         if the GPU runs out of memory
+  --tile 128         smaller pieces of GPU work, if the GPU runs out of memory or is reset
+                     (lowered by itself to 100, 64, 32 if fewer frames at once didn't help)
   --gpu-threads 4    frames the GPU works on at once (anime/camcorder default 8, lowered to
-                     6, 4, 2 by itself if a chunk fails; live action 2, then 1); same picture
+                     6, 4, 2, 1 by itself if a chunk fails; live action 2, then 1); same picture
   --gpu-jobs 1       one upscaler at a time (default 2 for live action: the GPU waits less
                      between chunks; 1 for anime); same picture, back to one if two are slower
 
@@ -4241,11 +4336,13 @@ def main():
         kind = (a.type if a.type != "vhs" else
                 f"vhs {'movie tape' if a.mode == 'telecine' else 'camcorder tape'}")
         print(f"Upscaler: {a.model} x{a.scale} ({kind} preset)")
-        if a.gpu_jobs is None:          # (see --gpu-jobs)
-            a.gpu_jobs = 1 if compact_model(a) else 2
+        load_gpu_step(a)        # (--all/--queue: as far down as the movies before it went)
+        if a.gpu_jobs is None:          # (see --gpu-jobs; one on a GPU that was reset before)
+            a.gpu_jobs = 1 if compact_model(a) or GPU_STEP[0] else 2
         jobs_note = (f"up to {a.gpu_jobs} upscalers per GPU, a second kept only if faster"
                      if a.gpu_jobs > 1 else "one upscaler per GPU")
-        print(f"GPU settings: {gpu_threads(a)} frames at once on the GPU; {jobs_note}")
+        print(f"GPU settings: {gpu_load_text(a)}; {jobs_note}"
+              + (" (the GPU needed less at once on an earlier movie)" if GPU_STEP[0] else ""))
     if a.faces is not None and (a.fast or a.type in ("anime", "cgi") or a.ai_blend == 0):
         # (--all --faces on a folder of all kinds of movies: only the live-action ones and tapes
         # get it)
@@ -5577,6 +5674,10 @@ def queue_main(argv):
 
     tried, done, failed, told_waiting, written = set(), [], [], set(), set()
     analyzed = 0
+    # how far each movie had to lower the load on the GPU: the next one starts there (see
+    # gpu_step_file), for this run of the queue only
+    gpu_steps = Path(tempfile.gettempdir()) / f"dvd_upscale_gpu_steps_{os.getpid()}.json"
+    atexit.register(lambda: gpu_steps.unlink(missing_ok=True))
 
     def delete_original(n, args):
         """--delete-originals, after a movie is done: the original to the Recycle Bin and the
@@ -5674,7 +5775,8 @@ def queue_main(argv):
             (base / args[1]).parent.mkdir(parents=True, exist_ok=True)   # "1080p Upscale"
         t0 = time.time()
         env = dict(os.environ, DVD_UPSCALE_QUEUE=json.dumps(
-            dict(n=pos, of=len(valid), later_secs=later_secs, folder=folder_mode)))
+            dict(n=pos, of=len(valid), later_secs=later_secs, folder=folder_mode)),
+            DVD_UPSCALE_GPU_STEPS=str(gpu_steps))
         p = subprocess.Popen([sys.executable, str(script), *args], cwd=base, env=env)
         try:
             rc = p.wait()
