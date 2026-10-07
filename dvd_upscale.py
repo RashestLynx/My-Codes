@@ -902,7 +902,9 @@ DISK_LOCK = threading.Lock()
 
 
 class GPUError(RuntimeError):
-    """The upscaler reported a GPU failure (a reset, out of video memory)."""
+    """The upscaler reported a GPU failure (a reset, out of video memory). good: the frames it
+    had finished before the first error (their names in the output folder)."""
+    good = ()
 
 
 class HandBack(Exception):
@@ -931,7 +933,9 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
     when a.stop_lanes is set."""
     log_path = Path(dst).parent / "upscaler_log.txt"
     hung = stopped = False
-    n_ok = 0
+    # frames there at the last look at the log without a GPU error (at first: the ones a try
+    # before this one finished, kept by Chunk.upscale)
+    good = [e.name for e in os.scandir(dst)]
     with open(log_path, "wb") as log:
         p = subprocess.Popen([str(c) for c in esrgan_cmd(a, src, dst, size, gpu)],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
@@ -941,7 +945,8 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
             last, same, all_there, tick = -1, 0, 0, 0
             log_offset, pending_log = 0, ""
             while True:
-                n = sum(1 for _ in os.scandir(dst))
+                names = [e.name for e in os.scandir(dst)]
+                n = len(names)
                 if n:           # (for the check of two upscalers on one GPU, see main)
                     UPSCALER_FRAMES[lane or ""] = (gpu if gpu is not None else gpu_list(a)[0], n)
                 tick += 1
@@ -964,7 +969,9 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
                         log_path, log_offset, pending_log)
                     bad = [line for line in (*log_lines, pending_log) if GPU_ERRORS.search(line)]
                     if not bad:
-                        n_ok = n            # (frames written after a GPU error are garbage)
+                        # (listed before this look at the log, so written before any error:
+                        # the upscaler prints a GPU error before it saves the frame it spoils)
+                        good = names
                     if bad and lane:
                         raise RuntimeError(f"the upscaler reported errors: "
                                            f"{bad[0].strip()[:100]}")
@@ -1043,11 +1050,15 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
         elif re.search(r"encode image", text):
             print("(it couldn't write the frames: is the work folder's drive full?)", flush=True)
         how = "stopped at the first one" if stopped else f"exit code {p.returncode}"
+        err = None
         if reset:
-            raise GPUError(f"the GPU was reset ({(errors or lines)[0].strip()[:60]}"
-                           + (f", after {n_ok} of {n_in} frames" if stopped else "") + ")")
-        if any(not re.search(r"(en|de)code image", x) for x in errors):
-            raise GPUError(f"the upscaler reported GPU errors ({how})")
+            err = GPUError(f"the GPU was reset ({(errors or lines)[0].strip()[:60]}, "
+                           f"{len(good)} of {n_in} frames done)")
+        elif any(not re.search(r"(en|de)code image", x) for x in errors):
+            err = GPUError(f"the upscaler reported GPU errors ({how})")
+        if err:
+            err.good = tuple(good)
+            raise err
         if errors:
             raise RuntimeError(f"the upscaler reported errors ({how})")
         raise subprocess.CalledProcessError(p.returncode, f"{a.esrgan} (upscaler)")
@@ -2014,7 +2025,7 @@ class Chunk:
     def clear_frames(self):
         # GBs of frames that a retry makes again anyway: don't leave them filling the drive
         # (upscaler_log.txt stays, for a look at what went wrong)
-        for d in ("in", "out", "faces"):
+        for d in ("in", "in_rest", "out", "faces"):
             shutil.rmtree(self.tmp / d, ignore_errors=True)
 
     def no_video(self):
@@ -2084,12 +2095,12 @@ class Chunk:
                     f"this chunk's upscaled frames and has {free / 1e9:.1f} GB: make room (or "
                     "use --work on another drive)")
             try:
-                attempt = 0
+                attempt, src, kept = 0, tmp / "in", 0
                 while True:
                     attempt += 1
                     try:
-                        run_upscaler(a, tmp / "in", tmp / "out", n_in, label, (w, h),
-                                     self.gpu, self.lane)
+                        run_upscaler(a, src, tmp / "out", n_in, label, (w, h), self.gpu,
+                                     self.lane)
                         n_out = len(list((tmp / "out").glob("*.png")))
                         if n_out != n_in:
                             # (the upscaler's last lines: a helper GPU's note stays one line)
@@ -2108,7 +2119,13 @@ class Chunk:
                         # run (see GPU_STEPS; --gpu-threads and --tile are kept). Tried again
                         # once in any case, and as long as there is a step left
                         lower = lower_gpu_load(a)
-                        if attempt >= 2 and not lower:
+                        # the frames finished before a GPU error are kept, and the next try
+                        # does only the rest: so a GPU that is reset now and then still gets
+                        # through, and at the last step a try that got further goes on
+                        good = set(getattr(e, "good", ()))
+                        further = len(good) > kept
+                        kept = len(good)
+                        if attempt >= 2 and not lower and not (further and attempt < 12):
                             if GPU_STEP[0] and isinstance(e, GPUError):
                                 raise RuntimeError(
                                     f"{str(e).rstrip('.')}, also with {gpu_load_text(a)} (the "
@@ -2126,11 +2143,30 @@ class Chunk:
                         status_line()
                         # (the retry on the first line, any upscaler output below it)
                         first, _, rest = str(e).partition("\n")
-                        print(f"  {label}: {first.rstrip('.')} - {retry_note}"
-                              "trying this chunk once more." + (f"\n{rest}" if rest else ""),
-                              flush=True)
-                        shutil.rmtree(tmp / "out", ignore_errors=True)
-                        (tmp / "out").mkdir()
+                        print(f"  {label}: {first.rstrip('.')} - "
+                              + (f"keeping those {kept}; " if kept else "") + retry_note
+                              + (f"trying the other {n_in - kept} once more." if kept else
+                                 "trying this chunk once more.")
+                              + (f"\n{rest}" if rest else ""), flush=True)
+                        for f in list((tmp / "out").iterdir()):
+                            if f.name not in good:
+                                f.unlink(missing_ok=True)
+                        shutil.rmtree(tmp / "in_rest", ignore_errors=True)
+                        src = tmp / "in"
+                        if good:
+                            src = tmp / "in_rest"
+                            src.mkdir()
+                            for f in (tmp / "in").glob("*.png"):
+                                if f.name not in good:
+                                    try:
+                                        os.link(f, src / f.name)
+                                    except OSError:
+                                        shutil.copyfile(f, src / f.name)
+                        if "reset" in first:
+                            # Windows takes a few seconds to restart the graphics driver, and
+                            # too many resets in a minute crash it for good
+                            status_line(f"  {label}: waiting for the graphics driver to recover")
+                            time.sleep(10)
             finally:
                 with DISK_LOCK:
                     UPSCALING.pop(self, None)

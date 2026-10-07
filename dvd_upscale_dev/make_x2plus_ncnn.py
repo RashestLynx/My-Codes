@@ -7,9 +7,15 @@ usage: python make_x2plus_ncnn.py RealESRGAN_x2plus.pth OUT_DIR      (needs: pip
 The ncnn files are written directly (pnnx ran out of memory on this network): input blob "data",
 output "output", RGB 0-1, as realesrgan-ncnn-vulkan expects. pixel_unshuffle(2) + the first 3x3
 conv are folded into one 6x6 stride-2 conv (the same sums), so no special layer is needed.
-Checked: ncnn on the CPU matches PyTorch at 82 dB PSNR (fp16 weights); in realesrgan-ncnn-vulkan
-it differs from PyTorch as much as the official x4plus model does (46 dB inside, the frame
-edges padded by the upscaler itself).
+The layers are laid out as in the official realesrgan-x4plus.param: each LeakyReLU done inside
+its convolution's GPU pass, and each "x * 0.2 + skip" as one Eltwise sum with coefficients (999
+layers; the first version had them as separate ReLU/BinaryOp layers, 1370 layers, each one more
+pass over the whole tile in GPU memory). The .bin is the same.
+Checked: ncnn on the CPU matches PyTorch at 83.6 dB PSNR (fp16 weights), as the first version
+did; in realesrgan-ncnn-vulkan (lavapipe) against the first version: 56.6 dB (fp16 rounding,
+at most 3 levels of 255 on 0.1% of the values) and 10-30% faster. Against PyTorch it differs
+as much as the official x4plus model does (46 dB inside, the frame edges padded by the
+upscaler itself).
 """
 import struct, sys
 import numpy as np
@@ -60,22 +66,23 @@ def fp16_weights(w):
     a += b"\0" * (-len(a) % 4)
     return struct.pack("<I", 0x01306B47) + a
 
-def conv(name, inp, outp, key, k=3, s=1, p=1, w=None, b=None):
+def conv(name, inp, outp, key, k=3, s=1, p=1, w=None, b=None, lrelu=False):
+    """lrelu: the LeakyReLU(0.2) after it done in the same GPU pass, as the official x4plus
+    model does (9=2: leaky ReLU, -23310: its slope)"""
     w = sd[key + ".weight"] if w is None else w
     b = sd[key + ".bias"] if b is None else b
     o = w.shape[0]
     ops.append(["Convolution", name, [inp], [outp],
-                f"0={o} 1={k} 3={s} 4={p} 5=1 6={w.numel()}"])
+                f"0={o} 1={k} 3={s} 4={p} 5=1 6={w.numel()}"
+                + (" 9=2 -23310=1,2.000000e-01" if lrelu else "")])
     binbuf.extend(fp16_weights(w)); binbuf.extend(b.detach().numpy().astype("<f4").tobytes())
-
-def relu(name, inp, outp):
-    ops.append(["ReLU", name, [inp], [outp], "0=2.000000e-01"])
 
 def cat(name, ins, outp):
     ops.append(["Concat", name, ins, [outp], "0=0"])
 
-def mul(name, inp, outp, v):
-    ops.append(["BinaryOp", name, [inp], [outp], f"0=2 1=1 2={v:e}"])
+def scaled_add(name, a, b, outp):
+    """a * 0.2 + b in one GPU pass (Eltwise sum with coefficients, as in the official x4plus)"""
+    ops.append(["Eltwise", name, [a, b], [outp], "0=1 -23301=2,2.000000e-01,1.000000e+00"])
 
 def add(name, a, b, outp):
     ops.append(["BinaryOp", name, [a, b], [outp], "0=0"])
@@ -99,27 +106,25 @@ for n in range(23):
     for r in (1, 2, 3):
         pre = f"body.{n}.rdb{r}"
         t = pre.replace(".", "_")
-        conv(t + "_c1", x, t + "_a1", pre + ".conv1"); relu(t + "_r1", t + "_a1", t + "_x1")
+        conv(t + "_c1", x, t + "_x1", pre + ".conv1", lrelu=True)
         cat(t + "_cat2", [x, t + "_x1"], t + "_k2")
-        conv(t + "_c2", t + "_k2", t + "_a2", pre + ".conv2"); relu(t + "_r2", t + "_a2", t + "_x2")
+        conv(t + "_c2", t + "_k2", t + "_x2", pre + ".conv2", lrelu=True)
         cat(t + "_cat3", [x, t + "_x1", t + "_x2"], t + "_k3")
-        conv(t + "_c3", t + "_k3", t + "_a3", pre + ".conv3"); relu(t + "_r3", t + "_a3", t + "_x3")
+        conv(t + "_c3", t + "_k3", t + "_x3", pre + ".conv3", lrelu=True)
         cat(t + "_cat4", [x, t + "_x1", t + "_x2", t + "_x3"], t + "_k4")
-        conv(t + "_c4", t + "_k4", t + "_a4", pre + ".conv4"); relu(t + "_r4", t + "_a4", t + "_x4")
+        conv(t + "_c4", t + "_k4", t + "_x4", pre + ".conv4", lrelu=True)
         cat(t + "_cat5", [x, t + "_x1", t + "_x2", t + "_x3", t + "_x4"], t + "_k5")
         conv(t + "_c5", t + "_k5", t + "_x5", pre + ".conv5")
-        mul(t + "_m", t + "_x5", t + "_x5s", 0.2)
-        add(t + "_add", t + "_x5s", x, t + "_out")
+        scaled_add(t + "_add", t + "_x5", x, t + "_out")
         x = t + "_out"
     b = f"body_{n}"
-    mul(b + "_m", x, b + "_s", 0.2)
-    add(b + "_add", b + "_s", rin, b + "_out")
+    scaled_add(b + "_add", x, rin, b + "_out")
     x = b + "_out"
 conv("conv_body", x, "bodyf", "conv_body")
 add("trunk_add", "feat", "bodyf", "feat2")
-up2("up1", "feat2", "u1"); conv("conv_up1", "u1", "u1c", "conv_up1"); relu("r_up1", "u1c", "u1r")
-up2("up2", "u1r", "u2"); conv("conv_up2", "u2", "u2c", "conv_up2"); relu("r_up2", "u2c", "u2r")
-conv("conv_hr", "u2r", "hrc", "conv_hr"); relu("r_hr", "hrc", "hrr")
+up2("up1", "feat2", "u1"); conv("conv_up1", "u1", "u1r", "conv_up1", lrelu=True)
+up2("up2", "u1r", "u2"); conv("conv_up2", "u2", "u2r", "conv_up2", lrelu=True)
+conv("conv_hr", "u2r", "hrr", "conv_hr", lrelu=True)
 conv("conv_last", "hrr", "output", "conv_last")
 
 # ncnn: a blob read by several layers goes through a Split, one copy per reader
