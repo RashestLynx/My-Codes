@@ -10,3 +10,4 @@ __pycache__/
 /face_models/
 /Movies/
 /realesrgan-x2plus.zip
+gpu_steps.json

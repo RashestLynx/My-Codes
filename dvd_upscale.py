@@ -757,8 +757,11 @@ def compact_model(a):
 #   frames; 21.5 frames/s on an RTX 3060 laptop)
 # - the big x2plus/x4plus: 2 frames, the upscaler's own default, in its own tiles (None: 200
 #   pixels on most GPUs). Windows resets a GPU whose piece of work takes over 2 seconds, and a
-#   GPU can fault on a large piece ("vkQueueSubmit failed -4"): that laptop did that with x2plus
-#   at 8, 6 and 2 frames. A tile is one piece of work: smaller tiles, shorter pieces
+#   GPU can fault on a large piece ("vkQueueSubmit failed -4"). That laptop: x2plus reset it after
+#   10-18 frames at 2 frames at once, 40-63 frames at 1, and in 100-pixel tiles after 163 frames
+#   once and not in 1440 frames another time. A tile is one piece of work: smaller tiles, shorter
+#   pieces, rarer resets; but each step down is slower too (64-pixel tiles: 20% more work than
+#   100, 32: 80%), so a reset after a good stretch of frames doesn't step down (Chunk.upscale)
 GPU_STEPS = {True: ((8, None), (6, None), (4, None), (2, None), (1, None), (1, 100), (1, 64)),
              False: ((2, None), (1, None), (1, 100), (1, 64), (1, 32))}  # compact?: steps
 GPU_STEP = [0]          # how many steps down this run has gone
@@ -798,35 +801,45 @@ def lower_gpu_load(a):
 
 
 def gpu_step_file():
-    """--all/--queue: the file in which each movie's run leaves how far it had to step down, so
-    the next movie starts there instead of resetting the GPU again (one per model kind)"""
-    return os.environ.get("DVD_UPSCALE_GPU_STEPS")
+    """Where a run leaves how far down the GPU needed to go: gpu_steps.json next to the script,
+    so the next run (and the next movie of --all/--queue) starts there instead of resetting the
+    GPU again on the way down. Delete it to start from the top again (after a driver update,
+    say). DVD_UPSCALE_GPU_STEPS: another file (the tests)."""
+    return Path(os.environ.get("DVD_UPSCALE_GPU_STEPS")
+                or Path(__file__).resolve().parent / "gpu_steps.json")
+
+
+def gpu_step_key(a):
+    return a.model + (f"@{a.gpu}" if a.gpu else "")      # (per model: x4plus is 4x the work)
 
 
 def load_gpu_step(a):
-    path = gpu_step_file()
-    if path:
-        try:
-            k = int(json.loads(Path(path).read_text(encoding="utf-8"))
-                    .get("compact" if compact_model(a) else "big", 0))
-            GPU_STEP[0] = max(0, min(k, len(GPU_STEPS[compact_model(a)]) - 1))
-        except (OSError, ValueError, TypeError, AttributeError):
-            pass
+    """The first step no bigger than the one saved: (frames, tile) is kept, not the step number,
+    so a changed list of steps still reads it right"""
+    try:
+        threads, tile = json.loads(gpu_step_file().read_text(encoding="utf-8"))[gpu_step_key(a)]
+        for k, (t2, p2) in enumerate(GPU_STEPS[compact_model(a)]):
+            # (no tile: whole frames for the compact models, 200 for the big ones)
+            if t2 <= int(threads) and (p2 or 10 ** 4) <= (int(tile) if tile else 10 ** 4):
+                GPU_STEP[0] = k
+                return True
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    return False
 
 
 def save_gpu_step(a):
     path = gpu_step_file()
-    if path:
+    try:
         try:
-            try:
-                saved = json.loads(Path(path).read_text(encoding="utf-8"))
-                saved = saved if isinstance(saved, dict) else {}
-            except (OSError, ValueError):
-                saved = {}
-            saved["compact" if compact_model(a) else "big"] = GPU_STEP[0]
-            Path(path).write_text(json.dumps(saved), encoding="utf-8")
-        except OSError:
-            pass
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            saved = saved if isinstance(saved, dict) else {}
+        except (OSError, ValueError):
+            saved = {}
+        saved[gpu_step_key(a)] = list(GPU_STEPS[compact_model(a)][GPU_STEP[0]])
+        path.write_text(json.dumps(saved, indent=1), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def esrgan_cmd(a, src, dst, size=None, gpu=None):
@@ -905,6 +918,66 @@ class GPUError(RuntimeError):
     """The upscaler reported a GPU failure (a reset, out of video memory). good: the frames it
     had finished before the first error (their names in the output folder)."""
     good = ()
+
+
+GPU_REPORTS = []        # GPU errors written to gpu_errors.log this run
+RESET_TIMES = []        # when the GPU was reset (time.time())
+
+
+def gpu_report(a, work, label, err, tried, log_path):
+    """After a GPU error: what happened, appended to <work folder>/gpu_errors.log (to send with a
+    bug report), with what Windows recorded about its graphics drivers in the last 15 minutes and
+    the NVIDIA GPU's state. Windows' records tell the causes apart: "Display" event 4101 or
+    nvlddmkm 153 (the driver restarted the GPU after a timeout: a piece of work took over 2 s);
+    nvlddmkm 13/14 or an "Xid" (the GPU hit a fault). Returns a one-line summary of those
+    records ("" if none)."""
+    GPU_REPORTS.append(time.time())
+    out = [f"=== {time.strftime('%Y-%m-%d %H:%M:%S')}  {label}  {a.model} x{a.scale}, {tried}",
+           str(err)]
+    try:
+        text = log_path.read_bytes().decode("utf-8", "replace")
+    except OSError:
+        text = ""
+    out += ["upscaler: " + x.strip() for x in text.splitlines()
+            if re.match(r"\[\d+ ", x.strip()) or "fp16-" in x or "subgroup" in x][:12]
+
+    def tool(cmd):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                               stdin=subprocess.DEVNULL, timeout=30)
+            return p.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    summary = ""
+    if len(GPU_REPORTS) <= 5:           # (the first few are what tell)
+        smi = tool(["nvidia-smi", "--query-gpu=name,driver_version,pstate,temperature.gpu,"
+                    "power.draw,power.limit,clocks.sm,clocks.max.sm,memory.used,memory.total,"
+                    "utilization.gpu,clocks_throttle_reasons.active", "--format=csv"])
+        if smi:
+            out += ["nvidia-smi: " + x for x in smi.splitlines()]
+        if sys.platform == "win32":
+            ev = tool(["wevtutil", "qe", "System", "/c:12", "/rd:true", "/f:text",
+                       "/q:*[System[(Provider[@Name='nvlddmkm'] or Provider[@Name='Display'] or "
+                       "Provider[@Name='amdkmdag'] or Provider[@Name='igfx']) and "
+                       "TimeCreated[timediff(@SystemTime) <= 900000]]]"])
+            found = []
+            for block in re.split(r"(?m)^Event\[\d+\]:", ev)[1:]:
+                src = re.search(r"Source:\s*(.+)", block)
+                eid = re.search(r"Event ID:\s*(\d+)", block)
+                desc = block.split("Description:", 1)[-1].strip().splitlines()
+                if src and eid:
+                    found.append(f"{src.group(1).strip()} {eid.group(1)}"
+                                 + (f" ({desc[0].strip()[:90]})" if desc and desc[0].strip()
+                                    else ""))
+            out += ["Windows: " + x for x in found] or ["Windows: no display driver events "
+                                                         "in the last 15 minutes"]
+            summary = "; ".join(found[:2])
+    try:
+        with open(work / "gpu_errors.log", "a", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n\n")
+    except OSError:
+        pass
+    return summary
 
 
 class HandBack(Exception):
@@ -1018,6 +1091,8 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
     if (p.returncode and not hung) or errors:
         lines = errors or [x for x in text.splitlines()
                            if x.strip() and not x.strip().endswith("%")]
+        # (two threads writing at once can run two error messages into one line)
+        lines = [y for x in lines for y in re.split(r"(?<=\S)(?=vk[A-Z]\w* failed)", x)]
         # (a GPU reset gives one line per piece of work left: shown once, with a count)
         same = []
         for x in lines:
@@ -2118,13 +2193,19 @@ class Chunk:
                         # pieces of GPU work: one step down per failed try, for the rest of the
                         # run (see GPU_STEPS; --gpu-threads and --tile are kept). Tried again
                         # once in any case, and as long as there is a step left
-                        lower = lower_gpu_load(a)
+                        tried = gpu_load_text(a)
                         # the frames finished before a GPU error are kept, and the next try
                         # does only the rest: so a GPU that is reset now and then still gets
                         # through, and at the last step a try that got further goes on
                         good = set(getattr(e, "good", ()))
-                        further = len(good) > kept
+                        new, further = len(good) - kept, len(good) > kept
                         kept = len(good)
+                        # only a GPU error lowers the load (not a full disk, say: smaller tiles
+                        # change the picture a little), and only when it came soon: after 120
+                        # new frames or more, a reset costs less (~25 s) than a step down would
+                        # for the rest of the run
+                        gpu_err = isinstance(e, GPUError)
+                        lower = gpu_err and new < 120 and lower_gpu_load(a)
                         if attempt >= 2 and not lower and not (further and attempt < 12):
                             if GPU_STEP[0] and isinstance(e, GPUError):
                                 raise RuntimeError(
@@ -2140,6 +2221,8 @@ class Chunk:
                         if self.make_room:
                             self.make_room("retry")
                         retry_note = f"going down to {gpu_load_text(a)} and " if lower else ""
+                        windows = (gpu_report(a, self.tmp.parent, label, e, tried,
+                                              tmp / "upscaler_log.txt") if gpu_err else "")
                         status_line()
                         # (the retry on the first line, any upscaler output below it)
                         first, _, rest = str(e).partition("\n")
@@ -2148,6 +2231,11 @@ class Chunk:
                               + (f"trying the other {n_in - kept} once more." if kept else
                                  "trying this chunk once more.")
                               + (f"\n{rest}" if rest else ""), flush=True)
+                        if windows:
+                            print(f"  (Windows recorded: {windows})", flush=True)
+                        if gpu_err and len(GPU_REPORTS) == 1:
+                            print(f"  (details for a bug report: "
+                                  f"{self.tmp.parent.resolve() / 'gpu_errors.log'})", flush=True)
                         for f in list((tmp / "out").iterdir()):
                             if f.name not in good:
                                 f.unlink(missing_ok=True)
@@ -2164,9 +2252,15 @@ class Chunk:
                                         shutil.copyfile(f, src / f.name)
                         if "reset" in first:
                             # Windows takes a few seconds to restart the graphics driver, and
-                            # too many resets in a minute crash it for good
-                            status_line(f"  {label}: waiting for the graphics driver to recover")
-                            time.sleep(10)
+                            # crashes for good when it has to 6 times within a minute: 15 s, and
+                            # never more than 3 resets in 60 s
+                            now = time.time()
+                            RESET_TIMES.append(now)
+                            recent = [t for t in RESET_TIMES if now - t < 60]
+                            wait = max(15, 60 - (now - recent[-3]) if len(recent) >= 3 else 0)
+                            status_line(f"  {label}: waiting {wait:.0f} s for the graphics "
+                                        "driver to recover")
+                            time.sleep(wait)
             finally:
                 with DISK_LOCK:
                     UPSCALING.pop(self, None)
@@ -4395,13 +4489,14 @@ def main():
         kind = (a.type if a.type != "vhs" else
                 f"vhs {'movie tape' if a.mode == 'telecine' else 'camcorder tape'}")
         print(f"Upscaler: {a.model} x{a.scale} ({kind} preset)")
-        load_gpu_step(a)        # (--all/--queue: as far down as the movies before it went)
+        load_gpu_step(a)        # (as far down as earlier runs had to go, see gpu_step_file)
         if a.gpu_jobs is None:          # (see --gpu-jobs; one on a GPU that was reset before)
             a.gpu_jobs = 1 if compact_model(a) or GPU_STEP[0] else 2
         jobs_note = (f"up to {a.gpu_jobs} upscalers per GPU, a second kept only if faster"
                      if a.gpu_jobs > 1 else "one upscaler per GPU")
         print(f"GPU settings: {gpu_load_text(a)}; {jobs_note}"
-              + (" (the GPU needed less at once on an earlier movie)" if GPU_STEP[0] else ""))
+              + (f" (what this GPU needed before; to try more again, delete "
+                 f"{gpu_step_file().name} next to {Path(__file__).name})" if GPU_STEP[0] else ""))
     if a.faces is not None and (a.fast or a.type in ("anime", "cgi") or a.ai_blend == 0):
         # (--all --faces on a folder of all kinds of movies: only the live-action ones and tapes
         # get it)
@@ -5733,10 +5828,6 @@ def queue_main(argv):
 
     tried, done, failed, told_waiting, written = set(), [], [], set(), set()
     analyzed = 0
-    # how far each movie had to lower the load on the GPU: the next one starts there (see
-    # gpu_step_file), for this run of the queue only
-    gpu_steps = Path(tempfile.gettempdir()) / f"dvd_upscale_gpu_steps_{os.getpid()}.json"
-    atexit.register(lambda: gpu_steps.unlink(missing_ok=True))
 
     def delete_original(n, args):
         """--delete-originals, after a movie is done: the original to the Recycle Bin and the
@@ -5834,8 +5925,7 @@ def queue_main(argv):
             (base / args[1]).parent.mkdir(parents=True, exist_ok=True)   # "1080p Upscale"
         t0 = time.time()
         env = dict(os.environ, DVD_UPSCALE_QUEUE=json.dumps(
-            dict(n=pos, of=len(valid), later_secs=later_secs, folder=folder_mode)),
-            DVD_UPSCALE_GPU_STEPS=str(gpu_steps))
+            dict(n=pos, of=len(valid), later_secs=later_secs, folder=folder_mode)))
         p = subprocess.Popen([sys.executable, str(script), *args], cwd=base, env=env)
         try:
             rc = p.wait()
