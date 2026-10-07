@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Simulated GPU upscaler. SIM_S: startup seconds; SIM_G: GPU seconds per frame (one frame at a
+time on the shared GPU, across processes); SIM_PENALTY: GPU time multiplier while two or more
+processes run (a GPU short of video memory). Frames are made by ffmpeg first, then released one
+by one as the simulated GPU finishes them."""
+import fcntl, os, shutil, subprocess, sys, tempfile, time
+args = sys.argv[1:]
+opt = {args[i]: args[i + 1] for i in range(0, len(args) - 1, 2)}
+src, dst, s = opt["-i"], opt["-o"], int(opt["-s"])
+G, S, PEN = (float(os.environ.get(k, d)) for k, d in (("SIM_G", "0.05"), ("SIM_S", "2"), ("SIM_PENALTY", "1")))
+root = os.environ.get("SIM_DIR", "/tmp/simgpu_state")
+os.makedirs(os.path.join(root, "active"), exist_ok=True)
+me = os.path.join(root, "active", str(os.getpid()))
+print("[0 SimGPU]  queueC=2[8]", flush=True)
+open(me, "w").close()
+try:
+    time.sleep(S)                                   # loading the model, building pipelines
+    tmp = tempfile.mkdtemp(dir=os.path.dirname(dst))
+    subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", os.path.join(src, "%06d.png"),
+                    "-vf", f"scale=iw*{s}:ih*{s}:flags=bicubic", "-compression_level", "1",
+                    os.path.join(tmp, "%06d.png")], check=True)
+    lock = open(os.path.join(root, "gpu.lock"), "w")
+    for name in sorted(os.listdir(tmp)):
+        fcntl.flock(lock, fcntl.LOCK_EX)            # the GPU: one frame at a time
+        busy = len(os.listdir(os.path.join(root, "active")))
+        time.sleep(G * (PEN if busy >= 2 else 1))
+        fcntl.flock(lock, fcntl.LOCK_UN)
+        shutil.move(os.path.join(tmp, name), os.path.join(dst, name))
+    shutil.rmtree(tmp, ignore_errors=True)
+finally:
+    os.remove(me)
