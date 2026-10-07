@@ -859,6 +859,24 @@ GPU_ERRORS = re.compile(r"vk(QueueSubmit|WaitForFences|AllocateMemory|MapMemory)
                         r"VK_ERROR_DEVICE_LOST|device lost|(en|de)code image .* failed", re.I)
 
 
+def upscaler_log_tail(path, limit=8):
+    """A short diagnostic excerpt for silent/incomplete upscaler runs (exit code 0)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    lines = [line.strip() for line in text.splitlines()
+             if line.strip() and not line.strip().endswith("%")]
+    if not lines:
+        return ""
+    return "\nUpscaler output (end):\n  " + "\n  ".join(
+        line[-240:] for line in lines[-limit:])
+
+
 def _read_log_updates(path, offset, pending=""):
     """Read only bytes appended since the last check, retaining an unfinished log line."""
     with open(path, "rb") as log:
@@ -2074,8 +2092,11 @@ class Chunk:
                                      self.gpu, self.lane)
                         n_out = len(list((tmp / "out").glob("*.png")))
                         if n_out != n_in:
+                            # (the upscaler's last lines: a helper GPU's note stays one line)
                             raise RuntimeError(f"upscaler produced {n_out} of {n_in} frames "
-                                               "(GPU out of memory? try --tile 128)")
+                                               "(GPU out of memory? try --tile 128)"
+                                               + ("" if self.lane else upscaler_log_tail(
+                                                   tmp / "upscaler_log.txt")))
                         check_frames(a, tmp, n_in, strict=bool(self.lane))
                         break
                     except (RuntimeError, subprocess.CalledProcessError) as e:
@@ -2103,8 +2124,10 @@ class Chunk:
                             self.make_room("retry")
                         retry_note = f"going down to {gpu_load_text(a)} and " if lower else ""
                         status_line()
-                        print(f"  {label}: {str(e).rstrip('.')} - {retry_note}"
-                              "trying this chunk once more.",
+                        # (the retry on the first line, any upscaler output below it)
+                        first, _, rest = str(e).partition("\n")
+                        print(f"  {label}: {first.rstrip('.')} - {retry_note}"
+                              "trying this chunk once more." + (f"\n{rest}" if rest else ""),
                               flush=True)
                         shutil.rmtree(tmp / "out", ignore_errors=True)
                         (tmp / "out").mkdir()
