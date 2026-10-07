@@ -742,31 +742,143 @@ def compact_model(a):
     return any(m in a.model for m in ("animevideov3", "general"))
 
 
-AUTO_THREADS = [8]      # frames on the GPU at once without --gpu-threads (lowered, see Chunk)
-MIN_THREADS = 2         # ...down to this (2: the upscaler's own default, the least memory)
+# what the GPU is given at once without --gpu-threads/--tile, first choice first: (frames at
+# once, tile size). A chunk the upscaler fails on is tried again one step down, and the rest of
+# the run keeps that (see Chunk.upscale; a movie of --all/--queue starts where the one before it
+# ended, see gpu_step_file).
+# - Frames at once: each frame is upscaled on its own, the same picture with any count. Lowered
+#   first.
+# - Tiles: the upscaler cuts each frame into tiles with a 10-pixel overlap, and the model sees
+#   only its tile, so the tile size changes the picture a little all over (no visible grid):
+#   x2plus on a DVD frame against the frame in one piece: 200 pixels 49 dB, 100 44 dB, 64 42 dB,
+#   32 40 dB (faces a touch crisper or softer). Smaller tiles only when fewer frames didn't
+#   help: the alternative is no movie at all.
+# - the small (compact) anime/VHS-camcorder models: 8 frames, each in one piece (None: whole
+#   frames; 21.5 frames/s on an RTX 3060 laptop)
+# - the big x2plus/x4plus: 2 frames, the upscaler's own default, in its own tiles (None: 200
+#   pixels on most GPUs). Windows resets a GPU whose piece of work takes over 2 seconds, and a
+#   GPU can fault on a large piece ("vkQueueSubmit failed -4"). That laptop: x2plus reset it after
+#   10-18 frames at 2 frames at once, 40-63 frames at 1, and in 100-pixel tiles after 163 frames
+#   once and not in 1440 frames another time. A tile is one piece of work: smaller tiles, shorter
+#   pieces, rarer resets; but each step down is slower too (64-pixel tiles: 20% more work than
+#   100, 32: 80%), so a reset after a good stretch of frames doesn't step down (Chunk.upscale)
+GPU_STEPS = {True: ((8, None), (6, None), (4, None), (2, None), (1, None), (1, 100), (1, 64)),
+             False: ((2, None), (1, None), (1, 100), (1, 64), (1, 32))}  # compact?: steps
+# the current ncnn (see ncnn_upscaler_main) does one frame at a time anyway
+NCNN_STEPS = ((1, None), (1, 100), (1, 64), (1, 32))
+GPU_STEP = [0]          # how many steps down this run has gone
+
+
+def gpu_steps(a):
+    return NCNN_STEPS if getattr(a, "engine", "exe") == "ncnn" else GPU_STEPS[compact_model(a)]
+
+
+def gpu_load(a, step=None):
+    """(frames at once, tile size or None) at a step (default: the current one); --gpu-threads
+    and --tile, when given, are kept at every step"""
+    steps = gpu_steps(a)
+    threads, tile = steps[min(GPU_STEP[0] if step is None else step, len(steps) - 1)]
+    return (a.gpu_threads if a.gpu_threads is not None else threads,
+            a.tile or tile)
 
 
 def gpu_threads(a):
-    """frames the GPU upscales at once: --gpu-threads, else 8, lowered to 6, 4, then 2 when a
-    chunk fails (a GPU short of memory: see Chunk.upscale). Each frame is upscaled on its own:
-    the same picture with any count."""
-    return a.gpu_threads if a.gpu_threads is not None else AUTO_THREADS[0]
+    """frames the GPU upscales at once"""
+    return gpu_load(a)[0]
+
+
+def gpu_load_text(a):
+    threads, tile = gpu_load(a)
+    return (f"{threads} frame{'s' if threads > 1 else ''} at once on the GPU"
+            + (f", in {tile}-pixel tiles" if tile else ""))
+
+
+def lower_gpu_load(a):
+    """One step less on the GPU at once for the rest of the run (steps that don't change
+    anything next to --gpu-threads/--tile are passed over); False if there is none left."""
+    steps = gpu_steps(a)
+    now = gpu_load(a)
+    for k in range(GPU_STEP[0] + 1, len(steps)):
+        if gpu_load(a, k) != now:
+            GPU_STEP[0] = k
+            save_gpu_step(a)
+            return True
+    return False
+
+
+def gpu_step_file():
+    """Where a run leaves how far down the GPU needed to go: gpu_steps.json next to the script,
+    so the next run (and the next movie of --all/--queue) starts there instead of resetting the
+    GPU again on the way down. Delete it to start from the top again (after a driver update,
+    say). DVD_UPSCALE_GPU_STEPS: another file (the tests)."""
+    return Path(os.environ.get("DVD_UPSCALE_GPU_STEPS")
+                or Path(__file__).resolve().parent / "gpu_steps.json")
+
+
+def gpu_step_key(a):
+    # (per model, x4plus being 4x the work; per engine; per --gpu)
+    return (a.model + ("/ncnn" if getattr(a, "engine", "exe") == "ncnn" else "")
+            + (f"@{a.gpu}" if a.gpu else ""))
+
+
+FRAMES_OK = [0]         # frames upscaled since the last GPU reset (this model and engine)
+
+
+def load_gpu_step(a):
+    """The first step no bigger than the one saved: (frames, tile) is kept, not the step number,
+    so a changed list of steps still reads it right. Also the frames since the last reset."""
+    try:
+        saved = json.loads(gpu_step_file().read_text(encoding="utf-8"))
+        FRAMES_OK[0] = int(saved.get(gpu_step_key(a) + "#ok", 0))
+        threads, tile = saved[gpu_step_key(a)]
+        for k, (t2, p2) in enumerate(gpu_steps(a)):
+            # (no tile: whole frames for the compact models, 200 for the big ones)
+            if t2 <= int(threads) and (p2 or 10 ** 4) <= (int(tile) if tile else 10 ** 4):
+                GPU_STEP[0] = k
+                return True
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    return False
+
+
+def save_gpu_step(a, frames_only=False):
+    """frames_only: just the frames since the last reset (after each chunk, once the file
+    exists: a run with no reset ever leaves no file)"""
+    path = gpu_step_file()
+    try:
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            saved = saved if isinstance(saved, dict) else {}
+        except (OSError, ValueError):
+            if frames_only:
+                return
+            saved = {}
+        if not frames_only:
+            saved[gpu_step_key(a)] = list(gpu_steps(a)[GPU_STEP[0]])
+        saved[gpu_step_key(a) + "#ok"] = FRAMES_OK[0]
+        path.write_text(json.dumps(saved, indent=1), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def esrgan_cmd(a, src, dst, size=None, gpu=None):
     compact = compact_model(a)
     gpu = gpu if gpu is not None else gpu_list(a)[0]
+    threads, tile = gpu_load(a)
+    # (the current ncnn: this script as the upscaler, with the same command line)
+    exe = ([sys.executable, Path(__file__).resolve(), "--ncnn-upscaler"]
+           if getattr(a, "engine", "exe") == "ncnn" else [a.esrgan_path])
     # threads to load:upscale:save frames (default 1:2:2): reading and writing the PNGs is CPU
     # work that otherwise leaves the GPU waiting
-    cmd = [a.esrgan_path, "-i", src, "-o", dst, "-n", a.model, "-s", a.scale, "-f", "png",
-           "-j", f"2:{gpu_threads(a)}:4"]
+    cmd = [*exe, "-i", src, "-o", dst, "-n", a.model, "-s", a.scale, "-f", "png",
+           "-j", f"2:{threads}:4"]
     models = models_dir(a)
     if models.is_dir():
         cmd += ["-m", models]
     if gpu is not None:
         cmd += ["-g", gpu]
-    if a.tile:
-        cmd += ["-t", a.tile]
+    if tile:
+        cmd += ["-t", tile]
     elif size and compact:
         # the small (compact) models need little GPU memory: a whole frame in one piece instead
         # of the default 200-pixel tiles, whose overlaps cost ~20% extra work (and leave no
@@ -779,7 +891,26 @@ def esrgan_cmd(a, src, dst, size=None, gpu=None):
 # reset, out of video memory) or a frame can't be read or written: its frames are then black,
 # garbled or missing
 GPU_ERRORS = re.compile(r"vk(QueueSubmit|WaitForFences|AllocateMemory|MapMemory)\w* failed|"
-                        r"VK_ERROR_DEVICE_LOST|device lost|(en|de)code image .* failed", re.I)
+                        r"VK_ERROR_DEVICE_LOST|device lost|(en|de)code image .* failed|"
+                        r"ncnn: GPU error", re.I)
+
+
+def upscaler_log_tail(path, limit=8):
+    """A short diagnostic excerpt for silent/incomplete upscaler runs (exit code 0)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    lines = [line.strip() for line in text.splitlines()
+             if line.strip() and not line.strip().endswith("%")]
+    if not lines:
+        return ""
+    return "\nUpscaler output (end):\n  " + "\n  ".join(
+        line[-240:] for line in lines[-limit:])
 
 
 def _read_log_updates(path, offset, pending=""):
@@ -804,6 +935,72 @@ UPSCALER_FRAMES = {}
 # the chunks being upscaled right now (on any GPU): chunk -> (bytes of frames it writes, frames)
 UPSCALING = {}
 DISK_LOCK = threading.Lock()
+
+
+class GPUError(RuntimeError):
+    """The upscaler reported a GPU failure (a reset, out of video memory). good: the frames it
+    had finished before the first error (their names in the output folder)."""
+    good = ()
+
+
+GPU_REPORTS = []        # GPU errors written to gpu_errors.log this run
+RESET_TIMES = []        # when the GPU was reset (time.time())
+
+
+def gpu_report(a, work, label, err, tried, log_path):
+    """After a GPU error: what happened, appended to <work folder>/gpu_errors.log (to send with a
+    bug report), with what Windows recorded about its graphics drivers in the last 15 minutes and
+    the NVIDIA GPU's state. Windows' records tell the causes apart: "Display" event 4101 or
+    nvlddmkm 153 (the driver restarted the GPU after a timeout: a piece of work took over 2 s);
+    nvlddmkm 13/14 or an "Xid" (the GPU hit a fault). Returns a one-line summary of those
+    records ("" if none)."""
+    GPU_REPORTS.append(time.time())
+    out = [f"=== {time.strftime('%Y-%m-%d %H:%M:%S')}  {label}  {a.model} x{a.scale}, {tried}",
+           str(err)]
+    try:
+        text = log_path.read_bytes().decode("utf-8", "replace")
+    except OSError:
+        text = ""
+    out += ["upscaler: " + x.strip() for x in text.splitlines()
+            if re.match(r"\[\d+ ", x.strip()) or "fp16-" in x or "subgroup" in x][:12]
+
+    def tool(cmd):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                               stdin=subprocess.DEVNULL, timeout=30)
+            return p.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    summary = ""
+    if len(GPU_REPORTS) <= 5:           # (the first few are what tell)
+        smi = tool(["nvidia-smi", "--query-gpu=name,driver_version,pstate,temperature.gpu,"
+                    "power.draw,power.limit,clocks.sm,clocks.max.sm,memory.used,memory.total,"
+                    "utilization.gpu,clocks_throttle_reasons.active", "--format=csv"])
+        if smi:
+            out += ["nvidia-smi: " + x for x in smi.splitlines()]
+        if sys.platform == "win32":
+            ev = tool(["wevtutil", "qe", "System", "/c:12", "/rd:true", "/f:text",
+                       "/q:*[System[(Provider[@Name='nvlddmkm'] or Provider[@Name='Display'] or "
+                       "Provider[@Name='amdkmdag'] or Provider[@Name='igfx']) and "
+                       "TimeCreated[timediff(@SystemTime) <= 900000]]]"])
+            found = []
+            for block in re.split(r"(?m)^Event\[\d+\]:", ev)[1:]:
+                src = re.search(r"Source:\s*(.+)", block)
+                eid = re.search(r"Event ID:\s*(\d+)", block)
+                desc = block.split("Description:", 1)[-1].strip().splitlines()
+                if src and eid:
+                    found.append(f"{src.group(1).strip()} {eid.group(1)}"
+                                 + (f" ({desc[0].strip()[:90]})" if desc and desc[0].strip()
+                                    else ""))
+            out += ["Windows: " + x for x in found] or ["Windows: no display driver events "
+                                                         "in the last 15 minutes"]
+            summary = "; ".join(found[:2])
+    try:
+        with open(work / "gpu_errors.log", "a", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n\n")
+    except OSError:
+        pass
+    return summary
 
 
 class HandBack(Exception):
@@ -831,7 +1028,10 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
     lane: a helper GPU (--gpu 0,1): its progress goes into LANE_STATUS instead, and it stops
     when a.stop_lanes is set."""
     log_path = Path(dst).parent / "upscaler_log.txt"
-    hung = False
+    hung = stopped = False
+    # frames there at the last look at the log without a GPU error (at first: the ones a try
+    # before this one finished, kept by Chunk.upscale)
+    good = [e.name for e in os.scandir(dst)]
     with open(log_path, "wb") as log:
         p = subprocess.Popen([str(c) for c in esrgan_cmd(a, src, dst, size, gpu)],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
@@ -841,30 +1041,39 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
             last, same, all_there, tick = -1, 0, 0, 0
             log_offset, pending_log = 0, ""
             while True:
-                n = sum(1 for _ in os.scandir(dst))
+                names = [e.name for e in os.scandir(dst)]
+                n = len(names)
                 if n:           # (for the check of two upscalers on one GPU, see main)
                     UPSCALER_FRAMES[lane or ""] = (gpu if gpu is not None else gpu_list(a)[0], n)
+                tick += 1
                 if lane:
                     LANE_STATUS[lane] = f"{lane}: {label} {n}/{n_in}"
-                    now, tick = time.time(), tick + 1
+                    now = time.time()
                     prog = LANE_PROGRESS.setdefault(lane, [0, n_in, now, now])
                     if n > prog[0]:
                         prog[0], prog[3] = n, now
                     if lane_stopped(a, lane):
                         raise RuntimeError("stopped")
-                    # a GPU error: the chunk goes back now, not once the upscaler gives up (or
-                    # hangs), and the main GPU does it
-                    if tick % 5 == 0:
-                        log_offset, pending_log, log_lines = _read_log_updates(
-                            log_path, log_offset, pending_log)
-                        bad = [line for line in (*log_lines, pending_log)
-                               if GPU_ERRORS.search(line)]
-                        if bad:
-                            raise RuntimeError(f"the upscaler reported errors: "
-                                               f"{bad[0].strip()[:100]}")
                 else:
                     status_line(f"  {label}: upscaling frame {n} of {n_in}"
                                 + "".join(f" | {x}" for x in list(LANE_STATUS.values())))
+                # a GPU error: the upscaler would go on to the last frame (black or garbled
+                # frames, a few seconds each after a GPU reset): stopped now instead. A helper
+                # GPU's chunk goes back to the main GPU; the main GPU's chunk is tried again
+                if tick % 5 == 0:
+                    log_offset, pending_log, log_lines = _read_log_updates(
+                        log_path, log_offset, pending_log)
+                    bad = [line for line in (*log_lines, pending_log) if GPU_ERRORS.search(line)]
+                    if not bad:
+                        # (listed before this look at the log, so written before any error:
+                        # the upscaler prints a GPU error before it saves the frame it spoils)
+                        good = names
+                    if bad and lane:
+                        raise RuntimeError(f"the upscaler reported errors: "
+                                           f"{bad[0].strip()[:100]}")
+                    if bad:
+                        stopped = True
+                        break
                 try:
                     p.wait(timeout=1)
                     break
@@ -905,6 +1114,17 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
     if (p.returncode and not hung) or errors:
         lines = errors or [x for x in text.splitlines()
                            if x.strip() and not x.strip().endswith("%")]
+        # (two threads writing at once can run two error messages into one line)
+        lines = [y for x in lines for y in re.split(r"(?<=\S)(?=vk[A-Z]\w* failed)", x)]
+        # (a GPU reset gives one line per piece of work left: shown once, with a count)
+        same = []
+        for x in lines:
+            if same and same[-1][0] == x:
+                same[-1][1] += 1
+            else:
+                same.append([x, 1])
+        lines = [x if k == 1 else f"{x}   (x{k})" for x, k in same]
+        reset = re.search(r"QueueSubmit failed -4\b|DEVICE_LOST|device lost", text, re.I)
         if lane:        # a helper GPU: one line, in the note that it stopped helping
             raise RuntimeError(("the upscaler reported errors" if errors else
                                 f"the upscaler failed (exit code {p.returncode})")
@@ -918,13 +1138,27 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
         elif re.search(r"vkCreateInstance|vkEnumeratePhysicalDevices|no vulkan", text, re.I):
             print("(no usable Vulkan graphics driver: install or update the GPU's driver)",
                   flush=True)
+        elif reset:
+            print("(the GPU was reset: Windows resets a graphics card whose piece of work takes "
+                  "over 2 seconds, or that faults on it; smaller tiles are smaller pieces of "
+                  "work)", flush=True)
         elif re.search(r"memory|vkAllocate", text, re.I):
             print("(the GPU may have run out of memory: try adding --tile 128, or --gpu-jobs 1)",
                   flush=True)
         elif re.search(r"encode image", text):
             print("(it couldn't write the frames: is the work folder's drive full?)", flush=True)
+        how = "stopped at the first one" if stopped else f"exit code {p.returncode}"
+        err = None
+        if reset:
+            err = GPUError(f"the GPU was reset ({(errors or lines)[0].strip()[:60]}, "
+                           f"{len(good)} of {n_in} frames done)")
+        elif any(not re.search(r"(en|de)code image", x) for x in errors):
+            err = GPUError(f"the upscaler reported GPU errors ({how})")
+        if err:
+            err.good = tuple(good)
+            raise err
         if errors:
-            raise RuntimeError(f"the upscaler reported errors (exit code {p.returncode})")
+            raise RuntimeError(f"the upscaler reported errors ({how})")
         raise subprocess.CalledProcessError(p.returncode, f"{a.esrgan} (upscaler)")
 
 
@@ -986,6 +1220,98 @@ def model_installed(a):
         return True     # unusual install layout: let the upscaler find its own models
     names = [a.model, f"{a.model}-x{a.scale}"]       # animevideov3 files carry the scale
     return any((d / f"{n}.param").exists() and (d / f"{n}.bin").exists() for n in names)
+
+
+def check_upscaler(a):
+    """Before the movie, a few seconds: the upscaler and its model on two small test pictures.
+    Model files that are damaged, or a .param and a .bin that don't belong together (from two
+    different downloads), give a GPU error or a smeared, garbled picture on every chunk: this
+    says so at once, instead of after every chunk has failed (or a whole movie came out wrong).
+    The test: each picture shrunk by the model's scale, then upscaled by the model, comes out
+    nearly as close to the original as a plain resize does (measured on the anime, live and x4
+    models: 0.3 better to 3.7 dB worse; a .bin from another conversion of realesrgan-x2plus:
+    7.6 dB worse, another model's .bin: far worse). One frame at a time: the frames-at-once
+    setting doesn't come into it."""
+    with tempfile.TemporaryDirectory(prefix="upscaler_check_") as d:
+        d = Path(d)
+        for sub in ("big", "in", "out"):
+            (d / sub).mkdir()
+        k = a.scale
+        for n, pattern in enumerate(("testsrc", "smptehdbars"), 1):
+            run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"{pattern}=s=480x288:d=1",
+                 "-frames:v", "1", str(d / "big" / f"{n:06d}.png")])
+            run(["ffmpeg", "-y", "-v", "error", "-i", str(d / "big" / f"{n:06d}.png"), "-vf",
+                 f"scale=iw/{k}:ih/{k}:flags=area", str(d / "in" / f"{n:06d}.png")])
+        cmd = [str(c) for c in esrgan_cmd(a, d / "in", d / "out", (480 // k, 288 // k))]
+        cmd[cmd.index("-j") + 1] = "1:1:1"
+        try:
+            p = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=600)
+            text, rc = (p.stdout + p.stderr).decode("utf-8", "replace"), p.returncode
+        except subprocess.TimeoutExpired:
+            text, rc = "no result after 10 minutes", "a hang"
+        errors = [x.strip() for x in text.splitlines() if GPU_ERRORS.search(x)]
+        files = (f"{models_dir(a)}: {a.model}.param and {a.model}.bin must come from the same "
+                 "download (for realesrgan-x2plus: unzip both from realesrgan-x2plus.zip again, "
+                 "replacing the old ones)")
+        outs = [d / "out" / f"{n:06d}.png" for n in (1, 2)]
+        if rc or errors or not all(o.exists() for o in outs):
+            status_line()
+            lines = errors or [x.strip() for x in text.splitlines()
+                               if x.strip() and not x.strip().endswith("%")]
+            if getattr(a, "engine", "exe") == "ncnn":
+                # (stdout is read before stderr, and ncnn's list of GPUs is on stderr: the last
+                # line is then always the last GPU, never the reason. The reason is the
+                # worker's own "ncnn: ..." line, or none at all: it crashed)
+                own = [x for x in lines if x.startswith("ncnn")]
+                why = own[-1][:160] if own else f"exit code {rc}, no message from the upscaler"
+                print("  the current ncnn's output:", flush=True)
+                for x in lines[-12:]:
+                    print("    " + x[:160], flush=True)
+                return ncnn_fallback(a, why)
+            reset = re.search(r"QueueSubmit failed -4\b|DEVICE_LOST|device lost", text, re.I)
+            sys.exit(f"The upscaler failed on a small test picture, before the movie started "
+                     f"({lines[-1][:120] if lines else f'exit code {rc}'}).\n"
+                     + ("The GPU was reset. " if reset else "")
+                     + "If other movies work (anime, say) and only this kind fails, the model's "
+                     f"files are the likely cause: {files}. Otherwise update the graphics "
+                     "driver, and try the upscaler's own test in its folder: "
+                     "realesrgan-ncnn-vulkan -i input.jpg -o test.png")
+
+        def psnr(x, ref, scale_up=""):
+            rc2, report = capture(["ffmpeg", "-v", "info", "-i", str(x), "-i", str(ref),
+                                   "-lavfi", f"[0:v]{scale_up or 'null'}[x];[x][1:v]psnr",
+                                   "-f", "null", "-"])
+            m = re.search(r"PSNR .*?average:([0-9.]+)", report)
+            return float(m.group(1)) if m else None
+        diffs = []
+        for n, o in enumerate(outs, 1):
+            big = d / "big" / f"{n:06d}.png"
+            model = psnr(o, big)
+            plain = psnr(d / "in" / f"{n:06d}.png", big, f"scale=iw*{k}:ih*{k}:flags=lanczos")
+            if model is not None and plain is not None:
+                diffs.append(model - plain)
+        if len(diffs) == 2 and sum(diffs) / 2 < -5.5:
+            status_line()
+            if getattr(a, "engine", "exe") == "ncnn":
+                return ncnn_fallback(a, f"a smeared picture, {-sum(diffs) / 2:.1f} dB worse "
+                                        "than a plain resize")
+            sys.exit(f"The upscaler's model {a.model} gives a smeared or garbled picture: two "
+                     f"small test pictures came out {-sum(diffs) / 2:.1f} dB worse than a plain "
+                     "resize (a working model: within 4). Its files are damaged or don't belong "
+                     f"together. {files}.")
+
+
+def ncnn_fallback(a, why):
+    """The current ncnn failed the start-up test: realesrgan-ncnn-vulkan instead (tested too)."""
+    print(f"NOTE: the current ncnn didn't work here ({why}): using realesrgan-ncnn-vulkan's own "
+          "engine instead (--engine exe). On NVIDIA drivers from 570 on that engine resets the "
+          "GPU now and then and is much slower: send the lines above if you want this fixed",
+          flush=True)
+    a.engine, GPU_STEP[0], FRAMES_OK[0] = "exe", 0, 0
+    load_gpu_step(a)
+    print(f"GPU settings: {gpu_load_text(a)}; "
+          + (f"up to {a.gpu_jobs} upscalers per GPU" if a.gpu_jobs > 1 else "one upscaler per GPU"))
+    return check_upscaler(a)
 
 
 def check_ffmpeg():
@@ -1488,6 +1814,192 @@ CV_DISTS = ("opencv-python-headless", "opencv-python", "opencv-contrib-python",
             "opencv-contrib-python-headless")
 
 
+NCNN_INSTALL = "python -m pip install --no-deps ncnn numpy"
+NCNN_VERSION = "1.0.20260526"           # (the one tested)
+
+
+def ncnn_install_hint():
+    """How to install the current ncnn for the Python running this script: setup.bat for the
+    one-folder install (its private Python isn't on the PATH), else pip for this Python. --no-deps:
+    ncnn itself needs only numpy; its other listed packages include opencv-python, which can
+    clash with the opencv-python-headless that --faces uses."""
+    here = Path(__file__).resolve().parent
+    if Path(sys.executable).resolve().parent == here / "python":
+        return "run setup.bat again"
+    return f"{pip_cmd()} install --no-deps ncnn=={NCNN_VERSION} numpy"
+ESRGAN_DEFAULT = "realesrgan-ncnn-vulkan"
+
+
+def ncnn_available():
+    """The current ncnn from pip is installed (it isn't loaded here: the GPU is used by the
+    upscaler processes only)"""
+    import importlib.util
+    return all(importlib.util.find_spec(m) for m in ("ncnn", "numpy"))
+
+
+def write_png(path, rgb):
+    """An 8-bit RGB PNG (rows "Up"-filtered, zlib level 1), written to a temporary name next to
+    the folder and then renamed: a frame in the folder is always whole."""
+    import numpy as np
+    h, w, _ = rgb.shape
+    rows = rgb.reshape(h, w * 3)
+    raw = np.empty((h, w * 3 + 1), np.uint8)
+    raw[:, 0] = 2                                           # (filter type Up)
+    raw[0, 1:] = rows[0]
+    np.subtract(rows[1:], rows[:-1], out=raw[1:, 1:])       # (uint8: modulo 256, as PNG wants)
+
+    import zlib
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw.tobytes(), 1)) + chunk(b"IEND", b""))
+    tmp = Path(path).parent.parent / f".{Path(path).name}.{os.getpid()}.part"
+    try:
+        tmp.write_bytes(data)
+        replace_file(tmp, path)         # (retried: a virus scanner may hold the new file)
+    except OSError as e:
+        raise OSError(f"encode image {Path(path).name} failed ({e})") from e
+
+
+def ncnn_upscaler_main(argv):
+    """python dvd_upscale.py --ncnn-upscaler -i IN -o OUT -n MODEL -s SCALE [-m MODELS] [-t TILE]
+    [-g GPU] [-j L:P:S] [-f png]: realesrgan-ncnn-vulkan's job done with the current ncnn from
+    pip (NCNN_INSTALL) instead of the April 2022 ncnn built into it.
+    Why: NVIDIA drivers from 570 on give a program robust buffer access only when it asks, and
+    the 2022 ncnn doesn't ask (fixed in ncnn 20250916, "fix hangs with NVIDIA >565 drivers").
+    Big networks (x2plus, x4plus) then hang the GPU now and then and Windows resets it
+    ("vkWaitForFences/vkQueueSubmit failed -4"; seen on an RTX 3060 laptop, driver 610, after
+    10-200 frames, while the small anime model ran for hours).
+    The same command line (so run_upscaler and all around it work unchanged) and the same
+    picture: realesrgan.cpp's tiling ported as is. Tiles of -t pixels (0: by the GPU's memory,
+    200 above 1.9 GB) overlap by 10 pixels, mirrored at the frame edges; in RGB / 255, out x 255
+    rounded; fp16 storage, fp32 arithmetic. Only fp16 rounding differs (55 dB). One frame at a
+    time (ncnn's Python module holds the interpreter while the GPU works); frames are read in
+    one ffmpeg stream and written by 3 threads. A GPU error ends it at once, with a line
+    run_upscaler knows (GPU_ERRORS)."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-upscaler")
+    for opt in ("-i", "-o", "-n", "-s", "-m", "-t", "-g", "-j", "-f"):
+        p.add_argument(opt)
+    w = p.parse_args(argv)
+    try:
+        import numpy as np
+        import ncnn
+    except ImportError as e:
+        print(f"ncnn: can't load the current ncnn ({e}): {ncnn_install_hint()}", flush=True)
+        return 1
+    from concurrent.futures import ThreadPoolExecutor
+    scale, tile, pad = int(w.s), int(w.t or 0), 10
+    models = Path(w.m or "models")
+    for name in (w.n, f"{w.n}-x{scale}"):           # (the anime models carry the scale)
+        if (models / f"{name}.param").exists():
+            break
+    else:
+        print(f"ncnn: {w.n}.param not found in {models}", flush=True)
+        return 1
+    if ncnn.get_gpu_count() == 0:       # (ncnn has printed the Vulkan problem)
+        print("ncnn: no Vulkan GPU found (no vulkan)", flush=True)
+        return 1
+    gpu = int(w.g) if w.g not in (None, "") else ncnn.get_default_gpu_index()
+    net = ncnn.Net()
+    o = net.opt
+    o.use_vulkan_compute = True
+    o.use_fp16_packed = o.use_fp16_storage = True
+    o.use_fp16_arithmetic = o.use_bf16_storage = o.use_bf16_packed = False
+    o.use_int8_storage = True
+    net.set_vulkan_device(gpu)
+    # (loaded from inside the models folder, by bare file names: ncnn's fopen takes a path in
+    # Windows' ANSI code page, so a folder like "Vidéos" in it would fail; the folder itself the
+    # system finds by its real name)
+    here = os.getcwd()
+    try:
+        os.chdir(models)
+        bad = net.load_param(f"{name}.param") or net.load_model(f"{name}.bin")
+    except OSError:
+        bad = True
+    finally:
+        os.chdir(here)
+    if bad:
+        print(f"ncnn: can't load {models / name}.param/.bin", flush=True)
+        return 1
+    if not tile:        # (realesrgan-ncnn-vulkan's own rule, main.cpp)
+        budget = ncnn.get_gpu_device(gpu).get_heap_budget()
+        tile = 200 if budget > 1900 else 100 if budget > 550 else 64 if budget > 190 else 32
+    src_dir, dst_dir = Path(w.i), Path(w.o)
+    files = sorted(f for f in os.listdir(src_dir) if f.lower().endswith(".png"))
+    print(f"ncnn {ncnn.__version__}: GPU {gpu} {ncnn.get_gpu_info(gpu).device_name()}, "
+          f"{name}, x{scale}, {tile}-pixel tiles, {len(files)} frames", flush=True)
+    if not files:
+        return 0
+    iw, ih = png_size(src_dir / files[0])
+    # (the PNGs fed in one stream, not named in a list: image2 would read a "%20d" in a movie's
+    # name as a frame-number pattern)
+    reader = subprocess.Popen(["ffmpeg", "-v", "error", "-f", "image2pipe", "-c:v", "png",
+                               "-i", "-", "-fps_mode", "passthrough", "-f", "rawvideo",
+                               "-pix_fmt", "rgb24", "-"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+
+    def feed():
+        try:
+            for f in files:
+                reader.stdin.write((src_dir / f).read_bytes())
+            reader.stdin.close()
+        except (OSError, ValueError):
+            pass
+    threading.Thread(target=feed, daemon=True).start()
+    saver = ThreadPoolExecutor(3)
+    pending = []
+    # (the tests: a GPU error after this many frames, in a process started with a tile size
+    # above 100; see dvd_upscale_dev)
+    fail_at = int(os.environ.get("DVD_UPSCALE_TEST_NCNN_FAIL", "-1")) if tile > 100 else -1
+    try:
+        for k, f in enumerate(files):
+            buf = reader.stdout.read(iw * ih * 3)
+            if len(buf) < iw * ih * 3:
+                print(f"ncnn: decode image {f} failed", flush=True)
+                return 1
+            img = np.frombuffer(buf, np.uint8).reshape(ih, iw, 3)
+            src = np.pad(img, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
+            src = np.ascontiguousarray(src.transpose(2, 0, 1), dtype=np.float32) * (1 / 255)
+            out = np.empty((ih * scale, iw * scale, 3), np.uint8)
+            for y0 in range(0, ih, tile):
+                th = min(tile, ih - y0)
+                for x0 in range(0, iw, tile):
+                    tw = min(tile, iw - x0)
+                    part = np.ascontiguousarray(src[:, y0:y0 + th + 2 * pad, x0:x0 + tw + 2 * pad])
+                    ex = net.create_extractor()
+                    # (a copy: ncnn.Mat(array) keeps numpy's channel stride, h*w, but the GPU
+                    # upload wants each channel to start at a multiple of 4 values: a tile of
+                    # odd size, padding included, would get its green and blue shifted)
+                    mat = ncnn.Mat(part).clone()
+                    ex.input("data", mat)
+                    ret, res = ex.extract("output")
+                    if k == fail_at:
+                        ret = -4
+                    if ret:
+                        print(f"ncnn: GPU error (extract returned {ret}) on {f}", flush=True)
+                        return 1
+                    res = np.array(res)[:, pad * scale:(pad + th) * scale,
+                                        pad * scale:(pad + tw) * scale]
+                    out[y0 * scale:(y0 + th) * scale, x0 * scale:(x0 + tw) * scale] = \
+                        np.clip(np.floor(res * 255 + 0.5), 0, 255).astype(np.uint8).transpose(1, 2, 0)
+                    del ex, mat, part
+            pending.append(saver.submit(write_png, dst_dir / f"{Path(f).stem}.png", out))
+            while len(pending) > 6:     # (frames waiting to be written: a few)
+                pending.pop(0).result()
+        for fut in pending:
+            fut.result()
+        return 0
+    except OSError as e:
+        print(f"ncnn: {e}", flush=True)
+        return 1
+    finally:
+        saver.shutdown()        # (the frames finished before an error are good: written)
+        reader.kill()
+        reader.wait()
+
+
 def faces_worker_main(argv):
     """python dvd_upscale.py --faces-worker ...: the face restoration of one chunk's frames, in
     a process of its own (started by Chunk.restore_faces, never by hand). It only reads the
@@ -1823,7 +2335,7 @@ class Chunk:
     def clear_frames(self):
         # GBs of frames that a retry makes again anyway: don't leave them filling the drive
         # (upscaler_log.txt stays, for a look at what went wrong)
-        for d in ("in", "out", "faces"):
+        for d in ("in", "in_rest", "out", "faces"):
             shutil.rmtree(self.tmp / d, ignore_errors=True)
 
     def no_video(self):
@@ -1893,44 +2405,106 @@ class Chunk:
                     f"this chunk's upscaled frames and has {free / 1e9:.1f} GB: make room (or "
                     "use --work on another drive)")
             try:
-                attempt = 0
+                attempt, src, kept = 0, tmp / "in", 0
                 while True:
                     attempt += 1
                     try:
-                        run_upscaler(a, tmp / "in", tmp / "out", n_in, label, (w, h),
-                                     self.gpu, self.lane)
+                        run_upscaler(a, src, tmp / "out", n_in, label, (w, h), self.gpu,
+                                     self.lane)
                         n_out = len(list((tmp / "out").glob("*.png")))
                         if n_out != n_in:
+                            # (the upscaler's last lines: a helper GPU's note stays one line)
                             raise RuntimeError(f"upscaler produced {n_out} of {n_in} frames "
-                                               "(GPU out of memory? try --tile 128)")
+                                               "(GPU out of memory? try --tile 128)"
+                                               + ("" if self.lane else upscaler_log_tail(
+                                                   tmp / "upscaler_log.txt")))
                         check_frames(a, tmp, n_in, strict=bool(self.lane))
+                        if not self.lane:
+                            FRAMES_OK[0] += n_in - kept
+                            save_gpu_step(a, frames_only=True)
                         break
                     except (RuntimeError, subprocess.CalledProcessError) as e:
                         # (no second try on a helper GPU: the main GPU redoes its chunk)
                         if self.lane:
                             raise
-                        # fewer frames on the GPU at once need less of its memory: 8, 6, 4,
-                        # then 2, one step per failed try, for the rest of the run (only the
-                        # automatic count: one given with --gpu-threads is kept). Tried again
+                        # less on the GPU at once needs less of its memory and gives shorter
+                        # pieces of GPU work: one step down per failed try, for the rest of the
+                        # run (see GPU_STEPS; --gpu-threads and --tile are kept). Tried again
                         # once in any case, and as long as there is a step left
-                        lower = a.gpu_threads is None and AUTO_THREADS[0] > MIN_THREADS
-                        if attempt >= 2 and not lower:
+                        tried = gpu_load_text(a)
+                        # the frames finished before a GPU error are kept, and the next try
+                        # does only the rest: so a GPU that is reset now and then still gets
+                        # through, and at the last step a try that got further goes on
+                        good = set(getattr(e, "good", ()))
+                        new, further = len(good) - kept, len(good) > kept
+                        kept = len(good)
+                        # only a GPU error lowers the load (not a full disk, say: smaller tiles
+                        # change the picture a little), and only when it came soon: after 120
+                        # new frames or more, a reset costs less (~25 s) than a step down would
+                        # for the rest of the run
+                        gpu_err = isinstance(e, GPUError)
+                        # (counted across chunks and runs: one reset early in a chunk after
+                        # hours without one doesn't step down for good)
+                        since = FRAMES_OK[0] + max(0, new)
+                        if gpu_err:
+                            FRAMES_OK[0] = 0
+                            save_gpu_step(a, frames_only=True)
+                        lower = gpu_err and since < 120 and lower_gpu_load(a)
+                        if attempt >= 2 and not lower and not (further and attempt < 12):
+                            if GPU_STEP[0] and isinstance(e, GPUError):
+                                raise RuntimeError(
+                                    f"{str(e).rstrip('.')}, also with {gpu_load_text(a)} (the "
+                                    "least this script tries). Update the graphics driver, plug "
+                                    "the laptop in, and close other programs that use the GPU"
+                                    + ("; or try --model realesrgan-x4plus" if "x2plus" in a.model
+                                       else "")) from e
                             raise
                         # a new upscaler process gets a fresh GPU device (after a driver
                         # reset, say). Another upscaler on the same GPU (--gpu-jobs) may have
                         # taken the memory this one needed: it stops, and this one goes alone
                         if self.make_room:
                             self.make_room("retry")
-                        retry_note = ""
-                        if lower:
-                            AUTO_THREADS[0] = max(MIN_THREADS, AUTO_THREADS[0] - 2)
-                            retry_note = f"lowering the GPU thread count to {AUTO_THREADS[0]} and "
+                        retry_note = f"going down to {gpu_load_text(a)} and " if lower else ""
+                        windows = (gpu_report(a, self.tmp.parent, label, e, tried,
+                                              tmp / "upscaler_log.txt") if gpu_err else "")
                         status_line()
-                        print(f"  {label}: {str(e).rstrip('.')} - {retry_note}"
-                              "trying this chunk once more.",
-                              flush=True)
-                        shutil.rmtree(tmp / "out", ignore_errors=True)
-                        (tmp / "out").mkdir()
+                        # (the retry on the first line, any upscaler output below it)
+                        first, _, rest = str(e).partition("\n")
+                        print(f"  {label}: {first.rstrip('.')} - "
+                              + (f"keeping those {kept}; " if kept else "") + retry_note
+                              + (f"trying the other {n_in - kept} once more." if kept else
+                                 "trying this chunk once more.")
+                              + (f"\n{rest}" if rest else ""), flush=True)
+                        if windows:
+                            print(f"  (Windows recorded: {windows})", flush=True)
+                        if gpu_err and len(GPU_REPORTS) == 1:
+                            print(f"  (details for a bug report: "
+                                  f"{self.tmp.parent.resolve() / 'gpu_errors.log'})", flush=True)
+                        for f in list((tmp / "out").iterdir()):
+                            if f.name not in good:
+                                f.unlink(missing_ok=True)
+                        shutil.rmtree(tmp / "in_rest", ignore_errors=True)
+                        src = tmp / "in"
+                        if good:
+                            src = tmp / "in_rest"
+                            src.mkdir()
+                            for f in (tmp / "in").glob("*.png"):
+                                if f.name not in good:
+                                    try:
+                                        os.link(f, src / f.name)
+                                    except OSError:
+                                        shutil.copyfile(f, src / f.name)
+                        if "reset" in first:
+                            # Windows takes a few seconds to restart the graphics driver, and
+                            # crashes for good when it has to 6 times within a minute: 15 s, and
+                            # never more than 3 resets in 60 s
+                            now = time.time()
+                            RESET_TIMES.append(now)
+                            recent = [t for t in RESET_TIMES if now - t < 60]
+                            wait = max(15, 60 - (now - recent[-3]) if len(recent) >= 3 else 0)
+                            status_line(f"  {label}: waiting {wait:.0f} s for the graphics "
+                                        "driver to recover")
+                            time.sleep(wait)
             finally:
                 with DISK_LOCK:
                     UPSCALING.pop(self, None)
@@ -3763,6 +4337,21 @@ def default_output(src, base=None, height=1080):
 
 def check_values(a):
     """Option values that would only fail later (after detection, or on every movie of a batch)."""
+    if a.tile is not None:
+        try:
+            tile = int(a.tile)
+        except (TypeError, ValueError):
+            sys.exit("--tile must be 0 (automatic) or a positive number of pixels")
+        if tile < 0:
+            sys.exit("--tile must be 0 (automatic) or a positive number of pixels")
+        a.tile = str(tile)
+    if a.gpu is not None:
+        devices = re.sub(r"\s+", "", str(a.gpu)).split(",")
+        if not devices or any(not re.fullmatch(r"[0-9]+", device) for device in devices):
+            sys.exit("--gpu must be a GPU index or comma-separated indices, e.g. 0 or 0,1")
+        if len(set(devices)) != len(devices):
+            sys.exit("--gpu cannot list the same GPU more than once")
+        a.gpu = ",".join(str(int(device)) for device in devices)
     if a.ai_blend is not None and (
             not math.isfinite(a.ai_blend) or not 0 <= a.ai_blend <= 1):
         sys.exit("--ai-blend must be between 0 and 1")
@@ -3784,7 +4373,7 @@ def check_values(a):
         sys.exit("--test must be a number of seconds (0 = the whole movie)")
     if a.gpu_threads is not None and not 1 <= a.gpu_threads <= 16:
         sys.exit("--gpu-threads must be between 1 and 16")
-    if not 1 <= a.gpu_jobs <= 4:
+    if a.gpu_jobs is not None and not 1 <= a.gpu_jobs <= 4:
         sys.exit("--gpu-jobs must be between 1 and 4")
     if a.faces is not None and (not math.isfinite(a.faces) or not 0 < a.faces <= 1):
         sys.exit("--faces must be more than 0 and at most 1 (e.g. --faces 0.6)")
@@ -3830,23 +4419,37 @@ def build_parser():
     p.add_argument("--fps", default=None, help="override output fps, e.g. 24000/1001")
     p.add_argument("--chunk-frames", type=int, default=None)
     p.add_argument("--test", type=int, default=0, help="only process first N seconds")
-    p.add_argument("--esrgan", default="realesrgan-ncnn-vulkan")
+    p.add_argument("--esrgan", default=ESRGAN_DEFAULT)
+    p.add_argument("--engine", choices=("auto", "exe", "ncnn"), default="auto", dest="engine_choice",
+                   help="what runs the big models (x2plus, x4plus): ncnn, the current ncnn from "
+                        f"pip ({NCNN_INSTALL}; fixes the GPU resets of current NVIDIA drivers), "
+                        "or exe, realesrgan-ncnn-vulkan's own (ncnn from 2022). auto (default): "
+                        "ncnn when it is installed (and --esrgan names no upscaler of its own)")
     p.add_argument("--gpu", default=None,
                    help="Vulkan GPU index for the upscaler (-g). Several, e.g. 0,1 (a laptop's "
                         "NVIDIA plus the processor's built-in graphics): the first works through "
                         "the movie, the others upscale whole chunks alongside it")
-    p.add_argument("--tile", default=None, help="tile size if GPU runs out of memory (-t)")
+    p.add_argument("--tile", default=None,
+                   help="tile size in pixels (-t; default: whole frames for anime, the "
+                        "upscaler's own 200 for live action). Smaller tiles need less GPU memory "
+                        "and are shorter pieces of GPU work; they change the picture a little. "
+                        "Without --tile, a chunk the GPU fails on is tried again with fewer "
+                        "frames at once and then with 100-, 64- and 32-pixel tiles")
     p.add_argument("--gpu-threads", type=int, default=None,
-                   help="frames the GPU upscales at once (default 8): more can keep a GPU "
-                        "busier, fewer need less GPU memory. The picture is the same either "
-                        "way. When a chunk fails with the default, it is tried again with 6, "
-                        "then 4, then 2 (and the rest of the run keeps the lower count)")
-    p.add_argument("--gpu-jobs", type=int, default=2,
-                   help="upscalers running at once on each GPU (default 2): the second keeps "
-                        "the GPU busy while the other starts up, checks its frames or waits for "
-                        "the next ones. The picture is the same either way; if two turn out "
-                        "slower than one (not enough video memory), it goes back to one by "
-                        "itself. 1 = one at a time")
+                   help="frames the GPU upscales at once (default 8 for anime, 2 for live "
+                        "action): more can keep a GPU busier, fewer need less GPU memory. The "
+                        "picture is the same either way. When a chunk fails with the default, it "
+                        "is tried again one step lower (anime 6, 4, 2, 1; live action 1), and "
+                        "the rest of the run keeps that")
+    p.add_argument("--gpu-jobs", type=int, default=None,
+                   help="upscalers running at once on each GPU (default 1: the anime and "
+                        "camcorder models' 8 frames at once keep the GPU busy already, two of "
+                        "those were 5.5x slower on a 6 GB laptop GPU, and on a GPU that the big "
+                        "models get reset, more work at once makes a reset likelier: 2 frames "
+                        "at once failed several times sooner than 1). A second one keeps the "
+                        "GPU busy while the other starts up, checks its frames or waits for the "
+                        "next ones. The picture is the same either way; if two turn out slower "
+                        "than one, it goes back to one by itself")
     p.add_argument("--ai-blend", type=float, default=None,
                    help="share of the AI result mixed with a plain upscale, 0-1 "
                         "(lower = less flicker, less detail; default 1 anime, 0.75 live/vhs)")
@@ -3969,11 +4572,14 @@ USEFUL EXTRAS (add to any command above)
                      the --ai-blend share, 0.75); needs extra installs and model files: the run
                      says which
   --cpu              encode without an NVIDIA GPU (slow)
-  --tile 128         if the GPU runs out of memory
-  --gpu-threads 4    frames the GPU works on at once (default 8, lowered to 6, 4, then 2 by
-                     itself if a chunk fails); same picture either way
-  --gpu-jobs 1       one upscaler at a time (default 2: the GPU waits less between chunks;
-                     same picture, and it goes back to one by itself if two are slower)
+  --tile 128         smaller pieces of GPU work, if the GPU runs out of memory or is reset
+                     (lowered by itself to 100, 64, 32 if fewer frames at once didn't help)
+  --gpu-threads 4    frames the GPU works on at once (anime/camcorder default 8, lowered to
+                     6, 4, 2, 1 by itself if a chunk fails; live action 2, then 1); same picture
+  --gpu-jobs 2       two upscalers at once (default 1): the GPU waits less between chunks;
+                     same picture, back to one if two are slower
+  --engine exe       live action/CGI on realesrgan-ncnn-vulkan's own engine (2022) even when
+                     the current one is installed (python -m pip install --no-deps ncnn numpy)
 
 MORE
   python dvd_upscale.py --help          every option, briefly
@@ -4146,13 +4752,38 @@ def main():
         if "x2plus" in a.model and a.scale != 2:
             sys.exit("realesrgan-x2plus needs --scale 2")
 
+    if not a.fast and not a.analyze:
+        # the big models: the current ncnn if it is there (see ncnn_upscaler_main); the small
+        # anime/camcorder ones stay on realesrgan-ncnn-vulkan, which runs them fine
+        a.engine = "exe"
+        if not compact_model(a) and a.engine_choice != "exe":
+            if ncnn_available() and (a.engine_choice == "ncnn"
+                                     or a.esrgan == ESRGAN_DEFAULT):
+                a.engine = "ncnn"
+            elif a.engine_choice == "ncnn":
+                sys.exit("--engine ncnn: the ncnn Python module isn't installed: "
+                         + ncnn_install_hint())
+            elif a.esrgan == ESRGAN_DEFAULT:
+                print(f"NOTE: for {a.model}, '{ncnn_install_hint()}' gives the upscaler a current "
+                      "GPU engine: the one built into realesrgan-ncnn-vulkan (2022) makes NVIDIA "
+                      "drivers from 570 on reset the GPU now and then (\"vkQueueSubmit failed -4\")")
     if not a.fast:
         kind = (a.type if a.type != "vhs" else
                 f"vhs {'movie tape' if a.mode == 'telecine' else 'camcorder tape'}")
-        print(f"Upscaler: {a.model} x{a.scale} ({kind} preset)")
+        print(f"Upscaler: {a.model} x{a.scale} ({kind} preset)"
+              + (", run by the current ncnn (pip)" if getattr(a, "engine", "exe") == "ncnn"
+                 else ""))
+        load_gpu_step(a)        # (as far down as earlier runs had to go, see gpu_step_file)
+        if a.gpu_jobs is None:          # (see --gpu-jobs)
+            # one: the small models keep the GPU busy at 8 frames at once (two anime upscalers
+            # starved NVENC on a laptop), and where the big ones get the GPU reset, more work at
+            # once makes it likelier (2 frames at once failed several times sooner than 1)
+            a.gpu_jobs = 1
         jobs_note = (f"up to {a.gpu_jobs} upscalers per GPU, a second kept only if faster"
                      if a.gpu_jobs > 1 else "one upscaler per GPU")
-        print(f"GPU settings: {gpu_threads(a)} frames at once on the GPU; {jobs_note}")
+        print(f"GPU settings: {gpu_load_text(a)}; {jobs_note}"
+              + (f" (what this GPU needed before; to try more again, delete "
+                 f"{gpu_step_file().name} next to {Path(__file__).name})" if GPU_STEP[0] else ""))
     if a.faces is not None and (a.fast or a.type in ("anime", "cgi") or a.ai_blend == 0):
         # (--all --faces on a folder of all kinds of movies: only the live-action ones and tapes
         # get it)
@@ -4279,6 +4910,8 @@ def main():
             Path(report).write_text(json.dumps(dict(type=a.type, mode=a.mode,
                                                     combed=bool(getattr(a, "combed", False)))))
         return
+    if not a.fast:
+        check_upscaler(a)       # (exits if the model's files are broken or the GPU fails)
     if a.faces:
         faces_check(a)          # (exits with what to install or download if something's missing)
 
@@ -4694,7 +5327,7 @@ def main():
     # the next ones; each frame is upscaled the same way either way), and the other GPUs of
     # --gpu 0,1. Each: (GPU, name, chunks it leaves to the main one, gated: waits until its
     # GPU's speed with one upscaler is known)
-    jobs = 1 if a.fast else a.gpu_jobs
+    jobs = 1 if a.fast else a.gpu_jobs or 1
 
     def lane_name(dev, k):
         return (f"GPU {dev}" if dev is not None else "upscaler") + (f" #{k + 1}" if k else "")
@@ -5009,7 +5642,7 @@ def main():
 
 VALUE_OPTS = ("--type", "--mode", "--model", "--scale", "--height", "--dar", "--fps",
               "--chunk-frames", "--test", "--esrgan", "--gpu", "--tile", "--gpu-threads",
-              "--gpu-jobs",
+              "--gpu-jobs", "--engine",
               "--ai-blend", "--smooth",
               "--sharpen", "--work", "--chroma-delay", "--mask", "--face-model", "--face-models")
 STOPPED = (130, 3221225786)     # a run stopped by Ctrl+C; Windows "terminated by Ctrl+C"
@@ -5618,7 +6251,8 @@ def queue_main(argv):
     for line in failed:
         print(f"  failed: {line}")
     if a.shutdown:
-        note("Shutting down in 60 s (cancel with: shutdown /a)")
+        note("Shutting down in 60 s. To cancel, type:  "
+             + ("shutdown /a" if sys.platform == "win32" else "shutdown -c"))
         cmd = (["shutdown", "/s", "/t", "60"] if sys.platform == "win32"
                else ["shutdown", "-h", "+1"])
         subprocess.run(cmd)
@@ -5750,6 +6384,8 @@ if __name__ == "__main__":
         os.environ["PATH"] = _here + os.pathsep + os.environ.get("PATH", "")
     if sys.argv[1:2] == ["--faces-worker"]:          # (a chunk's face restoration: see Chunk)
         sys.exit(faces_worker_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-upscaler"]:         # (the current ncnn: see esrgan_cmd)
+        sys.exit(ncnn_upscaler_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--clip"]:
         try:
             clip_main(sys.argv[2:])
