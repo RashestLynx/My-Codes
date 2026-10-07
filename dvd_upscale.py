@@ -1263,7 +1263,10 @@ def check_upscaler(a):
                 # line is then always the last GPU, never the reason. The reason is the
                 # worker's own "ncnn: ..." line, or none at all: it crashed)
                 own = [x for x in lines if x.startswith("ncnn")]
-                why = own[-1][:160] if own else f"exit code {rc}, no message from the upscaler"
+                why = (own[-1][:160] if own else "no message from the upscaler") + \
+                    f"; it ended with exit code {rc}" + \
+                    (" (a crash inside ncnn or the graphics driver)" if isinstance(rc, int)
+                     and (rc < 0 or rc > 255) else "")
                 print("  the current ncnn's output:", flush=True)
                 for x in lines[-12:]:
                     print("    " + x[:160], flush=True)
@@ -1883,6 +1886,8 @@ def ncnn_upscaler_main(argv):
     for opt in ("-i", "-o", "-n", "-s", "-m", "-t", "-g", "-j", "-f"):
         p.add_argument(opt)
     w = p.parse_args(argv)
+    import faulthandler
+    faulthandler.enable()       # (a crash inside ncnn or the driver then prints where, on stderr)
     try:
         import numpy as np
         import ncnn
