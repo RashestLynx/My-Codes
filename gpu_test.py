@@ -4,8 +4,11 @@
 whole frames, then 200-pixel tiles (the .exe's default). It reports the speed and whether the
 GPU was reset (vkQueueSubmit failed -4).
 
-    python -m pip install ncnn numpy
+    python -m pip install --no-deps ncnn numpy
     python gpu_test.py ["CGI\\COCO.mkv"]
+
+(--no-deps: ncnn itself needs only numpy; without it pip also installs opencv-python, which
+can clash with the opencv-python-headless that --faces uses)
 
 Put it next to dvd_upscale.py (the models folder next to realesrgan-ncnn-vulkan.exe is used).
 With a movie, a frame from it is used (ffmpeg needed), else a test picture.
@@ -82,7 +85,7 @@ if __name__ == "__main__":
     try:
         import numpy, ncnn
     except ImportError:
-        sys.exit("First: python -m pip install ncnn numpy")
+        sys.exit("First: python -m pip install --no-deps ncnn numpy")
     if not (HERE / "models" / "realesrgan-x2plus.param").exists():
         sys.exit(f"realesrgan-x2plus.param not found in {HERE / 'models'}")
     print(f"ncnn {ncnn.__version__}; GPUs: " + ", ".join(
