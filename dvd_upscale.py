@@ -1866,6 +1866,97 @@ def write_png(path, rgb):
         raise OSError(f"encode image {Path(path).name} failed ({e})") from e
 
 
+# ncnn options that can be switched off when the GPU faults with the current ncnn, mildest first
+# (see ncnn_stress_main, which tries them and saves the first that survives in ncnn_opts.json)
+NCNN_OPT_SETS = {
+    "base": {},
+    "nosubgroup": {"use_subgroup_ops": False},
+    "notensor": {"use_tensor_storage": False},
+    "nowinograd": {"use_winograd_convolution": False, "use_winograd23_convolution": False,
+                   "use_winograd43_convolution": False, "use_winograd63_convolution": False},
+    "fp32": {"use_fp16_packed": False, "use_fp16_storage": False, "use_int8_storage": False,
+             "use_bf16_packed": False, "use_bf16_storage": False},
+}
+NCNN_OPT_SETS["safe"] = {k: v for d in NCNN_OPT_SETS.values() for k, v in d.items()}
+
+
+def ncnn_opts_file():
+    return Path(os.environ.get("DVD_UPSCALE_NCNN_OPTS_FILE")
+                or Path(__file__).resolve().parent / "ncnn_opts.json")
+
+
+def ncnn_opt_set_name():
+    """The option set the upscaler worker uses: DVD_UPSCALE_NCNN_OPTS, else what the self-test
+    saved (ncnn_opts.json next to the script), else "base"."""
+    name = os.environ.get("DVD_UPSCALE_NCNN_OPTS")
+    if not name:
+        try:
+            name = json.loads(ncnn_opts_file().read_text(encoding="utf-8")).get("set")
+        except (OSError, ValueError, AttributeError):
+            name = None
+    return name if name in NCNN_OPT_SETS else "base"
+
+
+def ncnn_stress_main(argv):
+    """python dvd_upscale.py --ncnn-stress [--gpu N] [--frames 300]: the current ncnn upscaling
+    test frames with each option set of NCNN_OPT_SETS in turn (one process each, the real
+    worker). The GPU of NVIDIA drivers that fault on some ncnn code paths is reset within a few
+    hundred frames: the first set that gets through them all is saved in ncnn_opts.json, and
+    every later run uses it."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-stress")
+    p.add_argument("--gpu")
+    p.add_argument("--frames", type=int, default=300)
+    w = p.parse_args(argv)
+    here = Path(__file__).resolve().parent
+    exe = shutil.which(ESRGAN_DEFAULT) or next((str(f) for f in here.glob(ESRGAN_DEFAULT + "*")), None)
+    models = Path(exe).resolve().parent / "models" if exe else here / "models"
+    with tempfile.TemporaryDirectory(prefix="ncnn_stress_") as d:
+        d = Path(d)
+        (d / "in").mkdir()
+        print(f"Making {w.frames} test frames (720x480)...", flush=True)
+        run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+             f"testsrc2=s=720x480:r=24:d={w.frames / 24:.3f}", "-frames:v", str(w.frames),
+             str(d / "in" / "%06d.png")])
+        results = []
+        for name in NCNN_OPT_SETS:
+            out = d / ("out_" + name)
+            out.mkdir()
+            cmd = [sys.executable, Path(__file__).resolve(), "--ncnn-upscaler", "-i", d / "in",
+                   "-o", out, "-n", "realesrgan-x2plus", "-s", "2", "-f", "png", "-j", "1:1:1",
+                   "-m", models]
+            if w.gpu is not None:
+                cmd += ["-g", w.gpu]
+            t0 = time.time()
+            r = subprocess.run([str(c) for c in cmd], capture_output=True,
+                               stdin=subprocess.DEVNULL, env={**os.environ,
+                                                              "DVD_UPSCALE_NCNN_OPTS": name})
+            text = (r.stdout + r.stderr).decode("utf-8", "replace")
+            n = len(list(out.glob("*.png")))
+            ok = r.returncode == 0 and n == w.frames and not GPU_ERRORS.search(text)
+            took = time.time() - t0
+            print(f"  {name:11s} {'OK    ' if ok else 'FAILED'} {n}/{w.frames} frames, "
+                  f"{n / took:.1f} frames/s" + ("" if ok else f" (exit code {r.returncode})"),
+                  flush=True)
+            if not ok:
+                bad = [x.strip() for x in text.splitlines() if x.startswith("ncnn")
+                       or GPU_ERRORS.search(x)]
+                for x in bad[-3:]:
+                    print("      " + x[:150], flush=True)
+            results.append((name, ok, n / took))
+            shutil.rmtree(out, ignore_errors=True)
+            if ok:
+                break
+            time.sleep(15)      # (the driver recovers from the reset)
+    good = [x for x in results if x[1]]
+    if not good:
+        print("No option set got through (see the lines above). If they say the GPU was reset: "
+              "this driver faults on the current ncnn too, try an older one (before 570).")
+        return 1
+    ncnn_opts_file().write_text(json.dumps({"set": good[0][0]}), encoding="utf-8")
+    print(f"Saved '{good[0][0]}' in {ncnn_opts_file().name}: the upscaler uses it from now on.")
+    return 0
+
+
 def ncnn_upscaler_main(argv):
     """python dvd_upscale.py --ncnn-upscaler -i IN -o OUT -n MODEL -s SCALE [-m MODELS] [-t TILE]
     [-g GPU] [-j L:P:S] [-f png]: realesrgan-ncnn-vulkan's job done with the current ncnn from
@@ -1913,6 +2004,9 @@ def ncnn_upscaler_main(argv):
     o.use_fp16_packed = o.use_fp16_storage = True
     o.use_fp16_arithmetic = o.use_bf16_storage = o.use_bf16_packed = False
     o.use_int8_storage = True
+    for opt_name, opt_value in NCNN_OPT_SETS[ncnn_opt_set_name()].items():
+        if hasattr(o, opt_name):
+            setattr(o, opt_name, opt_value)
     net.set_vulkan_device(gpu)
     # (loaded from inside the models folder, by bare file names: ncnn's fopen takes a path in
     # Windows' ANSI code page, so a folder like "Vidéos" in it would fail; the folder itself the
@@ -6389,6 +6483,8 @@ if __name__ == "__main__":
         os.environ["PATH"] = _here + os.pathsep + os.environ.get("PATH", "")
     if sys.argv[1:2] == ["--faces-worker"]:          # (a chunk's face restoration: see Chunk)
         sys.exit(faces_worker_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-stress"]:           # (find the ncnn options the GPU survives)
+        sys.exit(ncnn_stress_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-upscaler"]:         # (the current ncnn: see esrgan_cmd)
         rc = ncnn_upscaler_main(sys.argv[2:])
         # (leave at once, without Python's and ncnn's clean-up: on Windows with the NVIDIA
