@@ -603,6 +603,44 @@ def vhs_prefilter(a):
     return ",".join(f)
 
 
+def bar_rows_valid(a, ih, m):
+    """m rows of black off the top and the bottom of an ih-line picture can be taken off before
+    the upscale and put back after it: the output height of what is left, and the offset it
+    sits at, must be whole even numbers (4:2:0 pictures)."""
+    if m <= 0 or ih - 2 * m < ih // 2:
+        return False
+    keep, off = a.height * (ih - 2 * m), a.height * m
+    return keep % ih == 0 and off % ih == 0 and (keep // ih) % 2 == 0 and (off // ih) % 2 == 0
+
+
+def detect_bars(a, info, samples=24):
+    """Black bars above and below a widescreen movie: the rows to cut off at the top and
+    bottom (the same number, 0: none). They cost the upscaler as much as the picture does
+    (2.39:1 on a DVD: a quarter of every frame), so the picture alone goes to the GPU and the
+    bars are put back after it, the same picture. ffmpeg's cropdetect on `samples` spots across
+    the movie: only the rows black at EVERY spot count (a scene with the picture over the whole
+    frame, or a dark one that reads as bars, keeps the crop small), less a safety margin."""
+    ih, dur = info["h"], float(info["duration"])
+    tops, bots = [], []
+    for k in range(samples):
+        at = dur * (0.03 + 0.94 * k / max(1, samples - 1))
+        rc, txt = capture(["ffmpeg", "-hide_banner", "-ss", f"{at:.1f}", "-i", a.input, "-an",
+                           "-sn", "-vf", "cropdetect=24:2:0", "-frames:v", "25", "-f", "null",
+                           "-"])
+        found = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", txt)
+        if found:
+            w, h, x, y = (int(v) for v in found[-1])
+            tops.append(y)
+            bots.append(ih - (y + h))
+    if len(tops) < samples * 0.75:
+        return 0                    # (couldn't read enough of the movie: no crop)
+    m = min(min(tops), min(bots)) - 6           # (a margin: soft or noisy edges)
+    for cand in range(m, 15, -1):
+        if bar_rows_valid(a, ih, cand):
+            return cand
+    return 0
+
+
 def prefilter(a):
     if a.type == "vhs":
         return vhs_prefilter(a)
@@ -634,6 +672,8 @@ def prefilter(a):
     else:
         f += ["scale=trunc(iw*sar/2)*2:ih:flags=lanczos"]      # anamorphic -> square pixels
     f += ["setsar=1", f"hqdn3d={a.denoise}"]
+    if getattr(a, "crop_rows", 0):
+        f += [f"crop=iw:ih-{2 * a.crop_rows}:0:{a.crop_rows}"]    # (the bars are put back after)
     if getattr(a, "dvd_trim", 0):
         f += [f"trim=start_frame={a.dvd_trim}", "setpts=PTS-STARTPTS"]   # chunk warm-up frames
     f += [f"fps={a.fps}"]
@@ -643,8 +683,16 @@ def prefilter(a):
 def postfilter(a):
     # exact width (multiple of 8, e.g. 1920 or 1440): some TVs and hardware decoders reject
     # odd sizes like 1918x1080
-    f = [f"scale={a.out_w}:{a.height}:flags=lanczos+accurate_rnd",
-         "format=yuv420p10le",
+    m, ih = getattr(a, "crop_rows", 0), getattr(a, "crop_src_h", 0)
+    if m and ih:
+        # the picture without its bars, scaled to the same size it has in the full frame, then
+        # the bars put back (black) where they were
+        keep, off = a.height * (ih - 2 * m) // ih, a.height * m // ih
+        f = [f"scale={a.out_w}:{keep}:flags=lanczos+accurate_rnd",
+             f"pad={a.out_w}:{a.height}:0:{off}:black"]
+    else:
+        f = [f"scale={a.out_w}:{a.height}:flags=lanczos+accurate_rnd"]
+    f += ["format=yuv420p10le",
          # SD (601) -> HD (709) colours. HD sources are 709 already; through the AI the frames
          # come back from RGB as 601 (the PNG step's default), so only --fast keeps their 709
          "colorspace=all=bt709:iall="
@@ -5140,6 +5188,10 @@ def build_parser():
                         "picture is the same either way. When a chunk fails with the default, it "
                         "is tried again one step lower (anime 6, 4, 2, 1; live action 1), and "
                         "the rest of the run keeps that")
+    p.add_argument("--no-crop", action="store_true",
+                   help="don't cut the black bars of a widescreen movie off before the upscale "
+                        "(they are looked for by default: the upscaler then does only the "
+                        "picture, about a quarter less work for 2.39:1)")
     p.add_argument("--encode-jobs", type=int, default=2, metavar="N",
                    help="chunks encoded at once while the next is upscaled (default 2): the CPU "
                         "filters and encode of a chunk can take longer than its upscale, and the "
@@ -5280,6 +5332,10 @@ USEFUL EXTRAS (add to any command above)
   --gpu 1 / 0,1      another GPU, or both (the default is GPU 0; see GPU SET-UP AND SPEED)
   --gpu-threads 4    frames the GPU works on at once (anime/camcorder default 8, lowered to
                      6, 4, 2, 1 by itself if a chunk fails; live action 2, then 1); same picture
+  --no-crop          don't cut the black bars of a widescreen movie off before the upscale (by
+                     default they are found, cut, upscaled without and put back: 2.39:1 movies
+                     take about a quarter less GPU work, the same picture; a movie already
+                     started keeps what it started with)
   --encode-jobs 2    chunks encoded at once while the next is upscaled (default 2; 1 = the old
                      way). The CPU part of a chunk (filters, encode) can take longer than its
                      upscale: the progress line then shows "(upscale 140s, encode 175s)" and the
@@ -5786,11 +5842,29 @@ def main():
     # started before that keeps its way, so its chunks match
     prev = previous_settings(a)
     a.rgb_interp = not a.fast and not (prev and "rgb" not in prev)
+    # black bars of a widescreen movie: cut off before the upscale, put back after it (see
+    # detect_bars). A movie started earlier keeps what it started with (its chunks must match)
+    a.crop_rows, a.crop_src_h = 0, info["h"]
+    if not a.fast and a.type != "vhs" and not a.no_crop and info["h"] <= 576:
+        if prev is not None:
+            a.crop_rows = int(prev.get("crop", 0))
+        else:
+            status_line("  looking for black bars...")
+            a.crop_rows = detect_bars(a, info)
+            status_line()
+            if a.crop_rows:
+                print(f"Black bars: {a.crop_rows} rows at the top and at the bottom are cut "
+                      f"before the upscale and put back after it ({info['h'] - 2 * a.crop_rows} "
+                      f"of {info['h']} rows upscaled: faster, the same picture; --no-crop turns "
+                      "it off)")
+            else:
+                print("Black bars: none found (the picture fills the frame)")
     fp = dict(input=str(Path(a.input).resolve()), size=st.st_size, mtime=int(st.st_mtime),
               mode=a.mode, fps=a.fps, model=a.model, scale=a.scale, height=a.height,
               chunk=a.chunk_frames, fast=a.fast, dar=a.dar, test=a.test, enc=" ".join(a.enc), w=a.out_w,
               denoise=a.denoise, ai_blend=a.ai_blend, smooth=a.smooth, sharpen=a.sharpen,
               **({"rgb": "interp"} if a.rgb_interp else {}),
+              **({"crop": a.crop_rows} if a.crop_rows else {}),
               **({"stabilize": a.stab_tf} if a.stabilize else {}),
               # (CodeFormer's fidelity: GFPGAN has none)
               **({"faces": f"{a.face_model} {a.faces:g}" + (
