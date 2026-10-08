@@ -1369,6 +1369,15 @@ def keep_awake():
     if os.name == "nt":
         import ctypes
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+        try:
+            # (above-normal priority, inherited by the upscaler and ffmpeg processes: Windows
+            # gives a busy browser or antivirus scan the processor first otherwise, and the GPU
+            # then waits for the upscaler's next frame)
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            k32.SetPriorityClass(ctypes.c_void_p(k32.GetCurrentProcess()), 0x00008000)
+        except (OSError, AttributeError):
+            pass
         return
     # macOS: caffeinate, Linux with systemd: an inhibitor; each lasts until this run exits
     pid = str(os.getpid())
@@ -5280,6 +5289,20 @@ USEFUL EXTRAS (add to any command above)
                      against 179 s a chunk): time a --test 60 before using it. Up to 4
   --engine exe       live action/CGI on realesrgan-ncnn-vulkan's own engine (2022) even when
                      the current one is installed (python -m pip install --no-deps ncnn numpy)
+
+SPEED CHECKLIST (what holds a laptop GPU back; the script can't change these, you can)
+  1. Plug in the charger (the GPU's power limit drops a lot on battery).
+  2. Windows 11: Settings > System > Power > Power mode = "Best performance".
+  3. The laptop maker's app (Armoury Crate, Legion Vantage, MSI Center, OMEN ...): Turbo /
+     Performance mode and the fans on max: this raises the GPU's power and heat limits.
+  4. NVIDIA Control Panel > Manage 3D settings > Power management mode = "Prefer maximum
+     performance" (Windows: Settings > System > Display > Graphics: python.exe = High performance).
+  5. Cooling: hard flat surface, raised at the back, vents clear, a cooling pad. The run shows
+     "slowed by: power cap, thermal" while the GPU is held back by power or heat.
+  6. Close what uses the GPU (browser video, games, overlays, AMD software), and pause
+     antivirus scans while a movie runs.
+  The script already keeps the PC awake and runs above-normal priority. Thermal and power
+  limits protect the GPU and can't (or shouldn't) be switched off.
 
 GPU SET-UP AND SPEED (run these once from the script's folder; each saves what it finds in
 ncnn_opts.json next to dvd_upscale.py, and every later run uses it)
