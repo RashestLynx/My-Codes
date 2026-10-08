@@ -4855,12 +4855,39 @@ USEFUL EXTRAS (add to any command above)
   --cpu              encode without an NVIDIA GPU (slow)
   --tile 128         smaller pieces of GPU work, if the GPU runs out of memory or is reset
                      (lowered by itself to 100, 64, 32 if fewer frames at once didn't help)
+  --gpu 1 / 0,1      another GPU, or both (the default is GPU 0; see GPU SET-UP AND SPEED)
   --gpu-threads 4    frames the GPU works on at once (anime/camcorder default 8, lowered to
                      6, 4, 2, 1 by itself if a chunk fails; live action 2, then 1); same picture
   --gpu-jobs 2       two upscalers at once (default 1): the GPU waits less between chunks;
                      same picture, back to one if two are slower
   --engine exe       live action/CGI on realesrgan-ncnn-vulkan's own engine (2022) even when
                      the current one is installed (python -m pip install --no-deps ncnn numpy)
+
+GPU SET-UP AND SPEED (run these once from the script's folder; each saves what it finds in
+ncnn_opts.json next to dvd_upscale.py, and every later run uses it)
+  python dvd_upscale.py --ncnn-stress --gpu 0
+        finds the ncnn options your GPU survives (the GPU resets with "vkWaitForFences failed -4"
+        or "vkQueueSubmit failed -4" mean it doesn't). Saves e.g. {"set": "nowinograd"}.
+        Takes a few minutes; run it again after a driver update or if resets come back.
+  python dvd_upscale.py --ncnn-bench "CGI\Movie.mkv" --gpu 0
+        the fastest settings that keep the same picture: whole frames instead of 200-pixel tiles
+        (about 50% faster, no tile seams) and fp16 (kept only if the picture matches). Saved as
+        "set" and "tile". Takes a few minutes.
+  python dvd_upscale.py --ncnn-bench-gpu "CGI\Movie.mkv"
+        times each GPU (--gpus 0,1 by default) and saves the faster one as the default GPU
+  --gpu N / --gpu 0,1     one GPU (default 0, or the one --ncnn-bench-gpu saved), or both: the
+                          first works through the movie, the second upscales whole chunks too
+  --tile 384              a tile size by hand (overrides the saved one; 0 = automatic)
+  gpu_steps.json          next to the script: the slower settings (fewer frames at once, small
+                          tiles) the script went down to after GPU resets, so the next run
+                          starts there. DELETE it after fixing the GPU (stress test, new driver).
+  ncnn_opts.json          the saved set/tile/gpu. Delete it to go back to the defaults; it can be
+                          edited: {"set": "nowinograd", "tile": 1024, "gpu": 0}
+  Time a run first:  python dvd_upscale.py "Movie.mkv" --test 60   (note the "NNNs/chunk" line)
+  Watch the GPU:     nvidia-smi -l 2   (utilization well under 90% = something else is slowing it)
+  Troubleshooting:   "NOTE: the current ncnn didn't work here" = it fell back to the old engine
+                     (slow, resets); the lines above it say why. A resumed movie keeps its
+                     settings; gpu_errors.log in the movie's _work folder has the GPU details.
 
 MORE
   python dvd_upscale.py --help          every option, briefly
