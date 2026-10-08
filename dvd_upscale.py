@@ -5727,8 +5727,9 @@ SPEED CHECKLIST (what holds a laptop GPU back; the script can't change these, yo
 THE GPU STEP-DOWN (what happens when Windows resets the graphics card: "failed -4")
   The chunk is tried again, and the GPU is given less to do at once for the rest of the run:
   each step is a smaller tile (512, 256, 128, 64, 32 pixels; less for the old engine: fewer
-  frames at once, then tiles). Smaller tiles are slower (more overlap to redo: 64-pixel tiles
-  take about a fifth more work than 100) and the picture changes very slightly, so a reset after
+  frames at once, then tiles). Smaller tiles are slower: the overlap between them is done twice.
+  Extra work on a DVD frame against whole frames: 512 +2%, 256 +11%, 128 +27%, 64 +66%, 32 +149%.
+  The picture changes very slightly, so a reset after
   a long good stretch (120+ frames) doesn't step down. Where it went is kept in gpu_steps.json
   next to the script, so the next run starts there. It costs speed ONLY after a reset: with
   settings the GPU survives (--ncnn-stress) it never happens.
