@@ -1878,6 +1878,7 @@ NCNN_OPT_SETS = {
              "use_bf16_packed": False, "use_bf16_storage": False},
 }
 NCNN_OPT_SETS["safe"] = {k: v for d in NCNN_OPT_SETS.values() for k, v in d.items()}
+NCNN_OPT_SETS["nowinograd_fp16"] = {**NCNN_OPT_SETS["nowinograd"], "use_fp16_arithmetic": True}
 
 
 def ncnn_opts_file():
@@ -1885,15 +1886,20 @@ def ncnn_opts_file():
                 or Path(__file__).resolve().parent / "ncnn_opts.json")
 
 
+def ncnn_saved():
+    try:
+        d = json.loads(ncnn_opts_file().read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
 def ncnn_opt_set_name():
     """The option set the upscaler worker uses: DVD_UPSCALE_NCNN_OPTS, else what the self-test
     saved (ncnn_opts.json next to the script), else "base"."""
     name = os.environ.get("DVD_UPSCALE_NCNN_OPTS")
     if not name:
-        try:
-            name = json.loads(ncnn_opts_file().read_text(encoding="utf-8")).get("set")
-        except (OSError, ValueError, AttributeError):
-            name = None
+        name = ncnn_saved().get("set")
     return name if name in NCNN_OPT_SETS else "base"
 
 
@@ -1919,6 +1925,8 @@ def ncnn_stress_main(argv):
              str(d / "in" / "%06d.png")])
         results = []
         for name in NCNN_OPT_SETS:
+            if name == "nowinograd_fp16":       # (a speed trial, see ncnn_bench_main)
+                continue
             out = d / ("out_" + name)
             out.mkdir()
             cmd = [sys.executable, Path(__file__).resolve(), "--ncnn-upscaler", "-i", d / "in",
@@ -1957,6 +1965,97 @@ def ncnn_stress_main(argv):
     return 0
 
 
+def ncnn_bench_main(argv):
+    """python dvd_upscale.py --ncnn-bench [MOVIE] [--gpu N] [--frames 90]: the speed-ups that
+    leave the picture as it is, tried on frames of the movie: whole frames instead of 200-pixel
+    tiles (a fifth of the work is the tiles' overlaps; and no seams) and fp16 arithmetic (the
+    GPU's fast path). Each is run through the real worker, its speed taken from the times its
+    frames were written, and its frames compared with the reference (the current settings): a
+    set must be 45 dB or closer (40+ is invisible; fp16 against fp32 rounding is about 55) and
+    free of GPU errors. The fastest that passes is saved in ncnn_opts.json (set and tile)."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-bench")
+    p.add_argument("movie", nargs="?")
+    p.add_argument("--gpu")
+    p.add_argument("--frames", type=int, default=90)
+    p.add_argument("--min-db", type=float, default=45.0)
+    w = p.parse_args(argv)
+    here = Path(__file__).resolve().parent
+    exe = shutil.which(ESRGAN_DEFAULT) or next((str(f) for f in here.glob(ESRGAN_DEFAULT + "*")), None)
+    models = Path(exe).resolve().parent / "models" if exe else here / "models"
+    base_set = ncnn_saved().get("set") or "nowinograd"
+    if base_set not in NCNN_OPT_SETS or base_set == "nowinograd_fp16":
+        base_set = "nowinograd"
+    trials = [(base_set, 200), (base_set, 1024), ("nowinograd_fp16", 200),
+              ("nowinograd_fp16", 1024)]
+    with tempfile.TemporaryDirectory(prefix="ncnn_bench_") as d:
+        d = Path(d)
+        (d / "in").mkdir()
+        if w.movie:
+            print(f"Taking {w.frames} frames from {w.movie}...", flush=True)
+            rc, txt = capture(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                               "-of", "csv=p=0", w.movie])
+            try:
+                at = max(0.0, float(txt.strip()) * 0.4)         # (somewhere inside the film)
+            except ValueError:
+                at = 0.0
+            run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.1f}", "-i", w.movie, "-map",
+                 "0:v:0", "-vf", "scale=iw*sar:ih,setsar=1,scale=720:480", "-frames:v",
+                 str(w.frames), str(d / "in" / "%06d.png")])
+        else:
+            run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                 f"testsrc2=s=720x480:r=24:d={w.frames / 24:.3f}", "-frames:v", str(w.frames),
+                 str(d / "in" / "%06d.png")])
+        n_in = len(list((d / "in").glob("*.png")))
+        ref, results = None, []
+        for k, (name, tile) in enumerate(trials):
+            out = d / f"out{k}"
+            out.mkdir()
+            cmd = [sys.executable, Path(__file__).resolve(), "--ncnn-upscaler", "-i", d / "in",
+                   "-o", out, "-n", "realesrgan-x2plus", "-s", "2", "-f", "png", "-j", "1:1:1",
+                   "-t", tile, "-m", models]
+            if w.gpu is not None:
+                cmd += ["-g", w.gpu]
+            r = subprocess.run([str(c) for c in cmd], capture_output=True,
+                               stdin=subprocess.DEVNULL,
+                               env={**os.environ, "DVD_UPSCALE_NCNN_OPTS": name})
+            text = (r.stdout + r.stderr).decode("utf-8", "replace")
+            files = sorted(out.glob("*.png"))
+            ok = r.returncode == 0 and len(files) == n_in and not GPU_ERRORS.search(text)
+            label = f"{name} / {'whole frame' if tile > 720 else str(tile) + '-pixel tiles'}"
+            fps = db = None
+            if ok and len(files) > 3:
+                times = [f.stat().st_mtime for f in files]
+                fps = (len(times) - 1) / max(1e-6, max(times) - min(times))
+                if ref is None:
+                    ref, db = out, float("inf")
+                else:
+                    rc, rep = capture(["ffmpeg", "-v", "info", "-i", str(out / "%06d.png"),
+                                       "-i", str(ref / "%06d.png"), "-lavfi", "psnr",
+                                       "-f", "null", "-"])
+                    m = re.search(r"PSNR .*?average:([0-9.]+|inf)", rep)
+                    db = float(m.group(1)) if m else 0.0
+            if ok and db is not None and db >= w.min_db:
+                print(f"  {label:42s} {fps:4.2f} frames/s  "
+                      + ("(reference)" if db == float("inf") else f"{db:.1f} dB from the reference"),
+                      flush=True)
+                results.append((fps, name, tile))
+            else:
+                why = ("GPU error" if GPU_ERRORS.search(text) or r.returncode else
+                       f"picture differs ({db:.1f} dB)" if db is not None else "no result")
+                print(f"  {label:42s} not used: {why}", flush=True)
+            if ref is not out:
+                shutil.rmtree(out, ignore_errors=True)
+            time.sleep(10 if ok else 15)
+    if not results:
+        print("Nothing ran cleanly: the saved settings are unchanged.")
+        return 1
+    fps, name, tile = max(results)
+    ncnn_opts_file().write_text(json.dumps({"set": name, "tile": tile}), encoding="utf-8")
+    print(f"Saved the fastest ({name}, {'whole frames' if tile > 720 else str(tile) + '-pixel tiles'}, "
+          f"{fps:.2f} frames/s) in {ncnn_opts_file().name}.")
+    return 0
+
+
 def ncnn_upscaler_main(argv):
     """python dvd_upscale.py --ncnn-upscaler -i IN -o OUT -n MODEL -s SCALE [-m MODELS] [-t TILE]
     [-g GPU] [-j L:P:S] [-f png]: realesrgan-ncnn-vulkan's job done with the current ncnn from
@@ -1986,7 +2085,7 @@ def ncnn_upscaler_main(argv):
         print(f"ncnn: can't load the current ncnn ({e}): {ncnn_install_hint()}", flush=True)
         return 1
     from concurrent.futures import ThreadPoolExecutor
-    scale, tile, pad = int(w.s), int(w.t or 0), 10
+    scale, tile, pad = int(w.s), int(w.t or ncnn_saved().get("tile") or 0), 10
     models = Path(w.m or "models")
     for name in (w.n, f"{w.n}-x{scale}"):           # (the anime models carry the scale)
         if (models / f"{name}.param").exists():
@@ -6483,6 +6582,8 @@ if __name__ == "__main__":
         os.environ["PATH"] = _here + os.pathsep + os.environ.get("PATH", "")
     if sys.argv[1:2] == ["--faces-worker"]:          # (a chunk's face restoration: see Chunk)
         sys.exit(faces_worker_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-bench"]:            # (the fastest settings that keep the picture)
+        sys.exit(ncnn_bench_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-stress"]:           # (find the ncnn options the GPU survives)
         sys.exit(ncnn_stress_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-upscaler"]:         # (the current ncnn: see esrgan_cmd)
