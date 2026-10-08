@@ -2140,19 +2140,21 @@ def ncnn_auto_main(argv):
     everything to set the GPU up and see how fast it is, in one go: the old saved settings
     (gpu_steps.json, ncnn_opts.json) cleared; --ncnn-stress (the options the GPU survives);
     --ncnn-bench (whole frames / fp16, the fastest with the same picture); --ncnn-bench-gpu
-    (which GPU is faster, saved as the default); then a --test 60 run of the movie while the
+    (which GPU is faster, saved as the default); --ncnn-models (every model's picture, against
+    the original); then a --test 60 run of the movie while the
     GPU is watched (nvidia-smi), and a summary with the time the whole movie will take."""
     p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-auto")
     p.add_argument("movie", nargs="?")
     p.add_argument("--gpu", default=DEFAULT_GPU)
     p.add_argument("--skip-gpu-test", action="store_true")
     p.add_argument("--no-test-run", action="store_true")
+    p.add_argument("--skip-model-test", action="store_true")
     w = p.parse_args(argv)
     movie = [w.movie] if w.movie else []
     summary = []
 
     def step(n, text):
-        print(f"\n=== {n}/5  {text} ===", flush=True)
+        print(f"\n=== {n}/6  {text} ===", flush=True)
 
     step(1, "clearing the old saved settings")
     for f in (gpu_step_file(), ncnn_opts_file()):
@@ -2181,7 +2183,14 @@ def ncnn_auto_main(argv):
         summary.append(f"default GPU: {ncnn_saved().get('gpu')}")
     else:
         summary.append(f"default GPU: {w.gpu} (the GPU test didn't finish)")
-    step(5, "timing a 60-second test run, GPU watched")
+    step(5, "every model on the same frames (--ncnn-models)")
+    if w.skip_model_test or not w.movie:
+        print("  skipped" + ("" if w.skip_model_test else " (give a movie to test the models)"))
+    elif ncnn_models_main([w.movie, "--gpu", str(ncnn_saved().get("gpu", w.gpu))]) == 0:
+        summary.append("models compared: see the table above and model_compare.png")
+    else:
+        summary.append("the model comparison didn't finish")
+    step(6, "timing a 60-second test run, GPU watched")
     if w.no_test_run or not w.movie:
         print("  skipped" + ("" if w.no_test_run else " (give a movie to time it)"))
     else:
@@ -2242,6 +2251,126 @@ def ncnn_auto_main(argv):
         print("  " + x)
     print("Run the movie with: python dvd_upscale.py <movie> <output>   (these settings are used "
           "automatically)")
+    return 0
+
+
+def ncnn_models_main(argv):
+    """python dvd_upscale.py --ncnn-models MOVIE [--gpu N] [--frames 6]: every model in the
+    upscaler's models folder, tried on the same frames of the movie, against the truth.
+    The test: each frame is shrunk to half size, every model upscales it back, and the result is
+    compared with the original frame (SSIM and PSNR; a plain Lanczos resize is the baseline: a
+    model has to beat it). The score is fidelity to the original: it rewards a faithful picture
+    and punishes invented detail, so it ranks models by how true they are, not how sharp, and
+    smooth models can score well. So a picture is written too, model_compare.png (next to the
+    script): the original and each model's result, the same part of the frame side by side, to
+    judge with your own eyes. Speed is relative to realesrgan-x2plus."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-models")
+    p.add_argument("movie")
+    p.add_argument("--gpu", default=None)
+    p.add_argument("--frames", type=int, default=6)
+    w = p.parse_args(argv)
+    here = Path(__file__).resolve().parent
+    exe = shutil.which(ESRGAN_DEFAULT) or next((str(f) for f in here.glob(ESRGAN_DEFAULT + "*")), None)
+    models = Path(exe).resolve().parent / "models" if exe else here / "models"
+    found = {}
+    for f in sorted(models.glob("*.param")):
+        m = re.fullmatch(r"(realesr-animevideov3)-x([234])", f.stem)
+        if m:
+            if m[2] == "2":                     # (its x3 and x4 files: other scales of the same net)
+                found[m[1]] = 2
+        elif (models / (f.stem + ".bin")).exists():
+            m = re.search(r"x([24])", f.stem)
+            if m:
+                found[f.stem] = int(m[1])
+    if not found:
+        print(f"No models found in {models}")
+        return 1
+    saved = ncnn_saved()
+    name = saved.get("set") if saved.get("set") in NCNN_OPT_SETS else "nowinograd"
+    tile = int(saved.get("tile") or 0)
+    rc, dur = capture(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
+                       "csv=p=0", w.movie])
+    try:
+        total = float(dur.strip())
+    except ValueError:
+        print(f"Can't read {w.movie}")
+        return 1
+    with tempfile.TemporaryDirectory(prefix="ncnn_models_") as d:
+        d = Path(d)
+        for sub in ("hr", "lr"):
+            (d / sub).mkdir()
+        print(f"Taking {w.frames} frames from {w.movie}...", flush=True)
+        for i in range(w.frames):
+            at = total * (0.15 + 0.7 * i / max(1, w.frames - 1))
+            run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.1f}", "-i", w.movie, "-map",
+                 "0:v:0", "-vf", "scale=iw*sar:ih,setsar=1,scale=720:480", "-frames:v", "1",
+                 str(d / "hr" / f"{i + 1:06d}.png")])
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(d / "hr" / "%06d.png"), "-vf",
+             "scale=360:240:flags=area", str(d / "lr" / "%06d.png")])
+        n_in = len(list((d / "lr").glob("*.png")))
+
+        def score(folder):
+            rc, rep = capture(["ffmpeg", "-v", "info", "-i", str(folder / "%06d.png"), "-i",
+                               str(d / "hr" / "%06d.png"), "-lavfi", "ssim", "-f", "null", "-"])
+            ssim = re.search(r"All:([0-9.]+)", rep)
+            rc, rep = capture(["ffmpeg", "-v", "info", "-i", str(folder / "%06d.png"), "-i",
+                               str(d / "hr" / "%06d.png"), "-lavfi", "psnr", "-f", "null", "-"])
+            psnr = re.search(r"average:([0-9.]+)", rep)
+            return (float(ssim[1]) if ssim else 0.0), (float(psnr[1]) if psnr else 0.0)
+        plain = d / "plain"
+        plain.mkdir()
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(d / "lr" / "%06d.png"), "-vf",
+             "scale=720:480:flags=lanczos", str(plain / "%06d.png")])
+        rows = [("plain resize (baseline)", *score(plain), None, plain)]
+        for mname, k in found.items():
+            out, fit = d / f"out_{mname}", d / f"fit_{mname}"
+            out.mkdir()
+            fit.mkdir()
+            cmd = [sys.executable, Path(__file__).resolve(), "--ncnn-upscaler", "-i", d / "lr",
+                   "-o", out, "-n", mname, "-s", k, "-f", "png", "-j", "1:1:1", "-m", models]
+            if tile:
+                cmd += ["-t", tile]
+            if w.gpu is not None:
+                cmd += ["-g", w.gpu]
+            r = subprocess.run([str(c) for c in cmd], capture_output=True,
+                               stdin=subprocess.DEVNULL, env={**os.environ,
+                                                              "DVD_UPSCALE_NCNN_OPTS": name})
+            text = (r.stdout + r.stderr).decode("utf-8", "replace")
+            files = sorted(out.glob("*.png"))
+            if r.returncode or len(files) != n_in or GPU_ERRORS.search(text):
+                print(f"  {mname:28s} didn't run cleanly (exit code {r.returncode})", flush=True)
+                time.sleep(15)
+                continue
+            times = [f.stat().st_mtime for f in files]
+            fps = (len(times) - 1) / max(1e-6, max(times) - min(times)) if len(times) > 2 else 0
+            run(["ffmpeg", "-y", "-v", "error", "-i", str(out / "%06d.png"), "-vf",
+                 "scale=720:480:flags=lanczos", str(fit / "%06d.png")])
+            rows.append((f"{mname} (x{k})", *score(fit), fps, fit))
+            time.sleep(5)
+        ref_speed = next((r[3] for r in rows if r[0].startswith("realesrgan-x2plus")), None)
+        print(f"\n  {'model':32s} {'SSIM':>7s} {'PSNR':>7s}   speed (x2plus = 1.0)")
+        for label, ssim, psnr, fps, _ in sorted(rows, key=lambda r: -r[1]):
+            sp = "" if fps is None or not ref_speed else f"{fps / ref_speed:.1f}"
+            print(f"  {label:32s} {ssim:7.4f} {psnr:6.1f}   {sp}")
+        # a picture to judge by eye: the same part of frame 3 (original, then each model)
+        pick = d / "hr" / f"{min(n_in, 3):06d}.png"
+        ins = [("original", pick)] + [(r[0], r[4] / pick.name) for r in rows]
+        cmd = ["ffmpeg", "-y", "-v", "error"]
+        for _, f in ins:
+            cmd += ["-i", str(f)]
+        filt = "".join(f"[{i}:v]crop=240:160:240:160,scale=480:320:flags=neighbor[c{i}];"
+                       for i in range(len(ins)))
+        filt += "".join(f"[c{i}]" for i in range(len(ins))) + f"hstack=inputs={len(ins)}"
+        cmd += ["-filter_complex", filt, "-frames:v", "1", str(here / "model_compare.png")]
+        rc, _ = capture(cmd)
+        if rc == 0:
+            print("\n  model_compare.png (next to the script), left to right: "
+                  + ", ".join(x[0] for x in ins))
+    best = max(rows[1:], key=lambda r: r[1], default=None)
+    if best:
+        print(f"\n  Closest to the original: {best[0]} (SSIM {best[1]:.4f}). Look at "
+              "model_compare.png before choosing: a higher score is a truer picture, not always "
+              "a nicer one.")
     return 0
 
 
@@ -4977,10 +5106,16 @@ GPU SET-UP AND SPEED (run these once from the script's folder; each saves what i
 ncnn_opts.json next to dvd_upscale.py, and every later run uses it)
   python dvd_upscale.py --ncnn-auto "CGI\Movie.mkv"
         ALL OF THE BELOW IN ONE GO (about 15-25 minutes, then nothing more to do): clears the old
-        saved settings, runs --ncnn-stress, --ncnn-bench and --ncnn-bench-gpu, times a 60-second
+        saved settings, runs --ncnn-stress, --ncnn-bench, --ncnn-bench-gpu and --ncnn-models, times a 60-second
         test run while watching the GPU, and prints a summary with the hours the movie will take.
-        Add --gpu N to set up another GPU, --skip-gpu-test, or --no-test-run. Use it after a
+        Add --gpu N to set up another GPU, --skip-gpu-test, --skip-model-test or --no-test-run. Use it after a
         driver update, or when GPU resets ("failed -4") come back. The pieces, one by one:
+  python dvd_upscale.py --ncnn-models "CGI\Movie.mkv"
+        tests EVERY model in the models folder on the same frames of the movie (shrunk to half,
+        upscaled back, compared with the original: SSIM/PSNR against a plain resize), prints a
+        table with the speed of each, and writes model_compare.png next to the script (the same
+        part of the frame from each model side by side, to judge by eye). A higher score means a
+        truer picture, not always a nicer one. It changes nothing.
   python dvd_upscale.py --ncnn-stress --gpu 0
         finds the ncnn options your GPU survives (the GPU resets with "vkWaitForFences failed -4"
         or "vkQueueSubmit failed -4" mean it doesn't). Saves e.g. {"set": "nowinograd"}.
@@ -6808,6 +6943,8 @@ if __name__ == "__main__":
         os.environ["PATH"] = _here + os.pathsep + os.environ.get("PATH", "")
     if sys.argv[1:2] == ["--faces-worker"]:          # (a chunk's face restoration: see Chunk)
         sys.exit(faces_worker_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-models"]:           # (every model on the same frames)
+        sys.exit(ncnn_models_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-auto"]:             # (all of the GPU set-up and a timed test)
         sys.exit(ncnn_auto_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-bench-gpu"]:        # (which GPU is faster)
