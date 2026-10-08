@@ -7263,10 +7263,22 @@ def queue_main(argv):
                       "one first (new movies / lines are picked up by the running one).")
     keep_awake()
 
+    # a marker in front of each kind of line on the screen (the log file keeps the plain text,
+    # so it can be searched for DONE / FAILED)
+    MARKERS = (("Started", "▶️ "), ("START", "▶️ "), ("DONE", "✅ "), ("Finished", "🏁 "), ("FAILED", "❌ "),
+               ("SKIPPED", "❌ "), ("STOPPED", "⏹️ "), ("KEPT", "⚠️ "), ("Waiting", "⏳ "))
+
     def note(msg):
-        print(msg, flush=True)
-        with open(log, "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+        marker = next((m for word, m in MARKERS if msg.startswith(word)), "")
+        if not marker and "WARNING" in msg.upper():
+            marker = "⚠️ "
+        status_line()           # (the progress line, finished, before a line that stays)
+        print(marker + msg, flush=True)
+        try:
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+        except OSError as e:    # (a log file another program has open must not stop the queue)
+            print(f"Couldn't write to {log.name}: {e}", flush=True)
 
     tried, done, failed, told_waiting, written = set(), [], [], set(), set()
     analyzed = 0
