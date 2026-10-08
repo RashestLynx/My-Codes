@@ -2790,6 +2790,47 @@ def faces_check(a):
               "so a chunk with many faces can take many minutes)." + how)
 
 
+THROTTLE_BITS = ((0x4, "power cap"), (0x8, "hardware slowdown"), (0x20, "thermal"),
+                 (0x40, "hardware thermal"), (0x80, "power brake"))
+
+
+class GpuWatch:
+    """While a chunk is upscaled: the NVIDIA GPU's clock, temperature, power and throttle
+    reasons (nvidia-smi, every 4 s), to tell a GPU that slows itself down (heat, power) from
+    one that waits for the processor. summary() is one short line, "" if there is no nvidia-smi."""
+
+    def __init__(self):
+        self.rows, self.stop = [], threading.Event()
+        if shutil.which("nvidia-smi"):
+            threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self):
+        while not self.stop.is_set():
+            try:
+                r = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm,temperature.gpu,"
+                     "power.draw,utilization.gpu,clocks_throttle_reasons.active",
+                     "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                    timeout=10, stdin=subprocess.DEVNULL)
+                v = [x.strip() for x in r.stdout.splitlines()[0].split(",")]
+                self.rows.append((float(v[0]), float(v[1]), float(v[2]), float(v[3]),
+                                  float(v[4]), int(v[5], 16)))
+            except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+                pass
+            self.stop.wait(4)
+
+    def summary(self):
+        self.stop.set()
+        rows = self.rows[2:] or self.rows         # (the first samples are the upscaler starting)
+        if not rows:
+            return ""
+        med = lambda i: statistics.median(r[i] for r in rows)
+        why = [name for bit, name in THROTTLE_BITS
+               if sum(1 for r in rows if r[5] & bit) > len(rows) / 4]
+        return (f"GPU {med(0):.0f} of {med(1):.0f} MHz, {med(2):.0f} C, {med(3):.0f} W, "
+                f"{med(4):.0f}% busy" + (f", slowed by: {', '.join(why)}" if why else ""))
+
+
 class Chunk:
     """One chunk of the movie, in three steps: read its frames out of the source (extract), run
     them through the upscaler (upscale, on the GPU) and encode them into the chunk file
@@ -2851,6 +2892,7 @@ class Chunk:
             self.pre += (f",vidstabtransform=input=stab.trf:{a.stab_tf}"
                          + (f",trim=start_frame={stab[2]},setpts=PTS-STARTPTS" if stab[2] else ""))
         self.encode = None
+        self.up_info = self.gpu_info = ""
         # --faces: what finish is doing while the main GPU waits for it (None: not restoring
         # faces), and the face restoration's time on the first chunk, shown once
         self.stage = self.face_msg = None
@@ -2927,6 +2969,7 @@ class Chunk:
                     f"the drive with the work folder needs about {need / 1e9:.0f} GB free for "
                     f"this chunk's upscaled frames and has {free / 1e9:.1f} GB: make room (or "
                     "use --work on another drive)")
+            watch, t_up0 = (GpuWatch() if not self.lane else None), time.time()
             try:
                 attempt, src, kept = 0, tmp / "in", 0
                 while True:
@@ -3031,6 +3074,19 @@ class Chunk:
             finally:
                 with DISK_LOCK:
                     UPSCALING.pop(self, None)
+            # where the upscale's seconds went: the upscaler starting (to its first frame), the
+            # frames at full speed, and what came after the last one (checks)
+            try:
+                times = sorted(f.stat().st_mtime for f in (tmp / "out").glob("*.png"))
+                if len(times) > 10 and not self.lane:
+                    self.up_info = (f"start {times[0] - t_up0:.0f}s, "
+                                    f"{(len(times) - 1) / max(1e-6, times[-1] - times[0]):.2f} "
+                                    f"frames/s, after {time.time() - times[-1]:.0f}s")
+                    self.gpu_info = watch.summary() if watch else ""
+            except OSError:
+                pass
+            if watch:
+                watch.stop.set()
             ins = ["-framerate", a.fps, "-i", pngs(tmp / "out")]
             if a.ai_blend < 1:
                 # mix the AI frames with a plain upscale of the same input frames, so frames
@@ -6040,9 +6096,12 @@ def main():
             shown[0] = len(plan) - remaining
             where = (f" (upscale {main_secs[-1]:.0f}s, encode {last_enc[0]:.0f}s)"
                      if main_secs and last_enc[0] else "")
+            detail = [x for x in (job.up_info, job.gpu_info) if x]
             say(f"[{len(plan) - remaining}/{len(plan)}] {per_chunk:.0f}s/chunk{where}{helped}"
                 + (f"{movie} {eta_text(left)}" if remaining else
                    ", all chunks done, finishing the file..."))
+            if detail and not helpers:
+                say("        upscale: " + "; ".join(detail))
             if later > 0 and remaining:
                 # the movies still to come, at this movie's speed (seconds of work per second
                 # of video): rough, a live-action movie takes longer than an anime one
