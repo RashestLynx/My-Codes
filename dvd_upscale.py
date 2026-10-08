@@ -846,6 +846,8 @@ def gpu_load_text(a):
 def lower_gpu_load(a):
     """One step less on the GPU at once for the rest of the run (steps that don't change
     anything next to --gpu-threads/--tile are passed over); False if there is none left."""
+    if getattr(a, "no_step_down", False):
+        return False            # (--no-step-down: the settings stay as they are)
     steps = gpu_steps(a)
     now = gpu_load(a)
     for k in range(GPU_STEP[0] + 1, len(steps)):
@@ -877,6 +879,8 @@ FRAMES_OK = [0]         # frames upscaled since the last GPU reset (this model a
 def load_gpu_step(a):
     """The first step no bigger than the one saved: (frames, tile) is kept, not the step number,
     so a changed list of steps still reads it right. Also the frames since the last reset."""
+    if getattr(a, "no_step_down", False):
+        return False            # (--no-step-down: what an earlier run went down to is ignored)
     try:
         saved = json.loads(gpu_step_file().read_text(encoding="utf-8"))
         FRAMES_OK[0] = int(saved.get(gpu_step_key(a) + "#ok", 0))
@@ -5528,6 +5532,11 @@ def build_parser():
     p.add_argument("--no-profile", action="store_true",
                    help="don't profile the GPUs on the first run (the profile is saved in "
                         "ncnn_opts.json, and an existing one is never overwritten)")
+    p.add_argument("--no-step-down", action="store_true",
+                   help="after a GPU reset, don't lower the GPU's load (fewer frames at once, "
+                        "smaller tiles) for the rest of the run: the chunk is tried again with "
+                        "the same settings. Keeps full speed if resets are rare; a GPU that keeps "
+                        "resetting then stops the run")
     p.add_argument("--best-quality", action="store_true",
                    help="upscale live action / 3D animation with the model that "
                         "--ncnn-models MOVIE --save found truest to the original (not used "
@@ -5715,6 +5724,19 @@ SPEED CHECKLIST (what holds a laptop GPU back; the script can't change these, yo
   python dvd_upscale.py --gpu-detect          the GPUs, their class, the driver and the saved profile
                                               (made now if there is none; --redo profiles again)
 
+THE GPU STEP-DOWN (what happens when Windows resets the graphics card: "failed -4")
+  The chunk is tried again, and the GPU is given less to do at once for the rest of the run:
+  each step is a smaller tile (512, 256, 128, 64, 32 pixels; less for the old engine: fewer
+  frames at once, then tiles). Smaller tiles are slower (more overlap to redo: 64-pixel tiles
+  take about a fifth more work than 100) and the picture changes very slightly, so a reset after
+  a long good stretch (120+ frames) doesn't step down. Where it went is kept in gpu_steps.json
+  next to the script, so the next run starts there. It costs speed ONLY after a reset: with
+  settings the GPU survives (--ncnn-stress) it never happens.
+  --no-step-down          never lower the load: a reset retries the chunk with the same settings
+                          (and ignores gpu_steps.json). Full speed if resets are rare; a GPU that
+                          keeps resetting then stops the run instead of going on slower
+  gpu_steps.json          delete it to go back to the full load (after a driver update, say)
+
 GPU SET-UP AND SPEED (run these once from the script's folder; each saves what it finds in
 ncnn_opts.json next to dvd_upscale.py, and every later run uses it)
   python dvd_upscale.py --ncnn-auto "CGI\Movie.mkv"
@@ -5798,6 +5820,7 @@ ALL THE SPECIAL COMMANDS, ONE LINE EACH (details below)
   --analyze                only show what it detects      --test 60   a 60-second preview
   Turn a built-in automatic step off: --no-crop (black bars) --no-skip-black (black frames)
   --no-profile (first-run GPU profile) --encode-jobs 1 --gpu-jobs 1 --engine exe
+  --no-step-down (don't slow the GPU settings down after a reset)  --best-quality (use the saved model)
 """
 
 
