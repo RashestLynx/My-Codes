@@ -5097,8 +5097,9 @@ USEFUL EXTRAS (add to any command above)
   --gpu 1 / 0,1      another GPU, or both (the default is GPU 0; see GPU SET-UP AND SPEED)
   --gpu-threads 4    frames the GPU works on at once (anime/camcorder default 8, lowered to
                      6, 4, 2, 1 by itself if a chunk fails; live action 2, then 1); same picture
-  --gpu-jobs 2       two upscalers at once (default 1): the GPU waits less between chunks;
-                     same picture, back to one if two are slower
+  --gpu-jobs 2       two upscalers at once (the default with the current ncnn, else 1): the
+                     GPU waits less; same picture, back to one if two are slower. --gpu-jobs 3
+                     to try more if "nvidia-smi -l 2" still shows the GPU under 90% busy
   --engine exe       live action/CGI on realesrgan-ncnn-vulkan's own engine (2022) even when
                      the current one is installed (python -m pip install --no-deps ncnn numpy)
 
@@ -5338,6 +5339,12 @@ def main():
             # starved NVENC on a laptop), and where the big ones get the GPU reset, more work at
             # once makes it likelier (2 frames at once failed several times sooner than 1)
             a.gpu_jobs = 1
+            if getattr(a, "engine", "exe") == "ncnn":
+                # the current ncnn upscales one frame at a time and the Python around it (the
+                # conversions, the copies) leaves the GPU waiting: one upscaler kept a 3060
+                # laptop 54% busy. A second fills the gaps (whole-frame tiles, no resets since
+                # the options of ncnn_opts.json); it is retired by itself if two are slower
+                a.gpu_jobs = 2
         jobs_note = (f"up to {a.gpu_jobs} upscalers per GPU, a second kept only if faster"
                      if a.gpu_jobs > 1 else "one upscaler per GPU")
         print(f"GPU settings: {gpu_load_text(a)}; {jobs_note}"
