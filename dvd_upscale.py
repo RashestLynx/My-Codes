@@ -2180,13 +2180,16 @@ def ncnn_bench_main(argv):
 
 
 def ncnn_bench_gpu_main(argv):
-    """python dvd_upscale.py --ncnn-bench-gpu [MOVIE] [--gpus 0,1] [--frames 40]: the same frames
+    """python dvd_upscale.py --ncnn-bench-gpu [MOVIE] [--gpus 0,1,2] [--frames 40]: the same frames
     through the real worker on each GPU (the saved settings); the faster one is saved in
     ncnn_opts.json as the GPU used when --gpu isn't given (else DEFAULT_GPU). Also says what both together would
     be (the movie's helper-GPU mode: --gpu 0,1) when the slower GPU is worth having."""
     p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-bench-gpu")
     p.add_argument("movie", nargs="?")
-    p.add_argument("--gpus", default="0,1")
+    p.add_argument("--gpus", default=None,
+                   help="the GPU numbers to time (default: every Vulkan GPU except integrated "
+                        "graphics, which can fail the test and bring up the driver's bug-report "
+                        "window)")
     p.add_argument("--frames", type=int, default=40)
     w = p.parse_args(argv)
     here = Path(__file__).resolve().parent
@@ -2195,7 +2198,13 @@ def ncnn_bench_gpu_main(argv):
     saved = ncnn_saved()
     name = saved.get("set") if saved.get("set") in NCNN_OPT_SETS else "nowinograd"
     tile = int(saved.get("tile") or 0)
-    gpus = [g.strip() for g in w.gpus.split(",") if g.strip().isdigit()]
+    if w.gpus is None:
+        found = probe_vulkan_gpus()
+        gpus = [str(i) for i, name in found if gpu_class(name) != "low"] \
+            or [str(i) for i, _ in found] or ["0", "1"]
+        print("Timing: " + ", ".join(f"GPU {i} ({dict(found).get(int(i), '?')})" for i in gpus))
+    else:
+        gpus = [g.strip() for g in w.gpus.split(",") if g.strip().isdigit()]
     results = []
     with tempfile.TemporaryDirectory(prefix="ncnn_gpu_") as d:
         d = Path(d)
@@ -2241,13 +2250,14 @@ def ncnn_bench_gpu_main(argv):
     if not results:
         print("No GPU ran cleanly: nothing saved.")
         return 1
-    fps, g = max(results)
+    results.sort(reverse=True)
+    fps, g = results[0]
     saved["gpu"] = int(g)
     saved.pop("helper", None)
     msg = (f"GPU {g} is the faster one: it is now the default (saved in {ncnn_opts_file().name}; "
            "--gpu N picks another, --gpu 0,1 uses both).")
     if len(results) > 1:
-        slow, h = min(results)
+        slow, h = results[1]        # (the next fastest: the one worth having as the helper)
         if slow / fps >= HELPER_MIN:
             saved["helper"] = int(h)
             msg += (f"\nGPU {h} is {slow / fps * 100:.0f}% as fast: worth having as a helper, so "
@@ -5772,7 +5782,8 @@ ncnn_opts.json next to dvd_upscale.py, and every later run uses it)
         own on 300 frames, and saves the fastest that gets through all of them with the same
         picture. About 8 minutes; --ncnn-stress first. (Part of --ncnn-auto.)
   python dvd_upscale.py --ncnn-bench-gpu "CGI\Movie.mkv"
-        times each GPU (--gpus 0,1 by default), saves the faster one as the default GPU and, if
+        times every GPU except integrated graphics (--gpus 0,1,2 to choose), saves the fastest
+        as the default GPU and, if
         the other is at least 20% as fast, as its helper (it then upscales whole chunks too,
         like --gpu 0,1; "--gpu 0" on its own runs without it)
   --gpu N / --gpu 0,1     one GPU (default 0, or the one --ncnn-bench-gpu saved), or both: the
