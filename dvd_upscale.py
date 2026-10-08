@@ -1880,6 +1880,12 @@ NCNN_OPT_SETS = {
              "use_bf16_packed": False, "use_bf16_storage": False},
 }
 NCNN_OPT_SETS["safe"] = {k: v for d in NCNN_OPT_SETS.values() for k, v in d.items()}
+# one winograd variant at a time (the three of ncnn's 3x3 convolution shaders; all off is
+# "nowinograd", the set that survives): winograd is the fast way to do 3x3 convolutions, and
+# the GPU fault may come from only one of them (see ncnn_winograd_main)
+NCNN_OPT_SETS["w23"] = {"use_winograd43_convolution": False, "use_winograd63_convolution": False}
+NCNN_OPT_SETS["w43"] = {"use_winograd23_convolution": False, "use_winograd63_convolution": False}
+NCNN_OPT_SETS["w63"] = {"use_winograd23_convolution": False, "use_winograd43_convolution": False}
 NCNN_OPT_SETS["nowinograd_fp16"] = {**NCNN_OPT_SETS["nowinograd"], "use_fp16_arithmetic": True}
 
 
@@ -1927,8 +1933,8 @@ def ncnn_stress_main(argv):
              str(d / "in" / "%06d.png")])
         results = []
         for name in NCNN_OPT_SETS:
-            if name == "nowinograd_fp16":       # (a speed trial, see ncnn_bench_main)
-                continue
+            if name in ("nowinograd_fp16", "w23", "w43", "w63"):    # (speed trials, see ncnn_bench_main
+                continue                                        # and ncnn_winograd_main)
             out = d / ("out_" + name)
             out.mkdir()
             cmd = [sys.executable, Path(__file__).resolve(), "--ncnn-upscaler", "-i", d / "in",
@@ -2183,13 +2189,15 @@ def ncnn_auto_main(argv):
                        + ("whole frames" if tile > 720 else f"{tile or 200}-pixel tiles"))
     else:
         summary.append("the speed-up test didn't finish: the settings of step 2 are kept")
-    step(4, "which GPU is faster (--ncnn-bench-gpu)")
+    step(4, "which GPU is faster (--ncnn-bench-gpu) and the winograd variants (--ncnn-winograd)")
     if w.skip_gpu_test:
         print("  skipped")
     elif ncnn_bench_gpu_main(movie) == 0:
         summary.append(f"default GPU: {ncnn_saved().get('gpu')}")
     else:
         summary.append(f"default GPU: {w.gpu} (the GPU test didn't finish)")
+    if ncnn_winograd_main([*movie, "--gpu", str(ncnn_saved().get("gpu", w.gpu))]) == 0:
+        summary.append(f"winograd: set '{ncnn_saved().get('set')}'")
     step(5, "every model on the same frames (--ncnn-models)")
     if w.skip_model_test or not w.movie:
         print("  skipped" + ("" if w.skip_model_test else " (give a movie to test the models)"))
@@ -2378,6 +2386,99 @@ def ncnn_models_main(argv):
         print(f"\n  Closest to the original: {best[0]} (SSIM {best[1]:.4f}). Look at "
               "model_compare.png before choosing: a higher score is a truer picture, not always "
               "a nicer one.")
+    return 0
+
+
+def ncnn_winograd_main(argv):
+    """python dvd_upscale.py --ncnn-winograd [MOVIE] [--gpu N] [--frames 300]: each of ncnn's
+    three winograd convolution variants on its own, on 300 frames of the movie (whole frames,
+    the saved tile), against "nowinograd" (the safe set the stress test found). Winograd is the
+    fast way to do 3x3 convolutions (nearly all of realesrgan-x2plus) and was switched off
+    whole because the GPU got reset with it on; if only one variant faults, the others can come
+    back. A variant must get through all the frames without a GPU error and give the same
+    picture (48 dB or closer: only fp16 rounding differs). The fastest is saved as the set."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-winograd")
+    p.add_argument("movie", nargs="?")
+    p.add_argument("--gpu")
+    p.add_argument("--frames", type=int, default=300)
+    w = p.parse_args(argv)
+    here = Path(__file__).resolve().parent
+    exe = shutil.which(ESRGAN_DEFAULT) or next((str(f) for f in here.glob(ESRGAN_DEFAULT + "*")), None)
+    models = Path(exe).resolve().parent / "models" if exe else here / "models"
+    saved = ncnn_saved()
+    tile = int(saved.get("tile") or 1024)
+    trials = ["nowinograd", "w23", "w43", "w63"]
+    names = {"nowinograd": "no winograd (the safe set)", "w23": "winograd 2x2", "w43": "winograd 4x4",
+             "w63": "winograd 6x6"}
+    with tempfile.TemporaryDirectory(prefix="ncnn_wino_") as d:
+        d = Path(d)
+        (d / "in").mkdir()
+        if w.movie:
+            rc, txt = capture(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                               "-of", "csv=p=0", w.movie])
+            try:
+                at = max(0.0, float(txt.strip()) * 0.4)
+            except ValueError:
+                at = 0.0
+            print(f"Taking {w.frames} frames from {w.movie}...", flush=True)
+            run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.1f}", "-i", w.movie, "-map",
+                 "0:v:0", "-vf", "scale=iw*sar:ih,setsar=1,scale=720:480", "-frames:v",
+                 str(w.frames), str(d / "in" / "%06d.png")])
+        else:
+            run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                 f"testsrc2=s=720x480:r=24:d={w.frames / 24:.3f}", "-frames:v", str(w.frames),
+                 str(d / "in" / "%06d.png")])
+        n_in = len(list((d / "in").glob("*.png")))
+        ref, results = None, []
+        for k, name in enumerate(trials):
+            out = d / f"out{k}"
+            out.mkdir()
+            cmd = [sys.executable, Path(__file__).resolve(), "--ncnn-upscaler", "-i", d / "in",
+                   "-o", out, "-n", "realesrgan-x2plus", "-s", "2", "-f", "png", "-j", "1:1:1",
+                   "-t", tile, "-m", models]
+            if w.gpu is not None:
+                cmd += ["-g", w.gpu]
+            r = subprocess.run([str(c) for c in cmd], capture_output=True,
+                               stdin=subprocess.DEVNULL,
+                               env={**os.environ, "DVD_UPSCALE_NCNN_OPTS": name})
+            text = (r.stdout + r.stderr).decode("utf-8", "replace")
+            files = sorted(out.glob("*.png"))
+            ok = r.returncode == 0 and len(files) == n_in and not GPU_ERRORS.search(text)
+            if not ok:
+                print(f"  {names[name]:28s} GPU error after {len(files)} of {n_in} frames", flush=True)
+                shutil.rmtree(out, ignore_errors=True)
+                time.sleep(15)          # (the driver recovers)
+                continue
+            times = [f.stat().st_mtime for f in files]
+            fps = (len(times) - 1) / max(1e-6, max(times) - min(times))
+            db = float("inf")
+            if ref is None:
+                ref = out
+            else:
+                rc, rep = capture(["ffmpeg", "-v", "info", "-i", str(out / "%06d.png"), "-i",
+                                   str(ref / "%06d.png"), "-lavfi", "psnr", "-f", "null", "-"])
+                m = re.search(r"PSNR .*?average:([0-9.]+|inf)", rep)
+                db = float(m.group(1)) if m else 0.0
+                shutil.rmtree(out, ignore_errors=True)
+            if db >= 48:
+                print(f"  {names[name]:28s} {fps:.2f} frames/s, got through all {n_in} frames"
+                      + ("" if db == float("inf") else f", {db:.0f} dB from the reference"),
+                      flush=True)
+                results.append((fps, name))
+            else:
+                print(f"  {names[name]:28s} {fps:.2f} frames/s but the picture differs "
+                      f"({db:.0f} dB): not used", flush=True)
+            time.sleep(5)
+    if not results:
+        print("Nothing ran cleanly: the saved settings are unchanged.")
+        return 1
+    fps, name = max(results)
+    base = next((f for f, n in results if n == "nowinograd"), None)
+    ncnn_opts_file().write_text(json.dumps({**ncnn_saved(), "set": name, "tile": tile}),
+                                encoding="utf-8")
+    print(f"Saved '{name}' ({fps:.2f} frames/s"
+          + (f", {fps / base * 100 - 100:+.0f}% against no winograd" if base and name != "nowinograd" else "")
+          + f") in {ncnn_opts_file().name}.")
     return 0
 
 
@@ -5202,6 +5303,11 @@ ncnn_opts.json next to dvd_upscale.py, and every later run uses it)
         the fastest settings that keep the same picture: whole frames instead of 200-pixel tiles
         (about 50% faster, no tile seams) and fp16 (kept only if the picture matches). Saved as
         "set" and "tile". Takes a few minutes.
+  python dvd_upscale.py --ncnn-winograd "CGI\Movie.mkv"
+        the faster way to run the 3x3 convolutions (winograd, three variants) was switched off
+        by --ncnn-stress because the GPU got reset with all three on. This tries each one on its
+        own on 300 frames, and saves the fastest that gets through all of them with the same
+        picture. About 8 minutes; --ncnn-stress first. (Part of --ncnn-auto.)
   python dvd_upscale.py --ncnn-bench-gpu "CGI\Movie.mkv"
         times each GPU (--gpus 0,1 by default), saves the faster one as the default GPU and, if
         the other is at least 20% as fast, as its helper (it then upscales whole chunks too,
@@ -7038,6 +7144,8 @@ if __name__ == "__main__":
         sys.exit(ncnn_models_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-auto"]:             # (all of the GPU set-up and a timed test)
         sys.exit(ncnn_auto_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-winograd"]:         # (the winograd variants the GPU survives)
+        sys.exit(ncnn_winograd_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-bench-gpu"]:        # (which GPU is faster)
         sys.exit(ncnn_bench_gpu_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-bench"]:            # (the fastest settings that keep the picture)
