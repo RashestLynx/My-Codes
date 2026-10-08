@@ -1831,6 +1831,7 @@ def ncnn_install_hint():
         return "run setup.bat again"
     return f"{pip_cmd()} install --no-deps ncnn=={NCNN_VERSION} numpy"
 ESRGAN_DEFAULT = "realesrgan-ncnn-vulkan"
+DEFAULT_GPU = "0"       # the GPU used without --gpu: 0 is the dedicated NVIDIA card here
 
 
 def ncnn_available():
@@ -2060,8 +2061,7 @@ def ncnn_bench_main(argv):
 
 def ncnn_bench_gpu_main(argv):
     """python dvd_upscale.py --ncnn-bench-gpu [MOVIE] [--gpus 0,1] [--frames 40]: the same frames
-    through the real worker on each GPU (the saved settings), and the fastest one saved in
-    ncnn_opts.json as the GPU used when --gpu isn't given. Also says what both together would
+    through the real worker on each GPU (the saved settings): which is faster. Also says what both together would
     be (the movie's helper-GPU mode: --gpu 0,1) when the slower GPU is worth having."""
     p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-bench-gpu")
     p.add_argument("movie", nargs="?")
@@ -2121,10 +2121,8 @@ def ncnn_bench_gpu_main(argv):
         print("No GPU ran cleanly: nothing saved.")
         return 1
     fps, g = max(results)
-    saved["gpu"] = int(g)
-    ncnn_opts_file().write_text(json.dumps(saved), encoding="utf-8")
-    print(f"GPU {g} is the faster one: saved as the default in {ncnn_opts_file().name} "
-          "(--gpu still overrides it).")
+    print(f"GPU {g} is the faster one. The default is GPU {DEFAULT_GPU} "
+          "(--gpu N picks another, --gpu 0,1 uses both).")
     if len(results) > 1:
         slow = min(results)[0]
         print(f"The other is {slow / fps * 100:.0f}% as fast"
@@ -4621,9 +4619,8 @@ def check_values(a):
         if tile < 0:
             sys.exit("--tile must be 0 (automatic) or a positive number of pixels")
         a.tile = str(tile)
-    if a.gpu is None and ncnn_saved().get("gpu") is not None:
-        # (the faster GPU, found by --ncnn-bench-gpu; --gpu on the command line still wins)
-        a.gpu = str(ncnn_saved()["gpu"])
+    if a.gpu is None:
+        a.gpu = DEFAULT_GPU     # (--gpu 1, or --gpu 0,1 for both, on the command line wins)
     if a.gpu is not None:
         devices = re.sub(r"\s+", "", str(a.gpu)).split(",")
         if not devices or any(not re.fullmatch(r"[0-9]+", device) for device in devices):
@@ -4705,7 +4702,7 @@ def build_parser():
                         "or exe, realesrgan-ncnn-vulkan's own (ncnn from 2022). auto (default): "
                         "ncnn when it is installed (and --esrgan names no upscaler of its own)")
     p.add_argument("--gpu", default=None,
-                   help="Vulkan GPU index for the upscaler (-g). Several, e.g. 0,1 (a laptop's "
+                   help="Vulkan GPU index for the upscaler (-g; default 0). Several, e.g. 0,1 (a laptop's "
                         "NVIDIA plus the processor's built-in graphics): the first works through "
                         "the movie, the others upscale whole chunks alongside it")
     p.add_argument("--tile", default=None,
