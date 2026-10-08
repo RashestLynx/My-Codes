@@ -813,12 +813,19 @@ def compact_model(a):
 GPU_STEPS = {True: ((8, None), (6, None), (4, None), (2, None), (1, None), (1, 100), (1, 64)),
              False: ((2, None), (1, None), (1, 100), (1, 64), (1, 32))}  # compact?: steps
 # the current ncnn (see ncnn_upscaler_main) does one frame at a time anyway
-NCNN_STEPS = ((1, None), (1, 100), (1, 64), (1, 32))
+def ncnn_steps():
+    """What the current ncnn is lowered to after a GPU reset, one step at a time: first the
+    tile it started with (the saved one: whole frames on a big GPU, else 200), then ever
+    smaller ones. Each step halves the piece of work, and costs a little speed and nothing a
+    viewer can see until the very small ones: from whole frames to 100 in one go gave up much
+    more than needed. Only tiles below the one it started with."""
+    cap = int(ncnn_saved().get("tile") or 200)
+    return ((1, None),) + tuple((1, t) for t in (512, 256, 128, 64, 32) if t < cap)
 GPU_STEP = [0]          # how many steps down this run has gone
 
 
 def gpu_steps(a):
-    return NCNN_STEPS if getattr(a, "engine", "exe") == "ncnn" else GPU_STEPS[compact_model(a)]
+    return ncnn_steps() if getattr(a, "engine", "exe") == "ncnn" else GPU_STEPS[compact_model(a)]
 
 
 def gpu_load(a, step=None):
