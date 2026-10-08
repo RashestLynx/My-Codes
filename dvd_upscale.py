@@ -1831,6 +1831,7 @@ def ncnn_install_hint():
         return "run setup.bat again"
     return f"{pip_cmd()} install --no-deps ncnn=={NCNN_VERSION} numpy"
 ESRGAN_DEFAULT = "realesrgan-ncnn-vulkan"
+HELPER_MIN = 0.2        # a second GPU this fraction as fast as the first is kept as a helper
 DEFAULT_GPU = "0"       # the GPU used without --gpu, until --ncnn-bench-gpu saves a faster one
 
 
@@ -2123,15 +2124,21 @@ def ncnn_bench_gpu_main(argv):
         return 1
     fps, g = max(results)
     saved["gpu"] = int(g)
-    ncnn_opts_file().write_text(json.dumps(saved), encoding="utf-8")
-    print(f"GPU {g} is the faster one: it is now the default (saved in {ncnn_opts_file().name}; "
-          "--gpu N picks another, --gpu 0,1 uses both).")
+    saved.pop("helper", None)
+    msg = (f"GPU {g} is the faster one: it is now the default (saved in {ncnn_opts_file().name}; "
+           "--gpu N picks another, --gpu 0,1 uses both).")
     if len(results) > 1:
-        slow = min(results)[0]
-        print(f"The other is {slow / fps * 100:.0f}% as fast"
-              + ("; using both (--gpu 0,1) could add about that much, if the script's "
-                 "helper-GPU mode keeps it busy." if slow / fps >= 0.25 else
-                 ": not worth adding as a helper."))
+        slow, h = min(results)
+        if slow / fps >= HELPER_MIN:
+            saved["helper"] = int(h)
+            msg += (f"\nGPU {h} is {slow / fps * 100:.0f}% as fast: worth having as a helper, so "
+                    f"it works alongside it from now on (whole chunks; --gpu {g} alone turns "
+                    "that off).")
+        else:
+            msg += (f"\nThe other GPU is {slow / fps * 100:.0f}% as fast: not worth adding as a "
+                    "helper (it would only add heat).")
+    ncnn_opts_file().write_text(json.dumps(saved), encoding="utf-8")
+    print(msg)
     return 0
 
 
@@ -4863,8 +4870,10 @@ def check_values(a):
         a.tile = str(tile)
     if a.gpu is None:
         # (the faster GPU found by --ncnn-bench-gpu, else 0; --gpu on the command line wins)
-        saved_gpu = ncnn_saved().get("gpu")
+        saved_gpu, helper = ncnn_saved().get("gpu"), ncnn_saved().get("helper")
         a.gpu = str(saved_gpu) if isinstance(saved_gpu, int) and saved_gpu >= 0 else DEFAULT_GPU
+        if isinstance(helper, int) and helper >= 0 and str(helper) != a.gpu:
+            a.gpu += f",{helper}"       # (the slower GPU worth having: it takes whole chunks)
     if a.gpu is not None:
         devices = re.sub(r"\s+", "", str(a.gpu)).split(",")
         if not devices or any(not re.fullmatch(r"[0-9]+", device) for device in devices):
@@ -5128,7 +5137,9 @@ ncnn_opts.json next to dvd_upscale.py, and every later run uses it)
         (about 50% faster, no tile seams) and fp16 (kept only if the picture matches). Saved as
         "set" and "tile". Takes a few minutes.
   python dvd_upscale.py --ncnn-bench-gpu "CGI\Movie.mkv"
-        times each GPU (--gpus 0,1 by default) and saves the faster one as the default GPU
+        times each GPU (--gpus 0,1 by default), saves the faster one as the default GPU and, if
+        the other is at least 20% as fast, as its helper (it then upscales whole chunks too,
+        like --gpu 0,1; "--gpu 0" on its own runs without it)
   --gpu N / --gpu 0,1     one GPU (default 0, or the one --ncnn-bench-gpu saved), or both: the
                           first works through the movie, the second upscales whole chunks too
   --tile 384              a tile size by hand (overrides the saved one; 0 = automatic)
