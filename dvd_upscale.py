@@ -6390,7 +6390,13 @@ if __name__ == "__main__":
     if sys.argv[1:2] == ["--faces-worker"]:          # (a chunk's face restoration: see Chunk)
         sys.exit(faces_worker_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-upscaler"]:         # (the current ncnn: see esrgan_cmd)
-        sys.exit(ncnn_upscaler_main(sys.argv[2:]))
+        rc = ncnn_upscaler_main(sys.argv[2:])
+        # (leave at once, without Python's and ncnn's clean-up: on Windows with the NVIDIA
+        # driver the current ncnn can crash (0xC0000005) while it shuts down, after every frame
+        # was written, and the exit code then said the upscale had failed)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        os._exit(rc or 0)
     if sys.argv[1:2] == ["--clip"]:
         try:
             clip_main(sys.argv[2:])
