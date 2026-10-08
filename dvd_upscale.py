@@ -1172,7 +1172,8 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
             else:
                 same.append([x, 1])
         lines = [x if k == 1 else f"{x}   (x{k})" for x, k in same]
-        reset = re.search(r"QueueSubmit failed -4\b|DEVICE_LOST|device lost", text, re.I)
+        reset = re.search(r"(QueueSubmit|WaitForFences) failed -4\b|DEVICE_LOST|device lost|"
+                          r"ncnn: GPU error \(extract returned -[14]\)", text, re.I)
         if lane:        # a helper GPU: one line, in the note that it stopped helping
             raise RuntimeError(("the upscaler reported errors" if errors else
                                 f"the upscaler failed (exit code {p.returncode})")
@@ -2219,6 +2220,8 @@ def ncnn_auto_main(argv):
     p.add_argument("--skip-gpu-test", action="store_true")
     p.add_argument("--no-test-run", action="store_true")
     p.add_argument("--skip-model-test", action="store_true")
+    p.add_argument("--winograd", action="store_true",
+                   help="also try the winograd variants (on an RTX 3060 laptop none was faster)")
     w = p.parse_args(argv)
     movie = [w.movie] if w.movie else []
     summary = []
@@ -2233,27 +2236,29 @@ def ncnn_auto_main(argv):
             print(f"  deleted {f.name}")
         except OSError:
             print(f"  no {f.name} (fine)")
-    step(2, f"finding the options GPU {w.gpu} survives (--ncnn-stress)")
-    if ncnn_stress_main(["--gpu", w.gpu]) != 0:
-        print("\nStopped: no setting survived (see above). Nothing more was tried.")
-        return 1
-    summary.append(f"settings the GPU survives: {ncnn_saved().get('set')}")
-    step(3, "the fastest settings with the same picture (--ncnn-bench)")
-    if ncnn_bench_main([*movie, "--gpu", w.gpu]) == 0:
-        saved = ncnn_saved()
-        tile = int(saved.get("tile") or 0)
-        summary.append(f"fastest safe: {saved.get('set')}, "
-                       + ("whole frames" if tile > 720 else f"{tile or 200}-pixel tiles"))
-    else:
-        summary.append("the speed-up test didn't finish: the settings of step 2 are kept")
-    step(4, "which GPU is faster (--ncnn-bench-gpu) and the winograd variants (--ncnn-winograd)")
+    step(2, "which GPU is faster (--ncnn-bench-gpu)")
     if w.skip_gpu_test:
         print("  skipped")
     elif ncnn_bench_gpu_main(movie) == 0:
         summary.append(f"default GPU: {ncnn_saved().get('gpu')}")
     else:
         summary.append(f"default GPU: {w.gpu} (the GPU test didn't finish)")
-    if ncnn_winograd_main([*movie, "--gpu", str(ncnn_saved().get("gpu", w.gpu))]) == 0:
+    # (the options are then found on the GPU the movie will run on)
+    gpu = str(ncnn_saved().get("gpu", w.gpu))
+    step(3, f"finding the options GPU {gpu} survives (--ncnn-stress)")
+    if ncnn_stress_main(["--gpu", gpu]) != 0:
+        print("\nStopped: no setting survived (see above). Nothing more was tried.")
+        return 1
+    summary.append(f"settings the GPU survives: {ncnn_saved().get('set')}")
+    step(4, "the fastest settings with the same picture (--ncnn-bench)")
+    if ncnn_bench_main([*movie, "--gpu", gpu]) == 0:
+        saved = ncnn_saved()
+        tile = int(saved.get("tile") or 0)
+        summary.append(f"fastest safe: {saved.get('set')}, "
+                       + ("whole frames" if tile > 720 else f"{tile or 200}-pixel tiles"))
+    else:
+        summary.append("the speed-up test didn't finish: the settings of step 3 are kept")
+    if w.winograd and ncnn_winograd_main([*movie, "--gpu", gpu]) == 0:
         summary.append(f"winograd: set '{ncnn_saved().get('set')}'")
     step(5, "every model on the same frames (--ncnn-models)")
     if w.skip_model_test or not w.movie:
@@ -2266,6 +2271,9 @@ def ncnn_auto_main(argv):
     if w.no_test_run or not w.movie:
         print("  skipped" + ("" if w.no_test_run else " (give a movie to time it)"))
     else:
+        # (a finished test run of this movie would be resumed, not timed)
+        shutil.rmtree(Path(w.movie).with_name(Path(w.movie).stem + "_work_test"),
+                      ignore_errors=True)
         util, temps, watts, clocks, seen = [], [], [], [], [False]
         stop = threading.Event()
 
@@ -2486,7 +2494,10 @@ def ncnn_winograd_main(argv):
                  f"testsrc2=s=720x480:r=24:d={w.frames / 24:.3f}", "-frames:v", str(w.frames),
                  str(d / "in" / "%06d.png")])
         n_in = len(list((d / "in").glob("*.png")))
-        ref, results = None, []
+        ref, results, trial_secs = None, [], []
+        est = len(trials) * (n_in / 3.0 + 25)
+        print(f"{len(trials)} runs of {n_in} frames: about {est / 60:.0f} minutes ("
+              f"{eta_text(est)})", flush=True)
         for k, name in enumerate(trials):
             out = d / f"out{k}"
             out.mkdir()
@@ -2495,10 +2506,32 @@ def ncnn_winograd_main(argv):
                    "-t", tile, "-m", models]
             if w.gpu is not None:
                 cmd += ["-g", w.gpu]
-            r = subprocess.run([str(c) for c in cmd], capture_output=True,
-                               stdin=subprocess.DEVNULL,
-                               env={**os.environ, "DVD_UPSCALE_NCNN_OPTS": name})
-            text = (r.stdout + r.stderr).decode("utf-8", "replace")
+            proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    env={**os.environ, "DVD_UPSCALE_NCNN_OPTS": name})
+            captured = []
+            threading.Thread(target=lambda: captured.append(proc.stdout.read()),
+                             daemon=True).start()
+            t_trial = time.time()
+            while proc.poll() is None:
+                time.sleep(2)
+                try:
+                    n_now = len(os.listdir(out))
+                except OSError:
+                    n_now = 0
+                spent = time.time() - t_trial
+                rate = n_now / spent if n_now >= 10 and spent > 0 else 3.0
+                this_left = max(0.0, (n_in - n_now) / rate)
+                each = (sum(trial_secs) / len(trial_secs)) if trial_secs else n_in / rate + 10
+                left = this_left + (len(trials) - k - 1) * (each + 15)
+                status_line(f"  {names[name]}: frame {n_now} of {n_in} | run {k + 1} of "
+                            f"{len(trials)} | {eta_text(left)}")
+            status_line()
+            proc.wait()
+            time.sleep(0.2)
+            trial_secs.append(time.time() - t_trial)
+            text = b"".join(captured).decode("utf-8", "replace")
+            r = proc
             files = sorted(out.glob("*.png"))
             ok = r.returncode == 0 and len(files) == n_in and not GPU_ERRORS.search(text)
             if not ok:
@@ -3230,6 +3263,8 @@ class Chunk:
                                         "driver to recover")
                             time.sleep(wait)
             finally:
+                if watch:
+                    watch.stop.set()        # (also when the chunk failed or was stopped)
                 with DISK_LOCK:
                     UPSCALING.pop(self, None)
             # where the upscale's seconds went: the upscaler starting (to its first frame), the
@@ -5083,7 +5118,7 @@ def check_values(a):
             sys.exit("--tile must be 0 (automatic) or a positive number of pixels")
         if tile < 0:
             sys.exit("--tile must be 0 (automatic) or a positive number of pixels")
-        a.tile = str(tile)
+        a.tile = str(tile) if tile else None      # (0: automatic, not a tile size)
     if a.gpu is None:
         # (the faster GPU found by --ncnn-bench-gpu, else 0; --gpu on the command line wins)
         saved_gpu, helper = ncnn_saved().get("gpu"), ncnn_saved().get("helper")
@@ -5848,6 +5883,9 @@ def main():
     if not a.fast and a.type != "vhs" and not a.no_crop and info["h"] <= 576:
         if prev is not None:
             a.crop_rows = int(prev.get("crop", 0))
+            if a.crop_rows and not bar_rows_valid(a, info["h"], a.crop_rows):
+                # (--height changed since: the settings then differ, and the run says so)
+                a.crop_rows = 0
         else:
             status_line("  looking for black bars...")
             a.crop_rows = detect_bars(a, info)
@@ -6019,6 +6057,8 @@ def main():
     encodings, reading, current = [], None, None    # [(Background, Chunk)] / (Background, Chunk) / Chunk
     last_enc = [0.0]            # seconds the last finished chunk's encode took
     enc_limit = max(1, getattr(a, "encode_jobs", None) or 1)    # encodes at once (--encode-jobs)
+    if a.faces:
+        enc_limit = 1           # (a face restoration is heavy on the GPU: one at a time)
 
     def claim(keep=0):
         with lock:
