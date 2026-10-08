@@ -5767,6 +5767,57 @@ MORE
 """
 
 
+QUICK_START = r"""
+QUICK START: the ones to remember (everything else below is the detail)
+  python dvd_upscale.py "Movie.mkv"                  upscale one movie: everything is automatic
+  python dvd_upscale.py --all                        every movie in this folder (each detected)
+  python dvd_upscale.py --ncnn-auto "Movie.mkv"      set the GPU up and test it (once, ~20 min):
+                                                     the settings it survives, the fastest, the
+                                                     best model; saved and used from then on
+  python dvd_upscale.py --gpu-detect                 the GPUs, the driver, the saved profile
+  python dvd_upscale.py --commands                   this list
+
+ALL THE SPECIAL COMMANDS, ONE LINE EACH (details below)
+  --ncnn-auto MOVIE        everything below in one go, with a summary at the end
+  --ncnn-stress            the ncnn options the GPU survives (no "failed -4" resets)
+  --ncnn-bench MOVIE       the fastest settings with the same picture (whole frames, fp16)
+  --ncnn-bench-gpu MOVIE   which GPU is faster (saved as the default)
+  --ncnn-models MOVIE      every model on your frames, with a picture to judge by eye
+      --save               ...and save the best one for live action / 3D animation
+  --ncnn-winograd MOVIE    the winograd variants (none was faster on an RTX 3060 laptop)
+  --gpu-detect [--redo]    GPUs, class, driver, memory, saved profile, recommendations
+  --clip MOVIE START SECS  cut a sample (add --upscale to upscale just that piece)
+  --queue / --all          several movies (a list of lines / every movie in a folder)
+  --analyze                only show what it detects      --test 60   a 60-second preview
+  Turn a built-in automatic step off: --no-crop (black bars) --no-skip-black (black frames)
+  --no-profile (first-run GPU profile) --encode-jobs 1 --gpu-jobs 1 --engine exe
+"""
+
+
+def commands_text():
+    """The cheat sheet: the quick start first, then the detail (COMMANDS), then every option of
+    the parser with its first sentence, made from the parser itself so it can't fall behind."""
+    p = build_parser()
+    rows = []
+    for act in p._actions:
+        names = [o for o in act.option_strings if o.startswith("--") and o != "--help"]
+        if not names or not act.help or act.help == argparse.SUPPRESS:
+            continue
+        text = " ".join(str(act.help).split()).replace("e.g.", "e.g.,").replace("i.e.", "i.e.,")
+        first = re.split(r"(?<=[a-z0-9)]\.)\s", text, maxsplit=1)[0]
+        if len(first) > 110:
+            first = first[:110].rsplit(" ", 1)[0] + " ..."
+        rows.append((", ".join(names) + (f" {act.metavar or act.dest.upper()}"
+                                         if act.nargs != 0 and act.const is None
+                                         and not isinstance(act, argparse._StoreTrueAction)
+                                         else ""), first))
+    width = max((len(n) for n, _ in rows), default=0) + 2
+    lines = ["", "EVERY OPTION (from --help; add to any command above)"]
+    lines += [f"  {n:<{width}}{h[:150]}" for n, h in sorted(rows)]
+    lines += ["", "(--faces-worker and --ncnn-upscaler are used by the script itself: not for typing)"]
+    return QUICK_START + COMMANDS + "\n".join(lines) + "\n"
+
+
 def main():
     a = build_parser().parse_args()
     check_values(a)
@@ -7692,7 +7743,7 @@ if __name__ == "__main__":
             sys.exit(130)
         sys.exit(0)
     if len(sys.argv) == 1 or sys.argv[1:] in (["--commands"], ["commands"]):
-        print(COMMANDS)             # plain "python dvd_upscale.py" shows the cheat sheet too
+        print(commands_text())      # plain "python dvd_upscale.py" shows the cheat sheet too
         sys.exit(0)
     queue_mode = any(w in ("--queue", "--all") or w.startswith(("--queue=", "--all="))
                      for w in sys.argv[1:])
