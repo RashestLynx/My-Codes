@@ -6396,6 +6396,16 @@ if __name__ == "__main__":
         # was written, and the exit code then said the upscale had failed)
         sys.stdout.flush()
         sys.stderr.flush()
+        if sys.platform == "win32":
+            # (os._exit is ExitProcess, which still unloads every DLL, and the crash is there:
+            # TerminateProcess ends the process without that)
+            try:
+                import ctypes
+                k32 = ctypes.windll.kernel32
+                k32.GetCurrentProcess.restype = ctypes.c_void_p
+                k32.TerminateProcess(ctypes.c_void_p(k32.GetCurrentProcess()), int(rc or 0))
+            except (OSError, AttributeError, ValueError):
+                pass
         os._exit(rc or 0)
     if sys.argv[1:2] == ["--clip"]:
         try:
