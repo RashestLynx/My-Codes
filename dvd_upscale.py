@@ -5236,6 +5236,32 @@ def gpu_class(name):
     return "low"
 
 
+def print_gpu_recommendations(kind, drv):
+    """What suits a GPU of this class: models, tile, and what to do when Windows resets it."""
+    print("\nRecommendations for a " + {"high": "high-performance dedicated GPU",
+                                        "mid": "mid-range or older dedicated GPU",
+                                        "low": "integrated or low-power GPU"}[kind] + ":")
+    if kind == "high":
+        print("  Anime and cartoons: realesr-animevideov3 (the small model: very fast).")
+        print("  Live action and 3D CGI: realesrgan-x2plus (the sharpest and most natural; the")
+        print("    default for those types). Whole frames (--tile 1024) are quicker than tiles.")
+        print("  One upscaler at a time: on an RTX 3060 laptop two were slower, not faster.")
+    elif kind == "mid":
+        print("  Anime and cartoons: realesr-animevideov3.")
+        print("  Live action and CGI: realesrgan-x2plus works; watch for GPU resets at first.")
+        print("  If Windows resets the driver during chunks: --tile 200, then --tile 100.")
+    else:
+        print("  Anime and cartoons: realesr-animevideov3 (compact, light on the GPU).")
+        print("  VHS camcorder tapes: realesr-general-dn50-x4v3 (much faster here).")
+        print("  Live action and CGI: realesrgan-x2plus is heavy for this GPU: expect days for a")
+        print("    movie. Use --tile 64 (or 32), or --fast for a quick draft without the AI.")
+    if drv and drv >= 570:
+        print(f"  NVIDIA driver {drv}: drivers from 570 on can reset the GPU with ncnn's default")
+        print("    options: the profile's stress test finds the ones that survive (once).")
+    if not ncnn_available():
+        print(f"  The current ncnn isn't installed: {ncnn_install_hint()}")
+
+
 def gpu_detect_main(argv):
     """python dvd_upscale.py --gpu-detect [--redo]: the GPUs found, how each is classed, the
     driver, and the saved profile; on a computer with no profile yet, the profile is made now
@@ -5259,6 +5285,11 @@ def gpu_detect_main(argv):
               + (f", {mb / 1024:.1f} GB for the upscaler" if mb else ""))
     inject_gpu_hardware_profile(types.SimpleNamespace(gpu=None, gpu_given=False))
     print("Saved profile: " + (json.dumps(ncnn_saved()) if ncnn_saved() else "none"))
+    gpus = probe_vulkan_gpus()
+    main = ncnn_saved().get("gpu")
+    name = dict(gpus).get(main if isinstance(main, int) else (gpus[0][0] if gpus else -1), "")
+    if name:
+        print_gpu_recommendations(gpu_class(name), drv)
     return 0
 
 
