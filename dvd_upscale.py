@@ -54,7 +54,8 @@ VHS captures (--type vhs, normally detected by itself): a capture card's 720x480
 - --stabilize steadies a shaky camcorder tape: the camera shake is measured once over the whole
   video (ffmpeg's vid.stab; on Windows the gyan.dev "full" build has it), then smoothed out with
   the picture zoomed in 4% (--stabilize strong: 8%) so no moving edges show. Slow pans stay.
-- --faces [strength] restores faces after the upscale (live action and VHS/home video only):
+- Faces are restored after the upscale (on by itself for live action and VHS/home video once
+  its extras are installed; --faces for 3D animation too, --no-faces for none; --faces [strength]):
   GFPGAN 1.4 (or --face-model codeformer, licensed for non-commercial use only) redraws each
   face it finds, steadied from frame to frame, as 0.6 of the final picture's face (or the
   strength given, up to the AI frames' share, --ai-blend: 0.75 for live and VHS). Needs pip
@@ -110,12 +111,21 @@ queue.txt has one movie per line, exactly what you'd type after "python dvd_upsc
 - While it runs the PC is kept from going to sleep (single movies too). Keep it plugged in, and if you
   close the lid, set the lid action to "Do nothing" for when it's plugged in.
 Progress is logged to queue_log.txt next to the queue file.
+
+Progress on your phone (iPhone or Android, any browser): on by itself for every run
+(--no-phone turns it off). It prints an address like http://192.168.1.20:8642 : open it on a
+phone on the same Wi-Fi (add it to the home screen to keep it handy). It shows the movie, % done, time left for this movie
+and all of them, the current step and the latest output, refreshed every 3 s, and the NVIDIA
+graphics card's load, temperature, power, memory and clock (from nvidia-smi). --phone 8650
+uses another port. The first time, Windows asks whether Python may use the network: allow it
+on private networks (the Wi-Fi must be set as a Private network in Windows).
 """
 import argparse, json, math, operator, os, re, shutil, signal, statistics, struct, subprocess, sys
 import atexit, tempfile
 import threading, time, types
+import http.server, socket
 from bisect import bisect_right as _bisect
-from collections import Counter
+from collections import Counter, deque
 from operator import add, sub
 from fractions import Fraction
 from pathlib import Path
@@ -152,6 +162,7 @@ def eta_text(secs):
 
 def status_line(msg=""):
     """A progress line that keeps being overwritten, in a console window only ("" clears it)."""
+    phone_line(msg)
     if not sys.stdout.isatty():
         return
     width = max(20, shutil.get_terminal_size((80, 24)).columns - 1)  # a full line would wrap
@@ -162,6 +173,571 @@ def status_line(msg=""):
 def say(msg):
     status_line()
     print(msg, flush=True)
+
+
+# ---- --phone: the progress on a web page that a phone on the same Wi-Fi opens ----
+# The run that was given --phone serves the page. Each movie's run (the same process for a single
+# movie, a new one per movie with --all/--queue) copies what it prints, and its progress line,
+# into a small status file the page reads; the --all/--queue run itself adds its own lines
+# (Movie 2 of 5, DONE, FAILED) from memory.
+PHONE_PORT = 8642
+PHONE = None                # what the page shows, once phone_setup turned it on
+PHONE_LOCK = threading.Lock()
+PHONE_FILE = None           # the status file this process writes (a movie's run)
+PHONE_PATH = None           # the status file the page reads (the process serving the page)
+PHONE_QUEUE = [False]       # the page is served by an --all/--queue run
+PHONE_DIRTY = [False]
+PHONE_CACHE = [None]
+PHONE_ETA = re.compile(r"((?:\d+ h )?\d+ min left, done ~[^,()]*?\d{1,2}:\d\d(?: ?[AP]M)?)")
+
+
+def phone_line(msg):
+    if PHONE is None:
+        return
+    with PHONE_LOCK:
+        PHONE["line"] = msg.strip()
+        PHONE["t"] = time.time()
+        PHONE_DIRTY[0] = True
+
+
+def phone_log(text):
+    text = text.strip()
+    if PHONE is None or not text:
+        return
+    with PHONE_LOCK:
+        now = time.time()
+        PHONE["log"].append([now, text])
+        PHONE["t"] = now
+        m = re.match(r"\[(\d+)/(\d+)\]", text)
+        if m:
+            PHONE["chunk"] = [int(m[1]), int(m[2])]
+            PHONE["eta"] = "finishing the file" if "all chunks done" in text else ""
+        eta = PHONE_ETA.search(text)
+        if eta:
+            PHONE["eta_all" if text.startswith("all ") and " movies:" in text else "eta"] = eta[1]
+        m = re.match(r"=== Movie (\d+) of (\d+): (.*) ===$", text)
+        if m:
+            PHONE["n"], PHONE["of"], PHONE["movie"] = int(m[1]), int(m[2]), m[3]
+        PHONE_DIRTY[0] = True
+
+
+class PhoneTee:
+    """sys.stdout/sys.stderr that also hands each finished line to the page (the progress
+    line's own writes, between carriage returns, are left out: phone_line has those)."""
+    def __init__(self, stream):
+        self._stream, self._buf = stream, ""
+
+    def write(self, text):
+        n = self._stream.write(text)
+        try:
+            buf = self._buf + text
+            *lines, buf = buf.split("\n")
+            for line in lines:
+                phone_log(line.rstrip("\r").split("\r")[-1])
+            self._buf = buf[buf.rfind("\r") + 1:][-2000:]
+        except Exception:           # (the page is a nicety: never let it stop a run)
+            pass
+        return n
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def phone_movie(name):
+    if PHONE is not None:
+        with PHONE_LOCK:
+            PHONE["movie"] = str(name)
+            PHONE_DIRTY[0] = True
+
+
+PHONE_WRITE_LOCK = threading.Lock()
+
+
+def phone_write():
+    if not PHONE_FILE or not PHONE_DIRTY[0]:
+        return
+    with PHONE_WRITE_LOCK:      # (the writer thread and the exit hook never write together)
+        with PHONE_LOCK:
+            data = dict(PHONE, log=list(PHONE["log"]))
+            PHONE_DIRTY[0] = False
+        tmp = PHONE_FILE + f".{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, PHONE_FILE)
+        except OSError:             # (Windows: the page was reading it right then) next time
+            PHONE_DIRTY[0] = True
+
+
+def phone_writer():
+    while True:
+        time.sleep(1)
+        phone_write()
+
+
+def phone_setup(queue_parent):
+    """Turn the page's copy of the output on, in a run started by --phone (or by a queue that
+    was): a movie's run writes the status file, an --all/--queue run keeps its lines in memory."""
+    global PHONE, PHONE_FILE
+    path = os.environ.get("DVD_UPSCALE_PHONE")
+    if not path:
+        return
+    PHONE = dict(movie="", n=0, of=0, line="", chunk=None, eta="", eta_all="",
+                 log=deque(maxlen=80), t=time.time(), started=time.time())
+    try:
+        q = json.loads(os.environ.get("DVD_UPSCALE_QUEUE") or "null")
+        if q:
+            PHONE["n"], PHONE["of"] = int(q["n"]), int(q["of"])
+    except (ValueError, TypeError, KeyError):
+        pass
+    sys.stdout, sys.stderr = PhoneTee(sys.stdout), PhoneTee(sys.stderr)
+    if not queue_parent:
+        PHONE_FILE = path
+        threading.Thread(target=phone_writer, daemon=True).start()
+        atexit.register(phone_write)        # (the last lines, "Failed: ..." among them)
+
+
+PHONE_GPU = dict(t=0.0, gpus=[])
+PHONE_GPU_LOCK = threading.Lock()
+PHONE_GPU_FIELDS = ("index,name,temperature.gpu,power.draw,power.limit,utilization.gpu,"
+                    "memory.used,memory.total,clocks.sm,clocks.max.sm,fan.speed,"
+                    "clocks_throttle_reasons.active")
+
+
+def phone_gpus():
+    """The NVIDIA GPUs right now (nvidia-smi; at most every 2.5 s, only while the page is open),
+    [] without nvidia-smi. A value the GPU doesn't report (a laptop's fan) is None."""
+    with PHONE_GPU_LOCK:
+        if time.time() - PHONE_GPU["t"] < 2.5 or not shutil.which("nvidia-smi"):
+            return PHONE_GPU["gpus"]
+        PHONE_GPU["t"] = time.time()
+        gpus = []
+        try:
+            r = subprocess.run(["nvidia-smi", "--query-gpu=" + PHONE_GPU_FIELDS,
+                                "--format=csv,noheader,nounits"], capture_output=True,
+                               text=True, timeout=8, stdin=subprocess.DEVNULL,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            for row in r.stdout.splitlines():
+                v = [x.strip() for x in row.split(",")]
+                if len(v) != 12:
+                    continue
+                num = lambda x: (float(x) if re.fullmatch(r"[\d.]+", x) else None)
+                try:
+                    reasons = int(v[11], 16)
+                except ValueError:
+                    reasons = 0
+                why = [name for bit, name in THROTTLE_BITS if reasons & bit]
+                gpus.append(dict(index=v[0], name=v[1], temp=num(v[2]), power=num(v[3]),
+                                 power_max=num(v[4]), busy=num(v[5]), mem=num(v[6]),
+                                 mem_max=num(v[7]), clock=num(v[8]), clock_max=num(v[9]),
+                                 fan=num(v[10]), slowed=why))
+        except (OSError, subprocess.SubprocessError):
+            pass
+        PHONE_GPU["gpus"] = gpus
+        return gpus
+
+
+def phone_snapshot():
+    try:
+        with open(PHONE_PATH, encoding="utf-8") as f:
+            PHONE_CACHE[0] = json.load(f)
+    except (OSError, ValueError, TypeError):
+        pass                            # (not written yet, or being replaced: the last one)
+    out = dict(now=time.time(), movie=PHONE_CACHE[0], queue=None, gpus=phone_gpus())
+    if PHONE_QUEUE[0] and PHONE is not None:
+        with PHONE_LOCK:
+            out["queue"] = dict(PHONE, log=list(PHONE["log"]))
+    return out
+
+
+def phone_host_ok(host):
+    """The Host a request was made to: an address (the phone typed one), localhost, this PC's
+    name, or a Tailscale name. A web page on the internet that points its own name at this PC
+    (DNS rebinding) arrives with ITS name and is refused."""
+    host = str(host or "").strip().lower()
+    if host.startswith("["):                     # an IPv6 address in brackets
+        return True
+    host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host) or host in ("localhost", ""):
+        return True
+    mine = {socket.gethostname().lower(), socket.gethostname().lower().split(".")[0]}
+    return host in mine or host.endswith(".ts.net") or host.endswith(".local")
+
+
+class PhoneHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if not phone_host_ok(self.headers.get("Host")):
+            self.send_error(403)
+            return
+        if self.path.startswith("/status"):
+            body, kind = json.dumps(phone_snapshot()).encode(), "application/json"
+        elif self.path in ("/", "/index.html"):
+            body, kind = PHONE_PAGE.encode("utf-8"), "text/html; charset=utf-8"
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):       # (each request would print a line in the window)
+        pass
+
+    def handle(self):
+        try:
+            super().handle()
+        except OSError:                 # (a phone that locked its screen or left the Wi-Fi)
+            pass
+
+
+def is_tailscale_ip(ip):
+    """100.64.0.0/10: the addresses Tailscale gives its devices."""
+    try:
+        a, b = (int(x) for x in str(ip).split(".")[:2])
+    except ValueError:
+        return False
+    return a == 100 and 64 <= b <= 127
+
+
+class PhoneServer(http.server.ThreadingHTTPServer):
+    """The page's server. Windows lets a second program take a port that is in use when it asks
+    to reuse addresses (Python's servers do), so two runs at once would share 8642 and the
+    phone would see either: there the port is taken exclusively instead, and the second run
+    says the port is in use."""
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        # (HTTPServer.server_bind asks the network for this PC's full name, which can take
+        # seconds on a PC with no DNS: the page doesn't use it)
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "dvd_upscale", self.server_address[1]
+
+    def handle_error(self, request, client_address):
+        pass                            # (a dropped connection is not an error worth a traceback)
+
+
+def lan_ip():
+    """This PC's address on the home network (no packet is sent: it only picks the route; a
+    Tailscale route to that range is passed over)."""
+    for probe in ("10.255.255.255", "192.168.255.255", "172.31.255.255"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((probe, 1))
+            ip = s.getsockname()[0]
+            if not is_tailscale_ip(ip) and not ip.startswith("127."):
+                return ip
+        except OSError:
+            pass
+        finally:
+            s.close()
+    return ""
+
+
+def tailscale_addresses():
+    """This PC's Tailscale name and address, if Tailscale is running here: the phone can open
+    the page through it from anywhere (mobile data, another Wi-Fi), with Tailscale on the phone
+    too. From the Tailscale program (its MagicDNS name, e.g. laptop.tail1234.ts.net, and its
+    100.x.y.z address); without it, from this PC's own addresses. [] if none."""
+    found = []
+    exe = shutil.which("tailscale")
+    for path in ([os.path.join(os.environ[v], "Tailscale", "tailscale.exe")
+                  for v in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA")
+                  if os.environ.get(v)]       # (never a path relative to the current folder)
+                 + ["/Applications/Tailscale.app/Contents/MacOS/Tailscale"]):
+        if not exe and os.path.isabs(path) and os.path.isfile(path):
+            exe = path
+    if exe:
+        try:
+            r = subprocess.run([exe, "status", "--json"], capture_output=True, timeout=8,
+                               stdin=subprocess.DEVNULL,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            j = json.loads(r.stdout.decode("utf-8", "replace") or "{}")
+            me = j.get("Self") or {}
+            if j.get("BackendState", "Running") == "Running":
+                name = str(me.get("DNSName") or "").rstrip(".")
+                found += [name] if name else []
+                found += [ip for ip in me.get("TailscaleIPs") or [] if is_tailscale_ip(ip)][:1]
+        except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
+            pass
+    if not found:
+        try:
+            found = sorted({i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None,
+                                                                 socket.AF_INET)
+                            if is_tailscale_ip(i[4][0])})[:1]
+        except OSError:
+            pass
+    return found
+
+
+PHONE_ASKED = [False]       # --phone was typed: the firewall is opened for this run (Windows)
+PHONE_RULE = "dvd_upscale phone page"
+
+
+def phone_firewall_command(port, pid):
+    """PowerShell that opens the phone page's port in Windows Firewall, waits until the run with
+    that process id ends, then closes it again: one admin prompt covers the whole run, and
+    nothing stays open. Two rules, named for the port (a second run on another port never
+    deletes this one's): the local subnet on PRIVATE and DOMAIN networks only (not a café's
+    or hotel's Wi-Fi), and Tailscale's own addresses on any."""
+    n = f"{PHONE_RULE} {int(port)}"
+    return (f"$n = '{n}'; $t = '{n} (Tailscale)'; "
+            "Remove-NetFirewallRule -DisplayName $n,$t -ErrorAction SilentlyContinue; "
+            f"New-NetFirewallRule -DisplayName $n -Direction Inbound -Action Allow -Protocol TCP "
+            f"-LocalPort {int(port)} -Profile Private,Domain -RemoteAddress LocalSubnet "
+            "| Out-Null; "
+            f"New-NetFirewallRule -DisplayName $t -Direction Inbound -Action Allow -Protocol TCP "
+            f"-LocalPort {int(port)} -Profile Any -RemoteAddress 100.64.0.0/10 | Out-Null; "
+            f"Wait-Process -Id {int(pid)} -ErrorAction SilentlyContinue; "
+            "Remove-NetFirewallRule -DisplayName $n,$t -ErrorAction SilentlyContinue")
+
+
+def phone_firewall(port):
+    """--phone on Windows: ask (the Windows admin prompt, UAC) to open the page's port for this
+    run, so the phone reaches it through Tailscale and any home network. Returns a line to show."""
+    if os.name != "nt":
+        return ""
+    import base64
+    import ctypes
+    script = phone_firewall_command(port, os.getpid())
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        # ("runas": the admin prompt; the helper runs hidden and on its own, so the run doesn't wait)
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "powershell.exe",
+            f"-NoProfile -WindowStyle Hidden -EncodedCommand {encoded}", None, 0)
+    except (OSError, AttributeError):
+        rc = 0
+    if rc > 32:
+        return (f"       firewall: port {port} opened for this run (home network and Tailscale "
+                "only); it closes by itself when the run ends")
+    return ("       firewall: not opened (the admin prompt was declined): the page works on the "
+            "home Wi-Fi if Python is allowed there")
+
+
+def phone_args(argv):
+    """Take --phone [port] and --no-phone out of argv (so every parser and every movie's run
+    never sees them). The page is on by itself: the port to serve it on, or None for --no-phone,
+    an --analyze run, or a movie of --all/--queue (the queue's own run serves the page)."""
+    off = "--no-phone" in argv
+    while "--no-phone" in argv:
+        argv.remove("--no-phone")
+    port = PHONE_PORT
+    for i, w in enumerate(argv):
+        if w == "--phone" or w.startswith("--phone="):
+            val = w.split("=", 1)[1] if "=" in w else None
+            if val is None and i + 1 < len(argv) and argv[i + 1].isdigit():
+                val = argv[i + 1]
+                del argv[i + 1]
+            del argv[i]
+            if val and not val.isdigit():
+                sys.exit(f"--phone: '{val}' isn't a port number (e.g. --phone 8642)")
+            port = int(val) if val else PHONE_PORT
+            if not 1 <= port <= 65535:
+                sys.exit(f"--phone: {port} isn't a port number (1-65535, e.g. --phone 8642)")
+            PHONE_ASKED[0] = True
+            break
+    if off:
+        os.environ["DVD_UPSCALE_NO_PHONE"] = "1"       # (the movies of --all/--queue inherit it)
+    # a run that only prints help or a list, a set-up command, or a movie's run under a queue
+    # that serves the page, doesn't start the page
+    quiet = ("-h", "--help", "--commands", "commands", "--gpu-detect", "--clip") + tuple(
+        w for w in argv if w.startswith("--ncnn-"))
+    if off or os.environ.get("DVD_UPSCALE_NO_PHONE") or "--analyze" in argv \
+            or os.environ.get("DVD_UPSCALE_PHONE") or any(w in quiet for w in argv):
+        return None
+    return port
+
+
+def phone_start(port, queue_parent):
+    """The page is a nicety: whatever goes wrong here, the run goes on without it."""
+    try:
+        _phone_start(port, queue_parent)
+    except Exception as e:           # (a full temp folder, a firewall tool that fails...)
+        print(f"Phone page: couldn't start it ({e}); the run goes on without it.", flush=True)
+
+
+def _phone_start(port, queue_parent):
+    global PHONE_PATH
+    folder = Path(tempfile.mkdtemp(prefix="dvd_upscale_phone_"))
+    atexit.register(shutil.rmtree, folder, True)
+    server, err = None, None
+    for attempt in range(6):
+        # (on Windows the port is taken exclusively, and the last run's closed connections hold
+        # it for a little while: a run started right after another waits a few seconds)
+        try:
+            server = PhoneServer(("0.0.0.0", port), PhoneHandler)
+            break
+        except OSError as e:
+            err = e
+            time.sleep(1)
+    if server is None:
+        print(f"Phone page: port {port} can't be used ({err.strerror or err}; another run?): "
+              f"this run goes on without it; --phone {port + 1} would serve it on another port.",
+              flush=True)
+        return
+    server.daemon_threads = True
+    PHONE_PATH = str(folder / "status.json")
+    PHONE_QUEUE[0] = queue_parent
+    os.environ["DVD_UPSCALE_PHONE"] = PHONE_PATH        # (each movie's run writes it)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    ip = lan_ip()
+    print((f"Phone: on the same Wi-Fi, open  http://{ip}:{port}  in the phone's browser\n"
+           if ip else "Phone: no home-network address found for this PC (Wi-Fi off?)\n")
+          + "       (if Windows asks, allow Python on private networks)", flush=True)
+    if PHONE_ASKED[0]:
+        note = phone_firewall(port)
+        if note:
+            print(note, flush=True)
+    ts = tailscale_addresses()
+    if ts:
+        print("       anywhere, through Tailscale (on the phone too):  "
+              + "  or  ".join(f"http://{x}:{port}" for x in ts), flush=True)
+
+
+PHONE_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#111418">
+<title>Upscale progress</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--fg:#15181d;--dim:#667080;--line:#e2e5ea;--acc:#2f6fed;
+--ok:#1f9d55;--warn:#c27c0e;--bad:#d64545}
+@media (prefers-color-scheme:dark){:root{--bg:#111418;--card:#1a1e24;--fg:#eef0f3;--dim:#8d96a3;
+--line:#2a3039;--acc:#5b8cff;--ok:#3ccf7c;--warn:#f0b13c;--bad:#ff6b6b}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 -apple-system,system-ui,
+"Segoe UI",Roboto,sans-serif;padding:max(16px,env(safe-area-inset-top)) 16px 32px}
+.wrap{max-width:560px;margin:0 auto}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+h1{font-size:15px;font-weight:600;color:var(--dim);margin:0;letter-spacing:.02em}
+.pill{font-size:13px;padding:3px 10px;border-radius:99px;border:1px solid var(--line);color:var(--dim)}
+.pill::before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;
+margin-right:6px;background:currentColor;vertical-align:1px}
+.live{color:var(--ok)}.stale{color:var(--warn)}.off{color:var(--bad)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:12px}
+.movie{font-size:19px;font-weight:650;word-break:break-word}
+.sub{color:var(--dim);font-size:14px;margin-top:2px}
+.pct{font-size:44px;font-weight:700;font-variant-numeric:tabular-nums;margin:12px 0 6px}
+.bar{height:10px;background:var(--line);border-radius:99px;overflow:hidden}
+.bar>i{display:block;height:100%;width:0;background:var(--acc);border-radius:99px;transition:width .6s}
+.row{display:flex;justify-content:space-between;gap:12px;margin-top:10px;font-size:14px}
+.row b{font-weight:600;text-align:right}
+.now{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:var(--dim);
+margin-top:12px;word-break:break-word;min-height:1.4em}
+h2{font-size:13px;color:var(--dim);font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.05em}
+ol{list-style:none;margin:0;padding:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+li{padding:5px 0;border-top:1px solid var(--line);display:flex;gap:10px;word-break:break-word}
+li:first-child{border-top:0}
+li time{color:var(--dim);flex:none}
+.err{color:var(--bad)}.done{color:var(--ok)}
+.gpu+.gpu{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+.gname{font-weight:600;font-size:15px;margin-bottom:10px}
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.tile{background:var(--bg);border-radius:10px;padding:10px 12px}
+.tile:last-child:nth-child(odd){grid-column:1/-1}
+.tile small{display:block;color:var(--dim);font-size:12px}
+.tile b{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+.tile span{color:var(--dim);font-size:13px;margin-left:3px}
+.mini{height:5px;background:var(--line);border-radius:9px;margin-top:7px;overflow:hidden}
+.mini>i{display:block;height:100%;background:var(--acc)}
+.hot b{color:var(--warn)}.vhot b{color:var(--bad)}
+.slow{margin-top:10px;font-size:13px;color:var(--warn)}
+.banner{display:none;background:var(--bad);color:#fff;border-radius:12px;padding:12px 14px;
+margin-bottom:12px;font-size:14px}
+footer{color:var(--dim);font-size:12px;text-align:center;margin-top:8px}
+</style></head><body><div class="wrap">
+<header><h1>DVD UPSCALE</h1><span id="pill" class="pill">connecting</span></header>
+<div id="banner" class="banner">Can't reach the PC. The run may have finished or been stopped,
+or the PC is asleep or off this Wi-Fi. Showing the last thing it reported.</div>
+<div class="card">
+ <div class="movie" id="movie">Waiting for the first update...</div>
+ <div class="sub" id="which"></div>
+ <div class="pct" id="pct">--</div>
+ <div class="bar"><i id="fill"></i></div>
+ <div class="row"><span>Chunks</span><b id="chunks">-</b></div>
+ <div class="row"><span>This movie</span><b id="eta">-</b></div>
+ <div class="row" id="allrow" hidden><span>All movies</span><b id="etaall">-</b></div>
+ <div class="now" id="now"></div>
+</div>
+<div class="card" id="gcard" hidden><h2>Graphics card</h2><div id="gpus"></div></div>
+<div class="card" id="qcard" hidden><h2>Queue</h2><ol id="qlog"></ol></div>
+<div class="card"><h2>Recent output</h2><ol id="log"></ol></div>
+<footer id="foot"></footer>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let last=null,lastOk=0,skew=0;
+function hm(t){const d=new Date((t-skew)*1000);return d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})}
+function fill(ol,items,n){ol.textContent='';items.slice(-n).reverse().forEach(([t,s])=>{
+ const li=document.createElement('li'),tm=document.createElement('time'),sp=document.createElement('span');
+ tm.textContent=hm(t);sp.textContent=s;
+ if(/fail|error|warning|⚠/i.test(s))sp.className='err';else if(/^(✅ )?DONE|^Finished|Saved/.test(s))sp.className='done';
+ li.append(tm,sp);ol.append(li)})}
+function show(d){
+ const m=d.movie,q=d.queue;
+ if(q&&q.log.length){$('qcard').hidden=false;fill($('qlog'),q.log,8)}
+ if(!m){if(q){$('movie').textContent=q.movie||'Getting ready...';
+   $('which').textContent=q.of?`Movie ${q.n} of ${q.of}`:''}return}
+ $('movie').textContent=m.movie||'Getting ready...';
+ $('which').textContent=m.of?`Movie ${m.n} of ${m.of}`:'';
+ if(m.chunk){const p=m.chunk[0]/m.chunk[1];$('pct').textContent=Math.floor(p*100)+'%';
+  $('fill').style.width=(p*100)+'%';$('chunks').textContent=`${m.chunk[0]} of ${m.chunk[1]}`}
+ else{$('pct').textContent='Preparing';$('fill').style.width='0';$('chunks').textContent='-'}
+ $('eta').textContent=m.eta||'-';
+ $('allrow').hidden=!m.eta_all;$('etaall').textContent=m.eta_all||'';
+ $('now').textContent=m.line||'';
+ fill($('log'),m.log,25);
+}
+function tile(label,val,unit,frac,cls){
+ const t=document.createElement('div');t.className='tile '+(cls||'');
+ const sm=document.createElement('small');sm.textContent=label;
+ const b=document.createElement('b');b.textContent=val==null?'n/a':val;
+ t.append(sm,b);if(unit&&val!=null){const u=document.createElement('span');u.textContent=unit;t.append(u)}
+ if(frac!=null){const m=document.createElement('div');m.className='mini';const i=document.createElement('i');
+  i.style.width=Math.min(100,Math.max(0,frac*100))+'%';m.append(i);t.append(m)}
+ return t}
+const r0=x=>x==null?null:Math.round(x);
+function showGpus(gs){
+ const box=$('gpus');$('gcard').hidden=!gs||!gs.length;if(!gs||!gs.length)return;box.textContent='';
+ gs.forEach(g=>{const d=document.createElement('div');d.className='gpu';
+  const n=document.createElement('div');n.className='gname';n.textContent=g.name;d.append(n);
+  const ts=document.createElement('div');ts.className='tiles';
+  ts.append(tile('Busy',r0(g.busy),'%',g.busy==null?null:g.busy/100));
+  ts.append(tile('Temperature',r0(g.temp),'°C',null,g.temp>=87?'vhot':g.temp>=78?'hot':''));
+  ts.append(tile('Power',r0(g.power),g.power_max?`W of ${r0(g.power_max)}`:'W',
+   g.power!=null&&g.power_max?g.power/g.power_max:null));
+  ts.append(tile('Memory',g.mem==null?null:(g.mem/1024).toFixed(1),
+   g.mem_max?`of ${(g.mem_max/1024).toFixed(0)} GB`:'GB',g.mem!=null&&g.mem_max?g.mem/g.mem_max:null));
+  ts.append(tile('Clock',r0(g.clock),g.clock_max?`MHz (max ${r0(g.clock_max)})`:'MHz',
+   g.clock!=null&&g.clock_max?g.clock/g.clock_max:null));
+  if(g.fan!=null)ts.append(tile('Fan',r0(g.fan),'%',g.fan/100));
+  d.append(ts);
+  if(g.slowed&&g.slowed.length){const w=document.createElement('div');w.className='slow';
+   w.textContent='⚠ Slowing itself down: '+g.slowed.join(', ');d.append(w)}
+  box.append(d)})}
+function status(){
+ const pill=$('pill'),now=Date.now()/1000,off=now-lastOk>12;
+ $('banner').style.display=off&&lastOk?'block':'none';
+ if(!last){return}
+ const t=Math.max(last.movie?last.movie.t:0,last.queue?last.queue.t:0),age=last.now-t;
+ if(off){pill.className='pill off';pill.textContent='offline'}
+ else if(age>300){pill.className='pill stale';pill.textContent='quiet '+Math.round(age/60)+' min'}
+ else{pill.className='pill live';pill.textContent='live'}
+ $('foot').textContent='PC last reported '+(age<60?Math.round(age)+' s':Math.round(age/60)+' min')+' ago · refreshes every 3 s';
+}
+async function poll(){
+ try{const r=await fetch('/status.json',{cache:'no-store'});const d=await r.json();
+  last=d;lastOk=Date.now()/1000;skew=d.now-lastOk;show(d);showGpus(d.gpus)}catch(e){}
+ status()}
+poll();setInterval(poll,3000);
+</script></body></html>"""
 
 
 def short_time(secs):
@@ -708,6 +1284,29 @@ def postfilter(a):
     return ",".join(f)
 
 
+# --ai-blend where the picture is busy: crowds of small people, grass, gravel, foliage. The models
+# paint such dense small detail flat (people turn waxy and run together) and it shimmers from frame
+# to frame, so there the plain upscale gets more say. "Busy" is the fine detail (Laplacian) of
+# the source frame, averaged over SIGMA pixels: a single strong outline (a close-up face, a
+# wall's edge) averages out low, a crowd or a lawn stays high. Below LO the AI keeps all of
+# --ai-blend, from HI on it gets LOW_BLEND (at most --ai-blend), linearly in between. Measured on
+# a real pedestrian video shrunk to DVD size, upscaled with realesrgan-x2plus and compared with
+# the real full-size frames (in the people: SSIM 0.860 -> 0.879, gradient error 0.155 -> 0.140,
+# shimmer of the still background 2.6x -> 2.2x the real video's; the same as --ai-blend 0.4
+# everywhere, but smooth scenes keep the AI as they were)
+DETAIL_BLEND = dict(sigma=6, lo=8, hi=25, low_blend=0.4)
+
+
+def detail_blend_mask(a):
+    """ffmpeg filters turning a source frame into the maskedmerge mask (0 = the AI frame,
+    255 = the plain upscale) at the source frame's size."""
+    d, high = DETAIL_BLEND, a.ai_blend
+    low = min(high, d["low_blend"] if getattr(a, "busy_blend", None) is None else a.busy_blend)
+    share = (f"{high}-({high}-{low})*clip((val-{d['lo']})/({d['hi']}-{d['lo']})\\,0\\,1)")
+    return (f"format=gray,convolution=0m='0 -1 0 -1 4 -1 0 -1 0':0rdiv=1:0bias=128,"
+            f"lut=y='abs(val-128)',gblur=sigma={d['sigma']},lut=y='255*(1-({share}))'")
+
+
 def nvenc_args(a):
     """NVENC argument lists, best first; the first one this GPU accepts is used (nvenc errors
     out on unsupported options instead of ignoring them).
@@ -812,6 +1411,8 @@ def compact_model(a):
 #   100, 32: 80%), so a reset after a good stretch of frames doesn't step down (Chunk.upscale)
 GPU_STEPS = {True: ((8, None), (6, None), (4, None), (2, None), (1, None), (1, 100), (1, 64)),
              False: ((2, None), (1, None), (1, 100), (1, 64), (1, 32))}  # compact?: steps
+
+
 # the current ncnn (see ncnn_upscaler_main) does one frame at a time anyway
 def ncnn_steps():
     """What the current ncnn is lowered to after a GPU reset, one step at a time: first the
@@ -821,6 +1422,8 @@ def ncnn_steps():
     more than needed. Only tiles below the one it started with."""
     cap = int(ncnn_saved().get("tile") or 200)
     return ((1, None),) + tuple((1, t) for t in (512, 256, 128, 64, 32) if t < cap)
+
+
 GPU_STEP = [0]          # how many steps down this run has gone
 
 
@@ -1662,7 +2265,6 @@ class FaceRestorer:
 
     def __init__(self, models, model=FACE_MODEL, fidelity=FACE_FIDELITY, providers=None):
         import numpy as np
-        import cv2
         import onnxruntime as ort
         avail = ort.get_available_providers()
         # the GPU if onnxruntime has a way to it (onnxruntime-gpu: CUDA, onnxruntime-directml:
@@ -1943,6 +2545,8 @@ def ncnn_install_hint():
     if Path(sys.executable).resolve().parent == here / "python":
         return "run setup.bat again"
     return f"{pip_cmd()} install --no-deps ncnn=={NCNN_VERSION} numpy"
+
+
 ESRGAN_DEFAULT = "realesrgan-ncnn-vulkan"
 HELPER_MIN = 0.2        # a second GPU this fraction as fast as the first is kept as a helper
 DEFAULT_GPU = "0"       # the GPU used without --gpu, until --ncnn-bench-gpu saves a faster one
@@ -2351,7 +2955,7 @@ def ncnn_auto_main(argv):
                          "--query-gpu=utilization.gpu,temperature.gpu,power.draw,clocks.sm",
                          "--format=csv,noheader,nounits"], capture_output=True, text=True,
                         timeout=10)
-                    v = [float(x) for x in r.stdout.strip().split(",")]
+                    v = [float(x) for x in r.stdout.strip().splitlines()[0].split(",")]
                     util.append(v[0]), temps.append(v[1]), watts.append(v[2]), clocks.append(v[3])
                 except (OSError, ValueError, IndexError, subprocess.SubprocessError):
                     pass
@@ -2378,11 +2982,14 @@ def ncnn_auto_main(argv):
             spc = max(1, int(secs[-1]))
             rc, dur = capture(["ffprobe", "-v", "error", "-show_entries", "format=duration",
                                "-of", "csv=p=0", w.movie])
-            line = f"test run: {spc} s per 480-frame chunk ({480 / spc:.1f} frames/s)"
+            # (the run's own frames/s; a chunk is 480 frames for live action, 1440 for anime)
+            rate = re.findall(r"Upscaled \d+ frames in .*?\(([\d.]+) frames/s\)", text)
+            fps = float(rate[-1]) if rate else 480 / spc
+            line = f"test run: {spc} s per chunk ({fps:.1f} frames/s)"
             try:
-                chunks = math.ceil(float(dur.strip()) * 24000 / 1001 / 480)
-                line += f"; this movie: about {chunks * spc / 3600:.1f} hours"
-            except ValueError:
+                line += (f"; this movie: about "
+                         f"{float(dur.strip()) * 24000 / 1001 / fps / 3600:.1f} hours")
+            except (ValueError, ZeroDivisionError):
                 pass
             summary.append(line)
         summary.append(f"GPU errors in the test run: {bad}" if bad else "no GPU errors in the test run")
@@ -2999,10 +3606,19 @@ def face_reinstall_hint():
             else face_install_hint())
 
 
+class FacesUnavailable(Exception):
+    """The automatic face restoration can't run here (packages or model files missing)."""
+
+
 def faces_check(a):
     """--faces, before anything long: the packages and model files are there and the models
-    load (in a worker, as for the chunks). Exits with what to install or download if not;
+    load (in a worker, as for the chunks). Exits with what to install or download if not (when
+    it was turned on by itself, raises FacesUnavailable instead: the movie goes on without);
     prints what it will use."""
+    def stop(msg):
+        if getattr(a, "faces_auto", False):
+            raise FacesUnavailable(msg)
+        sys.exit(msg)
     models = face_models_dir(a)
     a.face_models_path = str(models)
     status_line("  checking the face restoration (loading its models)...")
@@ -3013,7 +3629,7 @@ def faces_check(a):
                            capture_output=True, stdin=subprocess.DEVNULL, timeout=600)
     except subprocess.TimeoutExpired:
         status_line()
-        sys.exit("--faces: the face restoration's check didn't finish (its models didn't load "
+        stop("--faces: the face restoration's check didn't finish (its models didn't load "
                  "in 10 minutes). Reinstalling its packages may help:\n  "
                  + face_reinstall_hint())
     rc, text = p.returncode, (p.stdout + p.stderr).decode("utf-8", "replace")
@@ -3031,7 +3647,7 @@ def faces_check(a):
         # only the ones missing, and the OpenCV package installed if it is too old: a second
         # onnxruntime (or OpenCV) package next to a working one shares its folder and breaks it
         need = miss + ((face_dists(*CV_DISTS) or ["opencv-python-headless"]) if old_cv else [])
-        sys.exit("--faces needs a few Python packages (" + "; ".join(why) + ")"
+        stop("--faces needs a few Python packages (" + "; ".join(why) + ")"
                  + "".join(f"\n  {x.strip()}" for x in lines if x.startswith("("))
                  + (f"\n{'Install them' if miss else 'Update it'} with:\n  "
                     + face_install_hint(need) if need else "")
@@ -3042,7 +3658,7 @@ def faces_check(a):
                  + "\nThen run the same command again.")
     if rc == 4:
         files = found.get("MISSING-MODELS", "").split()
-        sys.exit(f"--faces needs its model files in '{models}'"
+        stop(f"--faces needs its model files in '{models}'"
                  + ("" if a.face_models else " (a face_models folder next to dvd_upscale.py; "
                     "--face-models DIR for another folder)")
                  + ". Missing:\n" + "".join(f"  {f}  from  {FACE_URLS.get(f, '?')}\n"
@@ -3050,13 +3666,13 @@ def faces_check(a):
                  + "Download them into that folder, then run the same command again.")
     if rc == 5:
         files = found.get("BAD-MODEL", "").split()
-        sys.exit(f"--faces: a model file in '{models}' is damaged or not fully downloaded:\n"
+        stop(f"--faces: a model file in '{models}' is damaged or not fully downloaded:\n"
                  + "".join(f"  {f}  from  {FACE_URLS.get(f, '?')}\n" for f in files)
                  + "Delete it and download it again into that folder, then run the same command "
                    "again.")
     provider = found.get("PROVIDER")
     if rc or not provider:
-        sys.exit("--faces: the face restoration couldn't start. Its output (end):\n  "
+        stop("--faces: the face restoration couldn't start. Its output (end):\n  "
                  + "\n  ".join(lines[-15:])
                  + "\nReinstalling its packages may help:\n  " + face_reinstall_hint())
     a.face_provider = provider.strip()
@@ -3379,6 +3995,12 @@ class Chunk:
                         for f in list((tmp / "out").iterdir()):
                             if f.name not in good:
                                 f.unlink(missing_ok=True)
+                        # (a failed check after the black frames were put in: their inputs
+                        # go aside again, else the upscaler gets them and makes too many)
+                        for name in blacks:
+                            if (tmp / "in" / name).exists():
+                                (tmp / "in_black").mkdir(exist_ok=True)
+                                os.replace(tmp / "in" / name, tmp / "in_black" / name)
                         shutil.rmtree(tmp / "in_rest", ignore_errors=True)
                         src = tmp / "in"
                         if good:
@@ -3427,9 +4049,18 @@ class Chunk:
                 # mix the AI frames with a plain upscale of the same input frames, so frames
                 # where the model adds detail and frames where it doesn't look less different
                 ins += ["-framerate", a.fps, "-i", pngs(tmp / "in")]
-                graph = (f"[1:v]scale=iw*{a.scale}:ih*{a.scale}:flags=lanczos,format=gbrp[plain];"
-                         f"[0:v]format=gbrp[ai];"
-                         f"[ai][plain]blend=all_mode=normal:all_opacity={a.ai_blend}")
+                if getattr(a, "detail_blend", False):
+                    # crowds, grass, gravel (dense small detail): less of the AI there, which
+                    # paints it flat and makes it shimmer; the rest keeps --ai-blend (see
+                    # detail_blend_mask)
+                    graph = (f"[1:v]split=2[p1][p2];[p1]scale=iw*{a.scale}:ih*{a.scale}:"
+                             f"flags=lanczos,format=gbrp[plain];[p2]{detail_blend_mask(a)},"
+                             f"scale=iw*{a.scale}:ih*{a.scale}:flags=bilinear,format=gbrp[mask];"
+                             f"[0:v]format=gbrp[ai];[ai][plain][mask]maskedmerge")
+                else:
+                    graph = (f"[1:v]scale=iw*{a.scale}:ih*{a.scale}:flags=lanczos,"
+                             f"format=gbrp[plain];[0:v]format=gbrp[ai];"
+                             f"[ai][plain]blend=all_mode=normal:all_opacity={a.ai_blend}")
             else:
                 graph = "[0:v]null"
             k = min(12, n_in - 1)
@@ -3553,7 +4184,8 @@ class Chunk:
                         raise RuntimeError(
                             f"the face restoration failed twice on {label} ({why}). Its output "
                             "(end):\n  " + "\n  ".join(tail[-20:]) + "\n(" + gpu_hint
-                            + f"--faces can be left out to upscale without it: {fresh})")
+                            + f"--no-faces upscales without it (for a movie already started: delete its "
+                            f"work folder first): {fresh})")
                     status_line()
                     print(f"  {label}: the face restoration failed ({why}) - trying it once "
                           + ("more on the processor (slower; the GPU may be short of memory "
@@ -3755,8 +4387,6 @@ TYPE_NAMES = {"anime": "anime / drawn animation", "live": "live action",
               "cgi": "3D animation (CGI)", "vhs": "VHS tape"}
 
 # ---- auto-detection, content, look at single pictures: flat colour areas and ink outlines (drawn) vs soft shading
-_cs_all__ = ["detect_content"]
-
 # ---- model (fitted on the training split, see REPORT.md) ---------------------------------------
 _cs_W_ANIME = (3.2616312366286953, 2.795601085467864, 0.07764657454479618)   # logit(eshare), logit(eshare2x), noise
 _cs_B_ANIME = 9.154252224821379
@@ -3766,7 +4396,6 @@ _cs_B_CGI = -5.499787115874285
 _cs_N_SAMPLES = 32
 _cs_BW_INK, _cs_BW_INK_HIGH = 1.2, 1.5               # dark-line ratio; non-anime training clips: max 1.19 (Caminandes 2)
 _cs_NPL = 7                                  # planes per sample: Y, median(Y), Laplacian, black/white top-hat, U, V
-_cs_ABS = {}
 
 
 def _cs_logit(x):
@@ -4611,8 +5240,6 @@ def _ct_detect_content(path, ffmpeg="ffmpeg", ffprobe="ffprobe", info=None):
                 seconds=round(time.time() - t0, 2))
 
 # ---- auto-detection, source: VHS tape (head-switching band at the bottom, ragged noisy side edges) vs DVD
-_src_all__ = ["detect_source"]
-
 _src_LOSSLESS = {"huffyuv", "ffvhuff", "ffv1", "utvideo", "lagarith", "rawvideo", "v210", "v410",
             "yuv4", "r210", "magicyuv", "y41p", "ayuv", "zlib", "mszh", "cllc", "vble"}
 _src_CAPTURE_EXT = (".avi", ".mpg", ".mpeg", ".dv")
@@ -5473,6 +6100,9 @@ def check_values(a):
         sys.exit("--encode-jobs must be between 1 and 4")
     if a.gpu_jobs is not None and not 1 <= a.gpu_jobs <= 4:
         sys.exit("--gpu-jobs must be between 1 and 4")
+    if a.busy_blend is not None and (not math.isfinite(a.busy_blend)
+                                     or not 0 <= a.busy_blend <= 1):
+        sys.exit("--busy-blend must be between 0 and 1")
     if a.faces is not None and (not math.isfinite(a.faces) or not 0 < a.faces <= 1):
         sys.exit("--faces must be more than 0 and at most 1 (e.g. --faces 0.6)")
 
@@ -5517,6 +6147,13 @@ def build_parser():
     p.add_argument("--fps", default=None, help="override output fps, e.g. 24000/1001")
     p.add_argument("--chunk-frames", type=int, default=None)
     p.add_argument("--test", type=int, default=0, help="only process first N seconds")
+    p.add_argument("--phone", nargs="?", type=int, const=PHONE_PORT, metavar="PORT",
+                   help="the progress page for a phone is on by itself: open the address the run "
+                        "prints in the phone's browser on the same Wi-Fi. --phone also asks "
+                        "Windows (an admin prompt) to open the firewall for it for this run, for "
+                        "Tailscale and the home network; --phone PORT: another port (default "
+                        f"{PHONE_PORT})")
+    p.add_argument("--no-phone", action="store_true", help="don't serve the phone page")
     p.add_argument("--esrgan", default=ESRGAN_DEFAULT)
     p.add_argument("--engine", choices=("auto", "exe", "ncnn"), default="auto", dest="engine_choice",
                    help="what runs the big models (x2plus, x4plus): ncnn, the current ncnn from "
@@ -5554,6 +6191,15 @@ def build_parser():
     p.add_argument("--no-skip-black", dest="no_skip_black", action="store_true",
                    help="upscale black frames too (by default a frame that is black through and "
                         "through is not sent to the upscaler: its upscale is black as well)")
+    p.add_argument("--no-detail-blend", action="store_true",
+                   help="use --ai-blend everywhere (by default crowds of small people, grass and "
+                        "other dense small detail get less of the AI, about 0.4: it paints them "
+                        "flat and makes them shimmer; smooth areas keep --ai-blend)")
+    p.add_argument("--busy-blend", type=float, default=None, metavar="SHARE",
+                   help="the AI's share in crowds, grass and other busy detail, 0-1 (default "
+                        f"{DETAIL_BLEND['low_blend']:g}; at most --ai-blend). Higher: crisper "
+                        "but invented detail that shimmers; lower: truer and steadier, softer. "
+                        "E.g. 0.55 for CGI films whose grass and fur look too soft")
     p.add_argument("--no-crop", action="store_true",
                    help="don't cut the black bars of a widescreen movie off before the upscale "
                         "(they are looked for by default: the upscaler then does only the "
@@ -5591,14 +6237,18 @@ def build_parser():
     p.add_argument("--faces", nargs="?", type=float, const=FACE_STRENGTH, default=None,
                    metavar="STRENGTH",
                    help="restore faces after the upscale (GFPGAN or CodeFormer redraws each "
-                        "face with real detail: eyes, teeth, skin), for live action and home "
-                        f"video; not used for anime or 3D animation. STRENGTH 0-1 (default "
+                        "face with real detail: eyes, teeth, skin). On by itself for live action "
+                        "and home video when installed; give it for 3D animation to use it there "
+                        f"(never for anime). STRENGTH 0-1 (default "
                         f"{FACE_STRENGTH:g}): the redrawn face's share of the final picture, at "
                         "most the AI frames' share (--ai-blend: 0.75 live and VHS). Needs "
                         "pip install -U onnxruntime-directml (Windows; onnxruntime-gpu for NVIDIA "
                         "with CUDA and cuDNN) opencv-python-headless numpy, and its model files "
                         "in a face_models folder next to this script (the run says where to get "
                         "them)")
+    p.add_argument("--no-faces", action="store_true",
+                   help="no face restoration (it is on by itself for live action and VHS when its "
+                        "packages and model files are installed)")
     p.add_argument("--face-model", choices=sorted(FACE_MODEL_FILES), default=FACE_MODEL,
                    help=f"--faces: gfpgan (GFPGAN 1.4, the default) or codeformer (CodeFormer, "
                         f"fidelity {FACE_FIDELITY:g}; its licence, S-Lab 1.0, allows "
@@ -5679,6 +6329,27 @@ TEST ONE SPOT OF A MOVIE (see what the full run will make of it, in a few minute
     -map 0:v:0  picture only; -map 0:v:0 -map 0:a gives picture and sound
     -c copy     no re-encoding: the clip starts at the nearest keyframe (up to ~1 s early)
 
+WATCH IT ON YOUR PHONE (iPhone or Android, any browser, same Wi-Fi as the PC)
+  It's ON BY ITSELF for every run (one movie, --all, --queue); --no-phone turns it off
+    1. At the start the run prints an address, e.g.  Phone: ... open  http://192.168.1.20:8642
+    2. Type that address into Safari / Chrome on the phone (Share > Add to Home Screen keeps it
+       one tap away)
+    3. The page shows the movie, % done, time left for this movie and for all of them, the step
+       it's on, the latest output, and the NVIDIA GPU's load, temperature, power, memory and
+       clock (a warning when heat or the power cap slows it down); it refreshes every 3 s
+  The first time, Windows asks whether Python may use the network: Allow (private networks).
+  Page won't load? Settings > Network > your Wi-Fi > Network profile type = Private, and the
+  phone on the same Wi-Fi (not mobile data). Port taken? --phone 8650
+  --phone: also asks Windows for admin rights (the "allow changes" prompt) to open the page's
+  port in the firewall for this run only (home network and Tailscale), and closes it again
+  when the run ends. Use it when the page won't load, e.g. through Tailscale.
+  TAILSCALE: if Tailscale runs on the PC, the run also prints its Tailscale address
+  (e.g. http://laptop.tail1234.ts.net:8642): with the Tailscale app on the phone, that one works
+  from anywhere (mobile data, work, a trip), not only at home. It never changes.
+  The Wi-Fi address stays the same from run to run (unless the router gives the PC a new one), so a
+  home-screen shortcut keeps working.
+  "offline" on the page: the run finished or was stopped, or the PC is asleep.
+
 STOP / RESUME
   Ctrl+C                       stop (finished chunks are kept)
   run the same command again   continue where it stopped (with the same type as before)
@@ -5688,11 +6359,18 @@ USEFUL EXTRAS (add to any command above)
   --hevc             smaller files, but needs a newer TV/player (H.264 is the default)
   --height 720       720p instead of 1080p
   --dar 16:9         fix a squeezed/stretched picture (or --dar 4:3)
-  --ai-blend 0.5     gentler AI (less "painted" look; default 0.75 live, 1 anime)
+  --ai-blend 0.5     gentler AI (less "painted" look; default 0.75 live, 1 anime). Crowds,
+                     grass and other busy detail get less AI by themselves (about 0.4): the AI
+                     smears small people together there; --no-detail-blend turns that off
+  --busy-blend 0.55  a little more AI in that busy detail (crisper grass and fur in CGI films,
+                     but more shimmer; 0.4 default, at most --ai-blend)
   --fast             no AI: much quicker, ordinary resize
-  --faces            restore faces (live action and home video; --faces 0.8 for more, at most
-                     the --ai-blend share, 0.75); needs extra installs and model files: the run
-                     says which
+  --faces            face restoration: ON BY ITSELF for live action and VHS once its extras are
+                     installed (the run says which, and goes on without them until then);
+                     --faces 0.8 for more (at most the --ai-blend share, 0.75); add --faces to
+                     a 3D-animation (CGI) movie to use it there too (check a clip: its model
+                     knows photos, faces can turn photographic); never for anime
+  --no-faces         no face restoration
   --cpu              encode without an NVIDIA GPU (slow)
   --tile 128         smaller pieces of GPU work, if the GPU runs out of memory or is reset
                      (lowered by itself to 100, 64, 32 if fewer frames at once didn't help)
@@ -5815,6 +6493,8 @@ QUICK START: the ones to remember (everything else below is the detail)
                                                      the settings it survives, the fastest, the
                                                      best model; saved and used from then on
   python dvd_upscale.py "Movie.mkv" --best-quality   upscale with the model --ncnn-models --save found
+  (every run)                                        watch it on your phone: open the address it
+                                                     prints at the start (same Wi-Fi)
   python dvd_upscale.py --gpu-detect                 the GPUs, the driver, the saved profile
   python dvd_upscale.py --commands                   this list
 
@@ -5831,6 +6511,8 @@ ALL THE SPECIAL COMMANDS, ONE LINE EACH (details below)
   --queue / --all          several movies (a list of lines / every movie in a folder)
   --analyze                only show what it detects      --test 60   a 60-second preview
   Turn a built-in automatic step off: --no-crop (black bars) --no-skip-black (black frames)
+  --no-detail-blend (less AI in crowds/busy detail)
+  --no-phone (don't serve the progress page for a phone)  --no-faces (no face restoration)
   --no-profile (first-run GPU profile) --encode-jobs 1 --gpu-jobs 1 --engine exe
   --no-step-down (don't slow the GPU settings down after a reset)  --best-quality (use the saved model)
 """
@@ -5862,6 +6544,7 @@ def commands_text():
 
 def main():
     a = build_parser().parse_args()
+    phone_movie(Path(a.input).name)
     check_values(a)
     a.combed = a.fix_combed     # (--clip --upscale: as detected for the whole movie)
     if a.work is None:
@@ -5903,10 +6586,6 @@ def main():
     a.ai_blend = pb if a.ai_blend is None else a.ai_blend
     a.smooth = psm if a.smooth is None else a.smooth
     a.sharpen = psh if a.sharpen is None else a.sharpen
-    if not 0 <= a.ai_blend <= 1:
-        sys.exit("--ai-blend must be between 0 and 1")
-    if a.smooth < 0 or not 0 <= a.sharpen <= 2:
-        sys.exit("--smooth must be 0 or more, --sharpen between 0 and 2")
     a.model = a.model or pm
     a.scale = a.scale or (4 if "x4plus" in a.model or "x4v3" in a.model else
                           2 if "x2plus" in a.model else ps)
@@ -5918,16 +6597,7 @@ def main():
     if a.telecine:
         a.mode = "telecine"
     if a.dar:
-        a.dar = a.dar.replace(":", "/")
-        if frac(a.dar) <= 0:
-            sys.exit(f"Invalid --dar '{a.dar}', use e.g. 16:9 or 4:3")
-    if a.fps:
-        if frac(a.fps) <= 0:
-            sys.exit(f"Invalid --fps '{a.fps}', use e.g. 24000/1001 or 25")
-    if a.height < 2 or a.height % 2:
-        sys.exit("--height must be an even number")
-    if a.chunk_frames < 1:
-        sys.exit("--chunk-frames must be at least 1")
+        a.dar = a.dar.replace(":", "/")     # (checked in check_values)
     if a.output is None:
         out = default_output(a.input, height=a.height)
         # a preview gets its own name: it must never replace the finished movie
@@ -6103,17 +6773,31 @@ def main():
         print(f"GPU settings: {gpu_load_text(a)}; {jobs_note}"
               + (f" (what this GPU needed before; to try more again, delete "
                  f"{gpu_step_file().name} next to {Path(__file__).name})" if GPU_STEP[0] else ""))
-    if a.faces is not None and (a.fast or a.type in ("anime", "cgi") or a.ai_blend == 0):
-        # (--all --faces on a folder of all kinds of movies: only the live-action ones and tapes
-        # get it)
+    # face restoration: on by itself for live action and tapes (when its packages and model
+    # files are installed: else the movie goes on without, see faces_check), only when asked
+    # for 3D animation (its model was trained on photos: animated faces can turn photographic),
+    # never for anime. A movie started without it keeps going without it (its chunks must match)
+    a.faces_auto = False
+    if a.no_faces:
+        a.faces = None
+    elif a.faces is None and a.type in ("live", "vhs") and not a.fast and not a.analyze \
+            and a.ai_blend > 0:
+        prev = previous_settings(a)
+        if prev is None or "faces" in prev:
+            a.faces, a.faces_auto = FACE_STRENGTH, True
+    if a.faces is not None and (a.fast or a.type == "anime" or a.ai_blend == 0):
+        # (--all --faces on a folder of all kinds of movies: anime gets none)
         if not a.analyze:
             print("NOTE: --faces isn't used " + (
                 "with --fast (it works on the AI-upscaled frames)" if a.fast else
-                f"for {TYPE_NAMES[a.type]}: it would turn drawn or 3D-animated faces into "
-                "photographic ones" if a.type in ("anime", "cgi") else
+                f"for {TYPE_NAMES[a.type]}: it would turn drawn faces into photographic ones"
+                if a.type == "anime" else
                 "with --ai-blend 0 (it works on the AI-upscaled frames, none of which are used "
                 "then)"))
         a.faces = None
+    elif a.faces is not None and a.type == "cgi" and not a.analyze:
+        print("NOTE: --faces on 3D animation: its model was trained on photos, so characters' "
+              "faces can come out photographic. Check a clip first (--clip ... --upscale)")
     info = vhs_info if a.type == "vhs" else probe_or_exit(a.input)
     sar_txt = f"{info['sar'].numerator}:{info['sar'].denominator}"
     print(f"Source: {info['w']}x{info['h']}, SAR {sar_txt}, "
@@ -6232,7 +6916,18 @@ def main():
     if not a.fast:
         check_upscaler(a)       # (exits if the model's files are broken or the GPU fails)
     if a.faces:
-        faces_check(a)          # (exits with what to install or download if something's missing)
+        try:
+            faces_check(a)      # (exits with what to install or download if something's missing)
+        except FacesUnavailable as e:
+            # (turned on by itself: the movie goes on without it, and says how to get it)
+            first, _, rest = str(e).partition("\n")
+            print("NOTE: face restoration is skipped for this movie: "
+                  + first.replace("--faces needs", "it needs").rstrip(".") + "."
+                  + (f"\n{rest}" if rest else "")
+                  + "\n  (This movie goes on without faces, and is saved that way: to add them "
+                    "later, install what is missing and start the movie over by deleting its "
+                    "_work folder. --no-faces hides this note.)", flush=True)
+            a.faces = a.faces_auto = None
 
     if a.fps is None and a.type == "vhs":
         if a.mode == "telecine":
@@ -6335,6 +7030,11 @@ def main():
     # started before that keeps its way, so its chunks match
     prev = previous_settings(a)
     a.rgb_interp = not a.fast and not (prev and "rgb" not in prev)
+    # less AI in crowds and other busy detail (see DETAIL_BLEND): not for drawn animation (its
+    # ink lines are dense detail the anime model is made for), and a movie started before keeps
+    # its way, so its chunks match
+    a.detail_blend = (not a.fast and a.type != "anime" and a.ai_blend < 1
+                      and not a.no_detail_blend and not (prev and "detail_blend" not in prev))
     # black bars of a widescreen movie: cut off before the upscale, put back after it (see
     # detect_bars). A movie started earlier keeps what it started with (its chunks must match)
     a.crop_rows, a.crop_src_h = 0, info["h"]
@@ -6360,6 +7060,10 @@ def main():
               chunk=a.chunk_frames, fast=a.fast, dar=a.dar, test=a.test, enc=" ".join(a.enc), w=a.out_w,
               denoise=a.denoise, ai_blend=a.ai_blend, smooth=a.smooth, sharpen=a.sharpen,
               **({"rgb": "interp"} if a.rgb_interp else {}),
+              **({"detail_blend": "{sigma}:{lo}:{hi}:{low}".format(
+                  **{**DETAIL_BLEND, "low": DETAIL_BLEND["low_blend"]
+                     if a.busy_blend is None else a.busy_blend})}
+                 if a.detail_blend else {}),
               **({"crop": a.crop_rows} if a.crop_rows else {}),
               **({"stabilize": a.stab_tf} if a.stabilize else {}),
               # (CodeFormer's fidelity: GFPGAN has none)
@@ -6404,11 +7108,22 @@ def main():
             hint += f" (to continue it as it was started, add --mode {old['mode']})"
         if "faces" in changed:
             was_faces = str(old.get("faces") or "").split()
-            hint += (" (it was started without --faces)" if not was_faces else
-                     f" (it was started with --faces {was_faces[1]}"
+            hint += (" (it was started without face restoration: leave out --faces, or add "
+                     "--no-faces)" if not was_faces else
+                     f" (it was started with face restoration (--faces {was_faces[1]}"
                      + (f" --face-model {was_faces[0]}" if was_faces[0] != FACE_MODEL else "")
-                     + (f" and CodeFormer fidelity {was_faces[2]}" if len(was_faces) > 2
-                        and float(was_faces[2]) != FACE_FIDELITY else "") + ")")
+                     + (f", CodeFormer fidelity {was_faces[2]}" if len(was_faces) > 2
+                        and float(was_faces[2]) != FACE_FIDELITY else "")
+                     + "): to continue it, leave out --no-faces and any other --faces / "
+                       "--face-model, with its packages and model files working)")
+        if "detail_blend" in changed:
+            was_db = str(old.get("detail_blend") or "").split(":")
+            hint += (" (it was started without the crowd/busy-detail blend: add "
+                     "--no-detail-blend)" if len(was_db) < 4 else
+                     f" (it was started with --busy-blend {was_db[3]})"
+                     if fp.get("detail_blend") else
+                     " (it was started with the crowd/busy-detail blend: leave out "
+                     "--no-detail-blend)")
         sys.exit(f"Settings or input changed since the last run in '{work}': "
                  f"{', '.join(changed)}{hint}. "
                  + (f"Delete the folder '{work.resolve()}' to start this movie fresh." if queue
@@ -6515,8 +7230,7 @@ def main():
     encodings, reading, current = [], None, None    # [(Background, Chunk)] / (Background, Chunk) / Chunk
     last_enc = [0.0]            # seconds the last finished chunk's encode took
     enc_limit = max(1, getattr(a, "encode_jobs", None) or 1)    # encodes at once (--encode-jobs)
-    if a.faces:
-        enc_limit = 1           # (a face restoration is heavy on the GPU: one at a time)
+    # (with faces, the face restorations of two chunks take turns: FACE_LOCK)
 
     def claim(keep=0):
         with lock:
@@ -6994,7 +7708,7 @@ def main():
 VALUE_OPTS = ("--type", "--mode", "--model", "--scale", "--height", "--dar", "--fps",
               "--chunk-frames", "--test", "--esrgan", "--gpu", "--tile", "--gpu-threads",
               "--gpu-jobs", "--encode-jobs", "--engine",
-              "--ai-blend", "--smooth",
+              "--ai-blend", "--busy-blend", "--smooth",
               "--sharpen", "--work", "--chroma-delay", "--mask", "--face-model", "--face-models")
 STOPPED = (130, 3221225786)     # a run stopped by Ctrl+C; Windows "terminated by Ctrl+C"
 VIDEO_EXT = (".mkv", ".mp4", ".m4v")
@@ -7188,6 +7902,8 @@ def is_upscaled_output(path):
     except ValueError:
         return False
     return any(OUTPUT_TAG in str(v) for v in tags.values())
+
+
 TYPE_DIRS = {"live": "live", "live action": "live", "live-action": "live", "anime": "anime",
              "cgi": "cgi", "3d": "cgi", "vhs": "vhs"}
 
@@ -7796,8 +8512,12 @@ if __name__ == "__main__":
               '       python dvd_upscale.py --all          (every movie in this folder)\n'
               '       python dvd_upscale.py --commands     (every command and option)')
         sys.exit(0)
+    phone_port = phone_args(sys.argv)              # (the phone page: before anything parses argv)
     queue_mode = any(w in ("--queue", "--all") or w.startswith(("--queue=", "--all="))
                      for w in sys.argv[1:])
+    if phone_port:
+        phone_start(phone_port, queue_mode)
+    phone_setup(queue_mode)
     try:
         if queue_mode:
             queue_main(sys.argv[1:])
