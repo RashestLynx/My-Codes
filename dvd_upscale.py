@@ -7742,8 +7742,13 @@ if __name__ == "__main__":
         except KeyboardInterrupt:
             sys.exit(130)
         sys.exit(0)
-    if len(sys.argv) == 1 or sys.argv[1:] in (["--commands"], ["commands"]):
-        print(commands_text())      # plain "python dvd_upscale.py" shows the cheat sheet too
+    if sys.argv[1:] in (["--commands"], ["commands"]):
+        print(commands_text())      # the cheat sheet: only when asked for
+        sys.exit(0)
+    if len(sys.argv) == 1:
+        print('Usage: python dvd_upscale.py "Movie.mkv"    (upscale one movie)\n'
+              '       python dvd_upscale.py --all          (every movie in this folder)\n'
+              '       python dvd_upscale.py --commands     (every command and option)')
         sys.exit(0)
     queue_mode = any(w in ("--queue", "--all") or w.startswith(("--queue=", "--all="))
                      for w in sys.argv[1:])
