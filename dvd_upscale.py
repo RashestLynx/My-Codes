@@ -5181,6 +5181,81 @@ def default_output(src, base=None, height=1080):
         return src.parent / f"{height}p Upscale" / name
 
 
+def probe_vulkan_gpus():
+    """[(index, name)] of the Vulkan GPUs, as ncnn numbers them (the numbers -g takes). Asked
+    in a process of its own: ncnn loaded into this one would crash it when it exits (the
+    0xC0000005 the upscaler worker has to dodge, see the end of the file). [] if unknown."""
+    if not ncnn_available():
+        return []
+    code = ("import ncnn\n"
+            "for i in range(ncnn.get_gpu_count()):\n"
+            "    print(i, ncnn.get_gpu_info(i).device_name())\n")
+    try:
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=60,
+                           stdin=subprocess.DEVNULL, text=True, errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [(int(m[1]), m[2].strip()) for m in
+            (re.fullmatch(r"(\d+) (.+)", x.strip()) for x in r.stdout.splitlines()) if m]
+
+
+def gpu_class(name):
+    """high / mid / low from a GPU's name: what tile size and settings suit it."""
+    n = name.lower()
+    if re.search(r"\b(graphics|uhd|iris|vega|basic|microsoft)\b", n) and "rtx" not in n:
+        return "low"            # integrated graphics, a software adapter
+    if re.search(r"rtx\s*(30|40|50)\d\d|rtx\s*a\d|\brx\s*[679]\d{3}", n):
+        return "high"
+    if re.search(r"gtx|rtx|radeon|\brx\b|arc", n):
+        return "mid"
+    return "low"
+
+
+def inject_gpu_hardware_profile(a):
+    """First run on a computer: find the GPUs, pick the settings that suit the main one, test
+    that it survives the upscaler, and save it all in ncnn_opts.json (one profile for every
+    later run: nothing is asked again, and an old profile is never overwritten). The same file
+    --ncnn-stress / --ncnn-bench / --ncnn-bench-gpu write, and the upscaler reads."""
+    saved = ncnn_saved()
+    if "gpu" in saved and "tile" in saved:
+        say(f"Hardware profile: GPU {saved['gpu']}"
+            + (f" + helper {saved['helper']}" if saved.get("helper") is not None else "")
+            + f", tile {saved['tile'] or 'automatic'}, set '{saved.get('set', 'base')}' "
+            f"(saved in {ncnn_opts_file().name}; delete it to profile again)")
+        return
+    gpus = probe_vulkan_gpus()
+    if not gpus:
+        return                  # (nothing learned: nothing saved, the defaults stay)
+    say("Hardware profile (first run on this computer):")
+    for idx, name in gpus:
+        say(f"  GPU {idx}: {name} ({gpu_class(name)})")
+    # the GPU the movie runs on: the one given, else the first that isn't integrated, else 0
+    if a.gpu_given:
+        main_gpu = int(str(a.gpu).split(",")[0])
+    else:
+        main_gpu = next((i for i, n in gpus if gpu_class(n) != "low"), gpus[0][0])
+    name = dict(gpus).get(main_gpu, "")
+    kind = gpu_class(name)
+    tile = {"high": 1024, "mid": 200, "low": 64}[kind]
+    say(f"  -> GPU {main_gpu} ({kind}): "
+        + {"high": "whole frames", "mid": "200-pixel tiles", "low": "64-pixel tiles"}[kind])
+    new = {**saved, "gpu": main_gpu, "tile": tile}
+    # (no helper GPU: a weak second GPU is slower than none and some drivers fault on it;
+    # --ncnn-bench-gpu measures it and saves one if it is worth having)
+    new.pop("helper", None)
+    write_durably(ncnn_opts_file(), json.dumps(new, indent=1))
+    a.gpu = str(main_gpu) if not a.gpu_given else a.gpu
+    # an NVIDIA GPU on a driver that resets it needs ncnn options turned off: found once, here
+    if "nvidia" in name.lower() and "set" not in saved:
+        say("  Testing which ncnn settings this GPU survives (a few minutes, once)...")
+        try:
+            if ncnn_stress_main(["--gpu", str(main_gpu)]) != 0:
+                say("  (no setting survived: see above; the run goes on with the defaults)")
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            say(f"  (the test couldn't run: {e})")
+    say(f"  Saved in {ncnn_opts_file().name}.")
+
+
 def check_values(a):
     """Option values that would only fail later (after detection, or on every movie of a batch)."""
     if a.tile is not None:
@@ -5191,6 +5266,7 @@ def check_values(a):
         if tile < 0:
             sys.exit("--tile must be 0 (automatic) or a positive number of pixels")
         a.tile = str(tile)
+    a.gpu_given = a.gpu is not None
     if a.gpu is None:
         # (the faster GPU found by --ncnn-bench-gpu, else 0; --gpu on the command line wins)
         saved_gpu, helper = ncnn_saved().get("gpu"), ncnn_saved().get("helper")
@@ -5295,6 +5371,9 @@ def build_parser():
                         "picture is the same either way. When a chunk fails with the default, it "
                         "is tried again one step lower (anime 6, 4, 2, 1; live action 1), and "
                         "the rest of the run keeps that")
+    p.add_argument("--no-profile", action="store_true",
+                   help="don't profile the GPUs on the first run (the profile is saved in "
+                        "ncnn_opts.json, and an existing one is never overwritten)")
     p.add_argument("--no-skip-black", dest="no_skip_black", action="store_true",
                    help="upscale black frames too (by default a frame that is black through and "
                         "through is not sent to the upscaler: its upscale is black as well)")
@@ -5442,6 +5521,8 @@ USEFUL EXTRAS (add to any command above)
   --gpu 1 / 0,1      another GPU, or both (the default is GPU 0; see GPU SET-UP AND SPEED)
   --gpu-threads 4    frames the GPU works on at once (anime/camcorder default 8, lowered to
                      6, 4, 2, 1 by itself if a chunk fails; live action 2, then 1); same picture
+  --no-profile       don't profile the GPUs on the first run on a computer (the profile, the
+                     settings the GPU survives and the tile, is saved in ncnn_opts.json once)
   --no-skip-black    upscale black frames too (by default a frame that is exactly all black is
                      not sent to the upscaler: black in, black out; fades are still upscaled)
   --no-crop          don't cut the black bars of a widescreen movie off before the upscale (by
@@ -5545,6 +5626,8 @@ def main():
     if find("ffmpeg"):
         check_ffmpeg()
     resolve_type(a, find)
+    if not a.fast and not a.analyze and a.type != "vhs" and not a.no_profile:
+        inject_gpu_hardware_profile(a)
     # model, scale, chunk frames, pre-denoise (hqdn3d), ai blend, post smoothing, sharpen
     presets = {"anime": ("realesr-animevideov3", 2, 1440, "2:1.5:3:2.5", 1.0, 0, 0.6),
                # x2plus: on small DVD faces x4plus draws eyes as black outlined almonds and
