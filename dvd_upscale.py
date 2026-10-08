@@ -2135,6 +2135,116 @@ def ncnn_bench_gpu_main(argv):
     return 0
 
 
+def ncnn_auto_main(argv):
+    """python dvd_upscale.py --ncnn-auto [MOVIE] [--gpu N] [--skip-gpu-test] [--no-test-run]:
+    everything to set the GPU up and see how fast it is, in one go: the old saved settings
+    (gpu_steps.json, ncnn_opts.json) cleared; --ncnn-stress (the options the GPU survives);
+    --ncnn-bench (whole frames / fp16, the fastest with the same picture); --ncnn-bench-gpu
+    (which GPU is faster, saved as the default); then a --test 60 run of the movie while the
+    GPU is watched (nvidia-smi), and a summary with the time the whole movie will take."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-auto")
+    p.add_argument("movie", nargs="?")
+    p.add_argument("--gpu", default=DEFAULT_GPU)
+    p.add_argument("--skip-gpu-test", action="store_true")
+    p.add_argument("--no-test-run", action="store_true")
+    w = p.parse_args(argv)
+    movie = [w.movie] if w.movie else []
+    summary = []
+
+    def step(n, text):
+        print(f"\n=== {n}/5  {text} ===", flush=True)
+
+    step(1, "clearing the old saved settings")
+    for f in (gpu_step_file(), ncnn_opts_file()):
+        try:
+            f.unlink()
+            print(f"  deleted {f.name}")
+        except OSError:
+            print(f"  no {f.name} (fine)")
+    step(2, f"finding the options GPU {w.gpu} survives (--ncnn-stress)")
+    if ncnn_stress_main(["--gpu", w.gpu]) != 0:
+        print("\nStopped: no setting survived (see above). Nothing more was tried.")
+        return 1
+    summary.append(f"settings the GPU survives: {ncnn_saved().get('set')}")
+    step(3, "the fastest settings with the same picture (--ncnn-bench)")
+    if ncnn_bench_main([*movie, "--gpu", w.gpu]) == 0:
+        saved = ncnn_saved()
+        tile = int(saved.get("tile") or 0)
+        summary.append(f"fastest safe: {saved.get('set')}, "
+                       + ("whole frames" if tile > 720 else f"{tile or 200}-pixel tiles"))
+    else:
+        summary.append("the speed-up test didn't finish: the settings of step 2 are kept")
+    step(4, "which GPU is faster (--ncnn-bench-gpu)")
+    if w.skip_gpu_test:
+        print("  skipped")
+    elif ncnn_bench_gpu_main(movie) == 0:
+        summary.append(f"default GPU: {ncnn_saved().get('gpu')}")
+    else:
+        summary.append(f"default GPU: {w.gpu} (the GPU test didn't finish)")
+    step(5, "timing a 60-second test run, GPU watched")
+    if w.no_test_run or not w.movie:
+        print("  skipped" + ("" if w.no_test_run else " (give a movie to time it)"))
+    else:
+        util, temps, watts, clocks, seen = [], [], [], [], [False]
+        stop = threading.Event()
+
+        def watch():
+            while not stop.wait(2):
+                try:
+                    r = subprocess.run(
+                        ["nvidia-smi", "-i", str(ncnn_saved().get("gpu", w.gpu)),
+                         "--query-gpu=utilization.gpu,temperature.gpu,power.draw,clocks.sm",
+                         "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                        timeout=10)
+                    v = [float(x) for x in r.stdout.strip().split(",")]
+                    util.append(v[0]), temps.append(v[1]), watts.append(v[2]), clocks.append(v[3])
+                except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+                    pass
+        threading.Thread(target=watch, daemon=True).start()
+        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), w.movie,
+                                 "--test", "60"], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        out = b""
+        while True:
+            chunk = os.read(proc.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            out += chunk
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+        proc.wait()
+        stop.set()
+        text = out.decode("utf-8", "replace")
+        secs = re.findall(r"(\d+)s/chunk", text)
+        bad = len(GPU_ERRORS.findall(text))
+        if proc.returncode or not secs:
+            summary.append(f"test run: didn't finish (exit code {proc.returncode})")
+        else:
+            spc = int(secs[-1])
+            rc, dur = capture(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                               "-of", "csv=p=0", w.movie])
+            line = f"test run: {spc} s per 480-frame chunk ({480 / spc:.1f} frames/s)"
+            try:
+                chunks = math.ceil(float(dur.strip()) * 24000 / 1001 / 480)
+                line += f"; this movie: about {chunks * spc / 3600:.1f} hours"
+            except ValueError:
+                pass
+            summary.append(line)
+        summary.append(f"GPU errors in the test run: {bad}" if bad else "no GPU errors in the test run")
+        if util:
+            summary.append(f"GPU while upscaling: {sum(util) / len(util):.0f}% busy, "
+                           f"up to {max(temps):.0f} C, {sum(watts) / len(watts):.0f} W, "
+                           f"{sum(clocks) / len(clocks):.0f} MHz"
+                           + ("  (well under 90% busy: something else is the limit)"
+                              if sum(util) / len(util) < 80 else ""))
+    print("\n=== Summary ===")
+    for x in summary:
+        print("  " + x)
+    print("Run the movie with: python dvd_upscale.py <movie> <output>   (these settings are used "
+          "automatically)")
+    return 0
+
+
 def ncnn_upscaler_main(argv):
     """python dvd_upscale.py --ncnn-upscaler -i IN -o OUT -n MODEL -s SCALE [-m MODELS] [-t TILE]
     [-g GPU] [-j L:P:S] [-f png]: realesrgan-ncnn-vulkan's job done with the current ncnn from
@@ -4865,6 +4975,12 @@ USEFUL EXTRAS (add to any command above)
 
 GPU SET-UP AND SPEED (run these once from the script's folder; each saves what it finds in
 ncnn_opts.json next to dvd_upscale.py, and every later run uses it)
+  python dvd_upscale.py --ncnn-auto "CGI\Movie.mkv"
+        ALL OF THE BELOW IN ONE GO (about 15-25 minutes, then nothing more to do): clears the old
+        saved settings, runs --ncnn-stress, --ncnn-bench and --ncnn-bench-gpu, times a 60-second
+        test run while watching the GPU, and prints a summary with the hours the movie will take.
+        Add --gpu N to set up another GPU, --skip-gpu-test, or --no-test-run. Use it after a
+        driver update, or when GPU resets ("failed -4") come back. The pieces, one by one:
   python dvd_upscale.py --ncnn-stress --gpu 0
         finds the ncnn options your GPU survives (the GPU resets with "vkWaitForFences failed -4"
         or "vkQueueSubmit failed -4" mean it doesn't). Saves e.g. {"set": "nowinograd"}.
@@ -6692,6 +6808,8 @@ if __name__ == "__main__":
         os.environ["PATH"] = _here + os.pathsep + os.environ.get("PATH", "")
     if sys.argv[1:2] == ["--faces-worker"]:          # (a chunk's face restoration: see Chunk)
         sys.exit(faces_worker_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-auto"]:             # (all of the GPU set-up and a timed test)
+        sys.exit(ncnn_auto_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-bench-gpu"]:        # (which GPU is faster)
         sys.exit(ncnn_bench_gpu_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-bench"]:            # (the fastest settings that keep the picture)
