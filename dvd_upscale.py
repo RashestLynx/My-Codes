@@ -1960,7 +1960,8 @@ def ncnn_stress_main(argv):
         print("No option set got through (see the lines above). If they say the GPU was reset: "
               "this driver faults on the current ncnn too, try an older one (before 570).")
         return 1
-    ncnn_opts_file().write_text(json.dumps({"set": good[0][0]}), encoding="utf-8")
+    ncnn_opts_file().write_text(json.dumps({**ncnn_saved(), "set": good[0][0]}),
+                                  encoding="utf-8")
     print(f"Saved '{good[0][0]}' in {ncnn_opts_file().name}: the upscaler uses it from now on.")
     return 0
 
@@ -2050,9 +2051,86 @@ def ncnn_bench_main(argv):
         print("Nothing ran cleanly: the saved settings are unchanged.")
         return 1
     fps, name, tile = max(results)
-    ncnn_opts_file().write_text(json.dumps({"set": name, "tile": tile}), encoding="utf-8")
+    ncnn_opts_file().write_text(json.dumps({**ncnn_saved(), "set": name, "tile": tile}),
+                                  encoding="utf-8")
     print(f"Saved the fastest ({name}, {'whole frames' if tile > 720 else str(tile) + '-pixel tiles'}, "
           f"{fps:.2f} frames/s) in {ncnn_opts_file().name}.")
+    return 0
+
+
+def ncnn_bench_gpu_main(argv):
+    """python dvd_upscale.py --ncnn-bench-gpu [MOVIE] [--gpus 0,1] [--frames 40]: the same frames
+    through the real worker on each GPU (the saved settings), and the fastest one saved in
+    ncnn_opts.json as the GPU used when --gpu isn't given. Also says what both together would
+    be (the movie's helper-GPU mode: --gpu 0,1) when the slower GPU is worth having."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-bench-gpu")
+    p.add_argument("movie", nargs="?")
+    p.add_argument("--gpus", default="0,1")
+    p.add_argument("--frames", type=int, default=40)
+    w = p.parse_args(argv)
+    here = Path(__file__).resolve().parent
+    exe = shutil.which(ESRGAN_DEFAULT) or next((str(f) for f in here.glob(ESRGAN_DEFAULT + "*")), None)
+    models = Path(exe).resolve().parent / "models" if exe else here / "models"
+    saved = ncnn_saved()
+    name = saved.get("set") if saved.get("set") in NCNN_OPT_SETS else "nowinograd"
+    tile = int(saved.get("tile") or 0)
+    gpus = [g.strip() for g in w.gpus.split(",") if g.strip().isdigit()]
+    results = []
+    with tempfile.TemporaryDirectory(prefix="ncnn_gpu_") as d:
+        d = Path(d)
+        (d / "in").mkdir()
+        if w.movie:
+            rc, txt = capture(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                               "-of", "csv=p=0", w.movie])
+            try:
+                at = max(0.0, float(txt.strip()) * 0.4)
+            except ValueError:
+                at = 0.0
+            run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.1f}", "-i", w.movie, "-map",
+                 "0:v:0", "-vf", "scale=iw*sar:ih,setsar=1,scale=720:480", "-frames:v",
+                 str(w.frames), str(d / "in" / "%06d.png")])
+        else:
+            run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                 f"testsrc2=s=720x480:r=24:d={w.frames / 24:.3f}", "-frames:v", str(w.frames),
+                 str(d / "in" / "%06d.png")])
+        n_in = len(list((d / "in").glob("*.png")))
+        for g in gpus:
+            out = d / f"out{g}"
+            out.mkdir()
+            cmd = [sys.executable, Path(__file__).resolve(), "--ncnn-upscaler", "-i", d / "in",
+                   "-o", out, "-n", "realesrgan-x2plus", "-s", "2", "-f", "png", "-j", "1:1:1",
+                   "-g", g, "-m", models] + (["-t", tile] if tile else [])
+            r = subprocess.run([str(c) for c in cmd], capture_output=True,
+                               stdin=subprocess.DEVNULL,
+                               env={**os.environ, "DVD_UPSCALE_NCNN_OPTS": name})
+            text = (r.stdout + r.stderr).decode("utf-8", "replace")
+            files = sorted(out.glob("*.png"))
+            gname = re.search(r"GPU %s (.+?), realesrgan" % g, text)
+            gname = gname.group(1) if gname else "?"
+            if r.returncode == 0 and len(files) == n_in and n_in > 3 \
+                    and not GPU_ERRORS.search(text):
+                times = [f.stat().st_mtime for f in files]
+                fps = (len(times) - 1) / max(1e-6, max(times) - min(times))
+                print(f"  GPU {g} ({gname}): {fps:.2f} frames/s", flush=True)
+                results.append((fps, g))
+            else:
+                print(f"  GPU {g} ({gname}): didn't run cleanly (exit code {r.returncode})",
+                      flush=True)
+            time.sleep(10)
+    if not results:
+        print("No GPU ran cleanly: nothing saved.")
+        return 1
+    fps, g = max(results)
+    saved["gpu"] = int(g)
+    ncnn_opts_file().write_text(json.dumps(saved), encoding="utf-8")
+    print(f"GPU {g} is the faster one: saved as the default in {ncnn_opts_file().name} "
+          "(--gpu still overrides it).")
+    if len(results) > 1:
+        slow = min(results)[0]
+        print(f"The other is {slow / fps * 100:.0f}% as fast"
+              + ("; using both (--gpu 0,1) could add about that much, if the script's "
+                 "helper-GPU mode keeps it busy." if slow / fps >= 0.25 else
+                 ": not worth adding as a helper."))
     return 0
 
 
@@ -4543,6 +4621,9 @@ def check_values(a):
         if tile < 0:
             sys.exit("--tile must be 0 (automatic) or a positive number of pixels")
         a.tile = str(tile)
+    if a.gpu is None and ncnn_saved().get("gpu") is not None:
+        # (the faster GPU, found by --ncnn-bench-gpu; --gpu on the command line still wins)
+        a.gpu = str(ncnn_saved()["gpu"])
     if a.gpu is not None:
         devices = re.sub(r"\s+", "", str(a.gpu)).split(",")
         if not devices or any(not re.fullmatch(r"[0-9]+", device) for device in devices):
@@ -6582,6 +6663,8 @@ if __name__ == "__main__":
         os.environ["PATH"] = _here + os.pathsep + os.environ.get("PATH", "")
     if sys.argv[1:2] == ["--faces-worker"]:          # (a chunk's face restoration: see Chunk)
         sys.exit(faces_worker_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-bench-gpu"]:        # (which GPU is faster)
+        sys.exit(ncnn_bench_gpu_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-bench"]:            # (the fastest settings that keep the picture)
         sys.exit(ncnn_bench_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-stress"]:           # (find the ncnn options the GPU survives)
