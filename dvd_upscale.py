@@ -1211,6 +1211,55 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
         raise subprocess.CalledProcessError(p.returncode, f"{a.esrgan} (upscaler)")
 
 
+def png_is_black(path):
+    """A frame that is black through and through: every pixel 0. Exact: a PNG whose filtered
+    rows are all zeros is all zeros whatever the filters (each pixel is built from zero
+    neighbours), so decoding it is just one decompression. Only small files are looked at (a
+    black 852x480 frame is a few KB); 8-bit RGB(A) only. Anything else: False (it is upscaled)."""
+    import zlib
+    try:
+        if os.path.getsize(path) > 65536:
+            return False
+        data = Path(path).read_bytes()
+        if data[:8] != b"\x89PNG\r\n\x1a\n":
+            return False
+        pos, idat, w, bpp = 8, [], 0, 0
+        while pos + 8 <= len(data):
+            n, kind = int.from_bytes(data[pos:pos + 4], "big"), data[pos + 4:pos + 8]
+            body = data[pos + 8:pos + 8 + n]
+            if kind == b"IHDR":
+                w, depth, ctype, interlace = (int.from_bytes(body[0:4], "big"), body[8], body[9],
+                                              body[12])
+                if depth != 8 or ctype not in (2, 6) or interlace:
+                    return False
+                bpp = 3 if ctype == 2 else 4
+            elif kind == b"IDAT":
+                idat.append(body)
+            pos += 12 + n
+        if not idat or not w:
+            return False
+        raw, row = zlib.decompress(b"".join(idat)), 1 + w * bpp
+        if len(raw) % row:
+            return False
+        # (the first byte of each row is its filter type, not a pixel)
+        return all(not any(raw[i + 1:i + row]) for i in range(0, len(raw), row))
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def write_black_png(path, w, h):
+    """An all-black 8-bit RGB PNG of w x h pixels."""
+    import zlib
+    raw = bytes(1 + w * 3) * h
+
+    def chunk(kind, body):
+        return (len(body).to_bytes(4, "big") + kind + body
+                + (zlib.crc32(kind + body) & 0xFFFFFFFF).to_bytes(4, "big"))
+    Path(path).write_bytes(b"\x89PNG\r\n\x1a\n"
+                          + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                          + chunk(b"IDAT", zlib.compress(raw, 1)) + chunk(b"IEND", b""))
+
+
 def png_size(path):
     with open(path, "rb") as f:
         head = f.read(24)
@@ -3091,7 +3140,7 @@ class Chunk:
     def clear_frames(self):
         # GBs of frames that a retry makes again anyway: don't leave them filling the drive
         # (upscaler_log.txt stays, for a look at what went wrong)
-        for d in ("in", "in_rest", "out", "faces"):
+        for d in ("in", "in_rest", "in_black", "out", "faces"):
             shutil.rmtree(self.tmp / d, ignore_errors=True)
 
     def no_video(self):
@@ -3161,6 +3210,23 @@ class Chunk:
                     f"this chunk's upscaled frames and has {free / 1e9:.1f} GB: make room (or "
                     "use --work on another drive)")
             watch, t_up0 = (GpuWatch() if not self.lane else None), time.time()
+            # black frames upscale to black frames: not sent to the upscaler. Their inputs are
+            # moved out of in/ (back after the upscale, for the checks and the blend) and their
+            # outputs written now as black PNGs, so the upscaler's count of frames is unchanged
+            blacks = set()
+            if not getattr(a, "no_skip_black", False):
+                found = [f.name for f in sorted((tmp / "in").glob("*.png")) if png_is_black(f)]
+                if len(found) == n_in:
+                    found = found[:-1]          # (the upscaler is given at least one frame)
+                if found:
+                    (tmp / "in_black").mkdir(exist_ok=True)
+                    write_black_png(tmp / "black.png", w * a.scale, h * a.scale)
+                    for name in found:
+                        os.replace(tmp / "in" / name, tmp / "in_black" / name)
+                        shutil.copyfile(tmp / "black.png", tmp / "out" / name)
+                    (tmp / "black.png").unlink()
+                    blacks = set(found)
+            self.black_frames = len(blacks)
             try:
                 attempt, src, kept = 0, tmp / "in", 0
                 while True:
@@ -3175,6 +3241,9 @@ class Chunk:
                                                "(GPU out of memory? try --tile 128)"
                                                + ("" if self.lane else upscaler_log_tail(
                                                    tmp / "upscaler_log.txt")))
+                        for name in blacks:     # (the inputs back where the checks look for them)
+                            if (tmp / "in_black" / name).exists():
+                                os.replace(tmp / "in_black" / name, tmp / "in" / name)
                         check_frames(a, tmp, n_in, strict=bool(self.lane))
                         if not self.lane:
                             FRAMES_OK[0] += n_in - kept
@@ -3270,12 +3339,15 @@ class Chunk:
             # where the upscale's seconds went: the upscaler starting (to its first frame), the
             # frames at full speed, and what came after the last one (checks)
             try:
-                times = sorted(f.stat().st_mtime for f in (tmp / "out").glob("*.png"))
+                times = sorted(f.stat().st_mtime for f in (tmp / "out").glob("*.png")
+                               if f.name not in blacks)
                 if len(times) > 10 and not self.lane:
                     self.up_info = (f"start {times[0] - t_up0:.0f}s, "
                                     f"{(len(times) - 1) / max(1e-6, times[-1] - times[0]):.2f} "
                                     f"frames/s, after {time.time() - times[-1]:.0f}s")
                     self.gpu_info = watch.summary() if watch else ""
+                if blacks and not self.lane:
+                    self.up_info += f"{', ' if self.up_info else ''}{len(blacks)} black frames not upscaled"
             except OSError:
                 pass
             if watch:
@@ -5223,6 +5295,9 @@ def build_parser():
                         "picture is the same either way. When a chunk fails with the default, it "
                         "is tried again one step lower (anime 6, 4, 2, 1; live action 1), and "
                         "the rest of the run keeps that")
+    p.add_argument("--no-skip-black", dest="no_skip_black", action="store_true",
+                   help="upscale black frames too (by default a frame that is black through and "
+                        "through is not sent to the upscaler: its upscale is black as well)")
     p.add_argument("--no-crop", action="store_true",
                    help="don't cut the black bars of a widescreen movie off before the upscale "
                         "(they are looked for by default: the upscaler then does only the "
@@ -5367,6 +5442,8 @@ USEFUL EXTRAS (add to any command above)
   --gpu 1 / 0,1      another GPU, or both (the default is GPU 0; see GPU SET-UP AND SPEED)
   --gpu-threads 4    frames the GPU works on at once (anime/camcorder default 8, lowered to
                      6, 4, 2, 1 by itself if a chunk fails; live action 2, then 1); same picture
+  --no-skip-black    upscale black frames too (by default a frame that is exactly all black is
+                     not sent to the upscaler: black in, black out; fades are still upscaled)
   --no-crop          don't cut the black bars of a widescreen movie off before the upscale (by
                      default they are found, cut, upscaled without and put back: 2.39:1 movies
                      take about a quarter less GPU work, the same picture; a movie already
