@@ -2314,7 +2314,8 @@ def ncnn_auto_main(argv):
     step(5, "every model on the same frames (--ncnn-models)")
     if w.skip_model_test or not w.movie:
         print("  skipped" + ("" if w.skip_model_test else " (give a movie to test the models)"))
-    elif ncnn_models_main([w.movie, "--gpu", str(ncnn_saved().get("gpu", w.gpu))]) == 0:
+    elif ncnn_models_main([w.movie, "--gpu", str(ncnn_saved().get("gpu", w.gpu)),
+                           "--save"]) == 0:
         summary.append("models compared: see the table above and model_compare.png")
     else:
         summary.append("the model comparison didn't finish")
@@ -2399,7 +2400,12 @@ def ncnn_models_main(argv):
     p.add_argument("movie")
     p.add_argument("--gpu", default=None)
     p.add_argument("--frames", type=int, default=6)
+    p.add_argument("--save", action="store_true",
+                   help="save the best model for live action / 3D animation in ncnn_opts.json: "
+                        "the upscale then uses it (10 frames at least)")
     w = p.parse_args(argv)
+    if w.save:
+        w.frames = max(w.frames, 10)
     here = Path(__file__).resolve().parent
     exe = shutil.which(ESRGAN_DEFAULT) or next((str(f) for f in here.glob(ESRGAN_DEFAULT + "*")), None)
     models = Path(exe).resolve().parent / "models" if exe else here / "models"
@@ -2453,6 +2459,7 @@ def ncnn_models_main(argv):
         run(["ffmpeg", "-y", "-v", "error", "-i", str(d / "lr" / "%06d.png"), "-vf",
              "scale=720:480:flags=lanczos", str(plain / "%06d.png")])
         rows = [("plain resize (baseline)", *score(plain), None, plain)]
+        by_model = {}
         for mname, k in found.items():
             out, fit = d / f"out_{mname}", d / f"fit_{mname}"
             out.mkdir()
@@ -2477,6 +2484,7 @@ def ncnn_models_main(argv):
             run(["ffmpeg", "-y", "-v", "error", "-i", str(out / "%06d.png"), "-vf",
                  "scale=720:480:flags=lanczos", str(fit / "%06d.png")])
             rows.append((f"{mname} (x{k})", *score(fit), fps, fit))
+            by_model[mname] = rows[-1]
             time.sleep(5)
         ref_speed = next((r[3] for r in rows if r[0].startswith("realesrgan-x2plus")), None)
         print(f"\n  {'model':32s} {'SSIM':>7s} {'PSNR':>7s}   speed (x2plus = 1.0)")
@@ -2502,6 +2510,46 @@ def ncnn_models_main(argv):
         print(f"\n  Closest to the original: {best[0]} (SSIM {best[1]:.4f}). Look at "
               "model_compare.png before choosing: a higher score is a truer picture, not always "
               "a nicer one.")
+    if w.save:
+        return save_best_model(by_model)
+    return 0
+
+
+QUALITY_MARGIN = 0.002      # SSIM a model must beat realesrgan-x2plus by to replace it
+QUALITY_MIN_SPEED = 0.3     # ...and it must run at least this fast against it
+
+
+def save_best_model(by_model):
+    """From --ncnn-models --save: the model for live action and 3D animation. Only the ones
+    made for photographs (x2plus, x4plus, the general video model): the anime ones are trained
+    on drawings. realesrgan-x2plus is what those types use already, so another model takes
+    over only when it is clearly truer to the original (SSIM better by QUALITY_MARGIN) and not
+    much slower (at least QUALITY_MIN_SPEED of its speed: x4plus does 4x the work). The choice
+    is saved as best_model in ncnn_opts.json; a movie already started keeps its own model."""
+    photo = {m: r for m, r in by_model.items()
+             if "anime" not in m and re.search(r"x2plus|x4plus|general", m)}
+    if not photo:
+        print("  No model for live action in the models folder: nothing saved.")
+        return 1
+    base = photo.get("realesrgan-x2plus")
+    pick, why = base and "realesrgan-x2plus", "the default for live action and 3D animation"
+    if base is None:
+        pick = max(photo, key=lambda m: photo[m][1])
+        why = "the only choice it could test is the closest to the original"
+    else:
+        for m, r in sorted(photo.items(), key=lambda kv: -kv[1][1]):
+            if m == "realesrgan-x2plus":
+                break
+            slow = (r[3] or 0) / max(1e-6, base[3] or 1e-6)
+            if r[1] - base[1] >= QUALITY_MARGIN and slow >= QUALITY_MIN_SPEED:
+                pick, why = m, (f"truer than realesrgan-x2plus by {r[1] - base[1]:.4f} SSIM, "
+                                f"at {slow:.1f}x its speed")
+                break
+    saved = ncnn_saved()
+    saved["best_model"] = pick
+    ncnn_opts_file().write_text(json.dumps(saved), encoding="utf-8")
+    print(f"  Saved best_model = {pick} ({why}). Live action and 3D animation use it from now "
+          f"on (a movie already started keeps its model; --model overrides).")
     return 0
 
 
@@ -5670,6 +5718,11 @@ ncnn_opts.json next to dvd_upscale.py, and every later run uses it)
         test run while watching the GPU, and prints a summary with the hours the movie will take.
         Add --gpu N to set up another GPU, --skip-gpu-test, --skip-model-test or --no-test-run. Use it after a
         driver update, or when GPU resets ("failed -4") come back. The pieces, one by one:
+  python dvd_upscale.py --ncnn-models "CGI\Movie.mkv" --save
+        THE BEST-QUALITY CHOICE, used by the automatic upscale: the same test, and the model
+        that is clearly truer to the original than realesrgan-x2plus (and not much slower) is
+        saved as best_model for live action and 3D animation; else x2plus stays. Part of
+        --ncnn-auto. A movie already started keeps its model; --model overrides.
   python dvd_upscale.py --ncnn-models "CGI\Movie.mkv"
         tests EVERY model in the models folder on the same frames of the movie (shrunk to half,
         upscaled back, compared with the original: SSIM/PSNR against a plain resize), prints a
@@ -5839,6 +5892,21 @@ def main():
             sys.exit(f"Missing tool: {t}")
     if not a.fast and not a.analyze:
         a.esrgan_path = find(a.esrgan)
+        best = ncnn_saved().get("best_model")
+        if best and user_model is None and a.type in ("cgi", "live") \
+                and best != a.model and previous_settings(a) is None:
+            # (--ncnn-models --save found a model truer to the original for these types)
+            keep = (a.model, a.scale)
+            a.model, a.scale = best, 2 if "x2plus" in best else 4
+            if model_installed(a):
+                print(f"Best-quality model for {TYPE_NAMES[a.type]}: {best} "
+                      f"(found by --ncnn-models --save; --model overrides)")
+                if "x4plus" in best:           # tame its face artifacts, as for the fallback
+                    a.ai_blend = 0.5 if user_blend is None else user_blend
+                    a.sharpen = 0.2 if user_sharpen is None else user_sharpen
+                    a.chunk_frames = user_chunk or 480
+            else:
+                a.model, a.scale = keep
         if a.model == "realesr-animevideov3" and user_model is None and not model_installed(a):
             # a folder set up for live action only: the next best model that is there
             for m in ("realesrgan-x2plus", "realesrgan-x4plus"):
