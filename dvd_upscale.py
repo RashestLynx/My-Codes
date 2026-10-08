@@ -5796,10 +5796,34 @@ def main():
                      "one another output name (or delete that file first if it should be "
                      "replaced).")
     if not a.analyze:
+        out_dir = Path(a.output).resolve().parent
         try:
-            Path(a.output).resolve().parent.mkdir(parents=True, exist_ok=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             sys.exit(f"Can't create the output folder '{Path(a.output).parent}': {e}")
+        # the output file is only written at the very end, after the chunks are joined: a
+        # folder that can't be written to would fail after hours of upscaling. A small file made
+        # and removed now shows it (read-only folder, a drive that went away, a locked share)
+        probe_file = out_dir / f".write_test_{os.getpid()}.tmp"
+        try:
+            probe_file.write_text("test", encoding="utf-8")
+        except OSError as e:
+            sys.exit(f"Can't write to the output folder '{out_dir}': {e}\n"
+                     "Give the output a name in another folder (the second argument, "
+                     'for example "D:\\Movies\\Movie 1080p.mkv").')
+        finally:
+            probe_file.unlink(missing_ok=True)
+        # the finished movie is about 10 Mbit/s (more for --hevc 10-bit: less): its size is
+        # a guess, a warning only
+        try:
+            secs = a.test if a.test else (media_duration(Path(a.input)) or 0)
+            need = max(1e9, secs * 1.25e6 * 1.3)
+            free = shutil.disk_usage(out_dir).free
+            if free < need:
+                print(f"WARNING: the drive of the output folder has {free / 1e9:.1f} GB free; "
+                      f"this movie needs about {need / 1e9:.1f} GB there at the end.")
+        except (OSError, TypeError, ValueError):
+            pass            # (a share that can't say how much is free)
         print(f"Saving to: {a.output}")
 
     tools = ["ffmpeg", "ffprobe"] + ([] if a.fast or a.analyze else [a.esrgan])
