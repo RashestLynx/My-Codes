@@ -3090,6 +3090,7 @@ class Chunk:
     def finish(self):
         """Restore the faces (--faces), encode (unless --fast did already) and keep the chunk.
         Returns (path, warning)."""
+        t_enc = time.time()
         if self.encode:
             try:
                 if self.a.faces:
@@ -3098,6 +3099,7 @@ class Chunk:
             except BaseException:
                 self.clear_frames()
                 raise
+        self.enc_secs = time.time() - t_enc
         n = count_frames(self.part)
         flush_to_disk(self.part)
         replace_file(self.part, self.out)
@@ -4902,6 +4904,8 @@ def check_values(a):
         sys.exit("--test must be a number of seconds (0 = the whole movie)")
     if a.gpu_threads is not None and not 1 <= a.gpu_threads <= 16:
         sys.exit("--gpu-threads must be between 1 and 16")
+    if not 1 <= a.encode_jobs <= 4:
+        sys.exit("--encode-jobs must be between 1 and 4")
     if a.gpu_jobs is not None and not 1 <= a.gpu_jobs <= 4:
         sys.exit("--gpu-jobs must be between 1 and 4")
     if a.faces is not None and (not math.isfinite(a.faces) or not 0 < a.faces <= 1):
@@ -4970,6 +4974,10 @@ def build_parser():
                         "picture is the same either way. When a chunk fails with the default, it "
                         "is tried again one step lower (anime 6, 4, 2, 1; live action 1), and "
                         "the rest of the run keeps that")
+    p.add_argument("--encode-jobs", type=int, default=2, metavar="N",
+                   help="chunks encoded at once while the next is upscaled (default 2): the CPU "
+                        "filters and encode of a chunk can take longer than its upscale, and the "
+                        "GPU then waits")
     p.add_argument("--gpu-jobs", type=int, default=None,
                    help="upscalers running at once on each GPU (default 1: the anime and "
                         "camcorder models' 8 frames at once keep the GPU busy already, two of "
@@ -5106,6 +5114,10 @@ USEFUL EXTRAS (add to any command above)
   --gpu 1 / 0,1      another GPU, or both (the default is GPU 0; see GPU SET-UP AND SPEED)
   --gpu-threads 4    frames the GPU works on at once (anime/camcorder default 8, lowered to
                      6, 4, 2, 1 by itself if a chunk fails; live action 2, then 1); same picture
+  --encode-jobs 2    chunks encoded at once while the next is upscaled (default 2; 1 = the old
+                     way). The CPU part of a chunk (filters, encode) can take longer than its
+                     upscale: the progress line then shows "(upscale 140s, encode 175s)" and the
+                     GPU waits. Up to 4 if the encode is still the longer one.
   --gpu-jobs 2       two upscalers at once (default 1): can fill a GPU that waits between
                      chunks, but on an RTX 3060 laptop with the current ncnn it was SLOWER (204
                      against 179 s a chunk): time a --test 60 before using it. Up to 4
@@ -5745,7 +5757,9 @@ def main():
     main_secs, skipped, shown = [], set(), [0]  # main GPU's upscale times; chunks with no video
     progress = {"chunks": 0, "video": 0.0, "helped": 0, "frames": 0}
     t_start = time.time()
-    encoding = reading = current = None     # (Background, Chunk) / Chunk
+    encodings, reading, current = [], None, None    # [(Background, Chunk)] / (Background, Chunk) / Chunk
+    last_enc = [0.0]            # seconds the last finished chunk's encode took
+    enc_limit = max(1, getattr(a, "encode_jobs", None) or 1)    # encodes at once (--encode-jobs)
 
     def claim(keep=0):
         with lock:
@@ -5875,16 +5889,17 @@ def main():
                              + ("it stopped making progress)" if stuck else
                                 "it will be done with it sooner)"))
 
-    def done_encoding():
-        nonlocal encoding
-        if encoding:
-            bg, job = encoding
+    def done_encoding(keep=0):
+        """Wait for the oldest encodes until at most `keep` are still running."""
+        while len(encodings) > keep:
+            bg, job = encodings[0]
             while a.faces and not bg.done.wait(0.5):      # --faces: show what it is doing
                 if job.stage:
                     status_line(f"  {job.label}: {job.stage}")
             # (cleared only once it has ended: stopped meanwhile, it is waited for, see below)
             chunks[job.idx], warning = bg.wait()
-            encoding = None
+            encodings.pop(0)
+            last_enc[0] = getattr(job, "enc_secs", 0.0)
             for msg in (job.face_msg, warning):
                 if msg:
                     status_line()
@@ -6010,8 +6025,9 @@ def main():
                 t_up = time.time()
                 job.upscale(n_in)
                 main_secs.append(time.time() - t_up)
-            done_encoding()                     # the previous chunk's encode
-            encoding, current = (Background(job.finish), job), None
+            done_encoding(enc_limit - 1)        # (the encodes that were running, up to --encode-jobs)
+            encodings.append((Background(job.finish), job))
+            current = None
             counted(job)
             show_notes()
             elapsed = time.time() - t_start
@@ -6022,7 +6038,9 @@ def main():
             helped = (f" ({progress['helped']} by the other upscaler{'s' * (len(helpers) > 1)})"
                       if helpers and progress["helped"] else "")
             shown[0] = len(plan) - remaining
-            say(f"[{len(plan) - remaining}/{len(plan)}] {per_chunk:.0f}s/chunk{helped}"
+            where = (f" (upscale {main_secs[-1]:.0f}s, encode {last_enc[0]:.0f}s)"
+                     if main_secs and last_enc[0] else "")
+            say(f"[{len(plan) - remaining}/{len(plan)}] {per_chunk:.0f}s/chunk{where}{helped}"
                 + (f"{movie} {eta_text(left)}" if remaining else
                    ", all chunks done, finishing the file..."))
             if later > 0 and remaining:
@@ -6030,8 +6048,8 @@ def main():
                 # of video): rough, a live-action movie takes longer than an anime one
                 rest = left + later * elapsed / progress["video"]
                 say(f"        all {queue['of']} movies: {eta_text(rest)} (rough)")
-        if encoding:
-            status_line(f"  {encoding[1].label}: encoding")
+        if encodings:
+            status_line(f"  {encodings[-1][1].label}: encoding")
         done_encoding()
         status_line()
         show_notes()
@@ -6049,7 +6067,7 @@ def main():
         # face restoration is stopped, and its chunk made again next time)
         a.stop_lanes.set()
         a.stopping.set()
-        for bg in [x[0] for x in (encoding, reading) if x] + helpers:
+        for bg in [x[0] for x in encodings] + [x[0] for x in (reading,) if x] + helpers:
             try:
                 bg.wait()
             except BaseException:
@@ -6215,7 +6233,7 @@ def main():
 
 VALUE_OPTS = ("--type", "--mode", "--model", "--scale", "--height", "--dar", "--fps",
               "--chunk-frames", "--test", "--esrgan", "--gpu", "--tile", "--gpu-threads",
-              "--gpu-jobs", "--engine",
+              "--gpu-jobs", "--encode-jobs", "--engine",
               "--ai-blend", "--smooth",
               "--sharpen", "--work", "--chroma-delay", "--mask", "--face-model", "--face-models")
 STOPPED = (130, 3221225786)     # a run stopped by Ctrl+C; Windows "terminated by Ctrl+C"
