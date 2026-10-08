@@ -2401,8 +2401,8 @@ def ncnn_models_main(argv):
     p.add_argument("--gpu", default=None)
     p.add_argument("--frames", type=int, default=6)
     p.add_argument("--save", action="store_true",
-                   help="save the best model for live action / 3D animation in ncnn_opts.json: "
-                        "the upscale then uses it (10 frames at least)")
+                   help="save the best model for live action / 3D animation in ncnn_opts.json "
+                        "(used only by an upscale run with --best-quality; 10 frames at least)")
     w = p.parse_args(argv)
     if w.save:
         w.frames = max(w.frames, 10)
@@ -2525,7 +2525,7 @@ def save_best_model(by_model):
     on drawings. realesrgan-x2plus is what those types use already, so another model takes
     over only when it is clearly truer to the original (SSIM better by QUALITY_MARGIN) and not
     much slower (at least QUALITY_MIN_SPEED of its speed: x4plus does 4x the work). The choice
-    is saved as best_model in ncnn_opts.json; a movie already started keeps its own model."""
+    is saved as best_model in ncnn_opts.json and used only by a run with --best-quality."""
     photo = {m: r for m, r in by_model.items()
              if "anime" not in m and re.search(r"x2plus|x4plus|general", m)}
     if not photo:
@@ -2548,8 +2548,9 @@ def save_best_model(by_model):
     saved = ncnn_saved()
     saved["best_model"] = pick
     ncnn_opts_file().write_text(json.dumps(saved), encoding="utf-8")
-    print(f"  Saved best_model = {pick} ({why}). Live action and 3D animation use it from now "
-          f"on (a movie already started keeps its model; --model overrides).")
+    print(f"  Saved best_model = {pick} ({why}). Nothing changes by itself: add --best-quality "
+          "to an upscale of live action or 3D animation to use it (a movie already started "
+          "keeps its model).")
     return 0
 
 
@@ -5527,6 +5528,10 @@ def build_parser():
     p.add_argument("--no-profile", action="store_true",
                    help="don't profile the GPUs on the first run (the profile is saved in "
                         "ncnn_opts.json, and an existing one is never overwritten)")
+    p.add_argument("--best-quality", action="store_true",
+                   help="upscale live action / 3D animation with the model that "
+                        "--ncnn-models MOVIE --save found truest to the original (not used "
+                        "otherwise: the usual model stays the default)")
     p.add_argument("--no-skip-black", dest="no_skip_black", action="store_true",
                    help="upscale black frames too (by default a frame that is black through and "
                         "through is not sent to the upscaler: its upscale is black as well)")
@@ -5719,10 +5724,11 @@ ncnn_opts.json next to dvd_upscale.py, and every later run uses it)
         Add --gpu N to set up another GPU, --skip-gpu-test, --skip-model-test or --no-test-run. Use it after a
         driver update, or when GPU resets ("failed -4") come back. The pieces, one by one:
   python dvd_upscale.py --ncnn-models "CGI\Movie.mkv" --save
-        THE BEST-QUALITY CHOICE, used by the automatic upscale: the same test, and the model
-        that is clearly truer to the original than realesrgan-x2plus (and not much slower) is
-        saved as best_model for live action and 3D animation; else x2plus stays. Part of
-        --ncnn-auto. A movie already started keeps its model; --model overrides.
+        FIND THE BEST-QUALITY MODEL: the same test, and the model that is clearly truer to the
+        original than realesrgan-x2plus (and not much slower) is saved as best_model for live
+        action and 3D animation; else x2plus stays. It changes nothing by itself: upscale with
+        --best-quality to use it (python dvd_upscale.py "Movie.mkv" --best-quality). Also
+        run by --ncnn-auto. A movie already started keeps its model.
   python dvd_upscale.py --ncnn-models "CGI\Movie.mkv"
         tests EVERY model in the models folder on the same frames of the movie (shrunk to half,
         upscaled back, compared with the original: SSIM/PSNR against a plain resize), prints a
@@ -5774,6 +5780,7 @@ QUICK START: the ones to remember (everything else below is the detail)
   python dvd_upscale.py --ncnn-auto "Movie.mkv"      set the GPU up and test it (once, ~20 min):
                                                      the settings it survives, the fastest, the
                                                      best model; saved and used from then on
+  python dvd_upscale.py "Movie.mkv" --best-quality   upscale with the model --ncnn-models --save found
   python dvd_upscale.py --gpu-detect                 the GPUs, the driver, the saved profile
   python dvd_upscale.py --commands                   this list
 
@@ -5783,7 +5790,7 @@ ALL THE SPECIAL COMMANDS, ONE LINE EACH (details below)
   --ncnn-bench MOVIE       the fastest settings with the same picture (whole frames, fp16)
   --ncnn-bench-gpu MOVIE   which GPU is faster (saved as the default)
   --ncnn-models MOVIE      every model on your frames, with a picture to judge by eye
-      --save               ...and save the best one for live action / 3D animation
+      --save               ...and save the best one (an upscale uses it only with --best-quality)
   --ncnn-winograd MOVIE    the winograd variants (none was faster on an RTX 3060 laptop)
   --gpu-detect [--redo]    GPUs, class, driver, memory, saved profile, recommendations
   --clip MOVIE START SECS  cut a sample (add --upscale to upscale just that piece)
@@ -5944,14 +5951,18 @@ def main():
     if not a.fast and not a.analyze:
         a.esrgan_path = find(a.esrgan)
         best = ncnn_saved().get("best_model")
-        if best and user_model is None and a.type in ("cgi", "live") \
+        if a.best_quality and not best:
+            print("NOTE: --best-quality: no best model is saved yet: run "
+                  "python dvd_upscale.py --ncnn-models \"Movie.mkv\" --save first. "
+                  "Using the usual model.")
+        if a.best_quality and best and user_model is None and a.type in ("cgi", "live") \
                 and best != a.model and previous_settings(a) is None:
             # (--ncnn-models --save found a model truer to the original for these types)
             keep = (a.model, a.scale)
             a.model, a.scale = best, 2 if "x2plus" in best else 4
             if model_installed(a):
                 print(f"Best-quality model for {TYPE_NAMES[a.type]}: {best} "
-                      f"(found by --ncnn-models --save; --model overrides)")
+                      f"(found by --ncnn-models --save, used because of --best-quality)")
                 if "x4plus" in best:           # tame its face artifacts, as for the fallback
                     a.ai_blend = 0.5 if user_blend is None else user_blend
                     a.sharpen = 0.2 if user_sharpen is None else user_sharpen
