@@ -113,7 +113,7 @@ Progress is logged to queue_log.txt next to the queue file.
 """
 import argparse, json, math, operator, os, re, shutil, signal, statistics, struct, subprocess, sys
 import atexit, tempfile
-import threading, time
+import threading, time, types
 from bisect import bisect_right as _bisect
 from collections import Counter
 from operator import add, sub
@@ -5199,6 +5199,19 @@ def probe_vulkan_gpus():
             (re.fullmatch(r"(\d+) (.+)", x.strip()) for x in r.stdout.splitlines()) if m]
 
 
+def nvidia_driver_major():
+    """The NVIDIA driver's major version (610 for 610.88), None if there is no nvidia-smi."""
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                           timeout=10, stdin=subprocess.DEVNULL)
+        return int(r.stdout.strip().splitlines()[0].split(".")[0])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
 def gpu_class(name):
     """high / mid / low from a GPU's name: what tile size and settings suit it."""
     n = name.lower()
@@ -5209,6 +5222,30 @@ def gpu_class(name):
     if re.search(r"gtx|rtx|radeon|\brx\b|arc", n):
         return "mid"
     return "low"
+
+
+def gpu_detect_main(argv):
+    """python dvd_upscale.py --gpu-detect [--redo]: the GPUs found, how each is classed, the
+    driver, and the saved profile; on a computer with no profile yet, the profile is made now
+    (as the first run would). --redo: forget the saved profile (not the files of the
+    movies) and profile again, including the stress test."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --gpu-detect")
+    p.add_argument("--redo", action="store_true")
+    w = p.parse_args(argv)
+    if w.redo:
+        try:
+            ncnn_opts_file().unlink()
+            print(f"Forgot the saved profile ({ncnn_opts_file().name}).")
+        except OSError:
+            pass
+    drv = nvidia_driver_major()
+    print(f"NVIDIA driver: {drv if drv else 'none found (no nvidia-smi)'}"
+          + (" (570 or newer: the stress test is needed)" if drv and drv >= 570 else ""))
+    for idx, name in probe_vulkan_gpus():
+        print(f"  Vulkan GPU {idx}: {name} -> {gpu_class(name)}")
+    inject_gpu_hardware_profile(types.SimpleNamespace(gpu=None, gpu_given=False))
+    print("Saved profile: " + (json.dumps(ncnn_saved()) if ncnn_saved() else "none"))
+    return 0
 
 
 def inject_gpu_hardware_profile(a):
@@ -5245,8 +5282,13 @@ def inject_gpu_hardware_profile(a):
     new.pop("helper", None)
     write_durably(ncnn_opts_file(), json.dumps(new, indent=1))
     a.gpu = str(main_gpu) if not a.gpu_given else a.gpu
-    # an NVIDIA GPU on a driver that resets it needs ncnn options turned off: found once, here
-    if "nvidia" in name.lower() and "set" not in saved:
+    # an NVIDIA GPU on a driver from 570 on gets reset by ncnn's default options (they need
+    # robust buffer access that its code doesn't ask for): the ones that survive are found
+    # once, here. Older drivers don't need it (and the test is skipped: minutes saved)
+    drv = nvidia_driver_major()
+    if "nvidia" in name.lower() and "set" not in saved and (drv is None or drv >= 570):
+        say(f"  NVIDIA driver {drv if drv else '(unknown version)'}: drivers from 570 on can reset "
+            "the GPU with ncnn's default options.")
         say("  Testing which ncnn settings this GPU survives (a few minutes, once)...")
         try:
             if ncnn_stress_main(["--gpu", str(main_gpu)]) != 0:
@@ -5552,6 +5594,9 @@ SPEED CHECKLIST (what holds a laptop GPU back; the script can't change these, yo
      antivirus scans while a movie runs.
   The script already keeps the PC awake and runs above-normal priority. Thermal and power
   limits protect the GPU and can't (or shouldn't) be switched off.
+
+  python dvd_upscale.py --gpu-detect          the GPUs, their class, the driver and the saved profile
+                                              (made now if there is none; --redo profiles again)
 
 GPU SET-UP AND SPEED (run these once from the script's folder; each saves what it finds in
 ncnn_opts.json next to dvd_upscale.py, and every later run uses it)
@@ -7442,6 +7487,8 @@ if __name__ == "__main__":
         sys.exit(faces_worker_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-models"]:           # (every model on the same frames)
         sys.exit(ncnn_models_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--gpu-detect"]:            # (the GPUs, the profile; made if there is none)
+        sys.exit(gpu_detect_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-auto"]:             # (all of the GPU set-up and a timed test)
         sys.exit(ncnn_auto_main(sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-winograd"]:         # (the winograd variants the GPU survives)
