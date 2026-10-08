@@ -830,15 +830,10 @@ def gpu_load(a, step=None):
             a.tile or tile)
 
 
-def gpu_threads(a):
-    """frames the GPU upscales at once"""
-    return gpu_load(a)[0]
-
-
 def gpu_load_text(a):
     threads, tile = gpu_load(a)
     return (f"{threads} frame{'s' if threads > 1 else ''} at once on the GPU"
-            + (f", in {tile}-pixel tiles" if tile else ""))
+            + (f", in {tile}-pixel tiles" if tile and str(tile) != "0" else ""))
 
 
 def lower_gpu_load(a):
@@ -2323,14 +2318,14 @@ def ncnn_auto_main(argv):
         # (a finished test run of this movie would be resumed, not timed)
         shutil.rmtree(Path(w.movie).with_name(Path(w.movie).stem + "_work_test"),
                       ignore_errors=True)
-        util, temps, watts, clocks, seen = [], [], [], [], [False]
+        util, temps, watts, clocks = [], [], [], []
         stop = threading.Event()
 
         def watch():
             while not stop.wait(2):
                 try:
                     r = subprocess.run(
-                        ["nvidia-smi", "-i", str(ncnn_saved().get("gpu", w.gpu)),
+                        ["nvidia-smi",
                          "--query-gpu=utilization.gpu,temperature.gpu,power.draw,clocks.sm",
                          "--format=csv,noheader,nounits"], capture_output=True, text=True,
                         timeout=10)
@@ -2358,7 +2353,7 @@ def ncnn_auto_main(argv):
         if proc.returncode or not secs:
             summary.append(f"test run: didn't finish (exit code {proc.returncode})")
         else:
-            spc = int(secs[-1])
+            spc = max(1, int(secs[-1]))
             rc, dur = capture(["ffprobe", "-v", "error", "-show_entries", "format=duration",
                                "-of", "csv=p=0", w.movie])
             line = f"test run: {spc} s per 480-frame chunk ({480 / spc:.1f} frames/s)"
@@ -2559,8 +2554,9 @@ def ncnn_winograd_main(argv):
                                     stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                     env={**os.environ, "DVD_UPSCALE_NCNN_OPTS": name})
             captured = []
-            threading.Thread(target=lambda: captured.append(proc.stdout.read()),
-                             daemon=True).start()
+            reader = threading.Thread(target=lambda pr=proc, box=captured: box.append(pr.stdout.read()),
+                                      daemon=True)
+            reader.start()
             t_trial = time.time()
             while proc.poll() is None:
                 time.sleep(2)
@@ -2577,7 +2573,7 @@ def ncnn_winograd_main(argv):
                             f"{len(trials)} | {eta_text(left)}")
             status_line()
             proc.wait()
-            time.sleep(0.2)
+            reader.join(10)         # (all of its output, so no error line is missed)
             trial_secs.append(time.time() - t_trial)
             text = b"".join(captured).decode("utf-8", "replace")
             r = proc
@@ -3209,44 +3205,48 @@ class Chunk:
                     f"the drive with the work folder needs about {need / 1e9:.0f} GB free for "
                     f"this chunk's upscaled frames and has {free / 1e9:.1f} GB: make room (or "
                     "use --work on another drive)")
-            watch, t_up0 = (GpuWatch() if not self.lane else None), time.time()
-            # black frames upscale to black frames: not sent to the upscaler. Their inputs are
-            # moved out of in/ (back after the upscale, for the checks and the blend) and their
-            # outputs written now as black PNGs, so the upscaler's count of frames is unchanged
-            blacks = set()
-            if not getattr(a, "no_skip_black", False):
-                found = [f.name for f in sorted((tmp / "in").glob("*.png")) if png_is_black(f)]
-                if len(found) == n_in:
-                    found = found[:-1]          # (the upscaler is given at least one frame)
-                if found:
-                    (tmp / "in_black").mkdir(exist_ok=True)
-                    write_black_png(tmp / "black.png", w * a.scale, h * a.scale)
-                    for name in found:
-                        os.replace(tmp / "in" / name, tmp / "in_black" / name)
-                        shutil.copyfile(tmp / "black.png", tmp / "out" / name)
-                    (tmp / "black.png").unlink()
-                    blacks = set(found)
-            self.black_frames = len(blacks)
+            watch, t_up0, blacks = None, time.time(), set()
             try:
+                watch = GpuWatch() if not self.lane else None
+                # black frames upscale to black frames: not sent to the upscaler. Their inputs
+                # are moved out of in/ (back after the upscale, for the checks and the blend)
+                # and their outputs written only after it, so out/ holds exactly what the GPU
+                # made (the retry, the frame counts and the progress all read it that way)
+                if not getattr(a, "no_skip_black", False):
+                    found = [f.name for f in sorted((tmp / "in").glob("*.png"))
+                             if png_is_black(f)]
+                    if len(found) == n_in:
+                        found = found[:-1]      # (the upscaler is given at least one frame)
+                    if found:
+                        (tmp / "in_black").mkdir(exist_ok=True)
+                        for name in found:
+                            os.replace(tmp / "in" / name, tmp / "in_black" / name)
+                        blacks = set(found)
+                n_ai = n_in - len(blacks)       # (frames the upscaler is to make)
                 attempt, src, kept = 0, tmp / "in", 0
                 while True:
                     attempt += 1
                     try:
-                        run_upscaler(a, src, tmp / "out", n_in, label, (w, h), self.gpu,
+                        run_upscaler(a, src, tmp / "out", n_ai, label, (w, h), self.gpu,
                                      self.lane)
                         n_out = len(list((tmp / "out").glob("*.png")))
-                        if n_out != n_in:
+                        if n_out != n_ai:
                             # (the upscaler's last lines: a helper GPU's note stays one line)
-                            raise RuntimeError(f"upscaler produced {n_out} of {n_in} frames "
+                            raise RuntimeError(f"upscaler produced {n_out} of {n_ai} frames "
                                                "(GPU out of memory? try --tile 128)"
                                                + ("" if self.lane else upscaler_log_tail(
                                                    tmp / "upscaler_log.txt")))
-                        for name in blacks:     # (the inputs back where the checks look for them)
-                            if (tmp / "in_black" / name).exists():
+                        if blacks:
+                            # the black frames' outputs, and their inputs back where the checks
+                            # and the blend look for them
+                            write_black_png(tmp / "black.png", w * a.scale, h * a.scale)
+                            for name in sorted(blacks):
+                                shutil.copyfile(tmp / "black.png", tmp / "out" / name)
                                 os.replace(tmp / "in_black" / name, tmp / "in" / name)
+                            (tmp / "black.png").unlink()
                         check_frames(a, tmp, n_in, strict=bool(self.lane))
                         if not self.lane:
-                            FRAMES_OK[0] += n_in - kept
+                            FRAMES_OK[0] += n_ai - kept
                             save_gpu_step(a, frames_only=True)
                         break
                     except (RuntimeError, subprocess.CalledProcessError) as e:
@@ -3298,7 +3298,7 @@ class Chunk:
                         first, _, rest = str(e).partition("\n")
                         print(f"  {label}: {first.rstrip('.')} - "
                               + (f"keeping those {kept}; " if kept else "") + retry_note
-                              + (f"trying the other {n_in - kept} once more." if kept else
+                              + (f"trying the other {n_ai - kept} once more." if kept else
                                  "trying this chunk once more.")
                               + (f"\n{rest}" if rest else ""), flush=True)
                         if windows:
@@ -5190,7 +5190,7 @@ def check_values(a):
             sys.exit("--tile must be 0 (automatic) or a positive number of pixels")
         if tile < 0:
             sys.exit("--tile must be 0 (automatic) or a positive number of pixels")
-        a.tile = str(tile) if tile else None      # (0: automatic, not a tile size)
+        a.tile = str(tile)
     if a.gpu is None:
         # (the faster GPU found by --ncnn-bench-gpu, else 0; --gpu on the command line wins)
         saved_gpu, helper = ncnn_saved().get("gpu"), ncnn_saved().get("helper")
@@ -7117,7 +7117,7 @@ def queue_main(argv):
         if gone:
             if work.is_dir():
                 clean_work_folder(work)
-            note(f"Original deleted (to the Recycle Bin, if its drive has one): {args[0]}"
+            note(f"Original deleted ({'to the Recycle Bin, if its drive has one' if os.name == 'nt' else 'permanently: there is no Recycle Bin here'}): {args[0]}"
                  + ("" if work.exists() else f" (work folder {work.name} deleted)"))
         else:
             note(f"KEPT the original {args[0]}: it couldn't be moved to the Recycle Bin")
@@ -7272,6 +7272,8 @@ def clip_main(argv):
         sys.exit("Missing tool: ffmpeg")
     m, sec = divmod(int(start), 60)
     tag = f"{m // 60}h{m % 60:02d}m{sec:02d}s" if m >= 60 else f"{m}m{sec:02d}s"
+    if start != int(start):
+        tag += f"{round((start - int(start)) * 10):d}"    # (a start of 1.5 s is not a start of 1 s)
     out = src.with_name(f"{src.stem} clip {tag}.mkv")
     dur = media_duration(src)
     if dur and start >= dur:
@@ -7305,6 +7307,7 @@ def clip_upscale(src, clip, extra):
     print(f"\nChecking the whole movie, as the full run would ({src.name})...", flush=True)
     fd, report = tempfile.mkstemp(suffix=".json")
     os.close(fd)
+    rc = 1
     try:
         rc = subprocess.run([sys.executable, script, str(src), "--analyze", *extra],
                             env=dict(os.environ, DVD_UPSCALE_REPORT=report)).returncode
