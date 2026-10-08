@@ -5395,6 +5395,10 @@ def check_values(a):
         sys.exit("--test must be a number of seconds (0 = the whole movie)")
     if a.gpu_threads is not None and not 1 <= a.gpu_threads <= 16:
         sys.exit("--gpu-threads must be between 1 and 16")
+    if a.encode_jobs is None:
+        # (a small processor: the encode of one chunk competes with the upscaler's own Python
+        # thread; more cores don't need more: on a 3060 laptop the encode takes 7 s of 176)
+        a.encode_jobs = 1 if (os.cpu_count() or 4) <= 4 else 2
     if not 1 <= a.encode_jobs <= 4:
         sys.exit("--encode-jobs must be between 1 and 4")
     if a.gpu_jobs is not None and not 1 <= a.gpu_jobs <= 4:
@@ -5475,8 +5479,9 @@ def build_parser():
                    help="don't cut the black bars of a widescreen movie off before the upscale "
                         "(they are looked for by default: the upscaler then does only the "
                         "picture, about a quarter less work for 2.39:1)")
-    p.add_argument("--encode-jobs", type=int, default=2, metavar="N",
-                   help="chunks encoded at once while the next is upscaled (default 2): the CPU "
+    p.add_argument("--encode-jobs", type=int, default=None, metavar="N",
+                   help="chunks encoded at once while the next is upscaled (default 2, 1 on a "
+                        "processor with 4 threads or fewer): the CPU "
                         "filters and encode of a chunk can take longer than its upscale, and the "
                         "GPU then waits")
     p.add_argument("--gpu-jobs", type=int, default=None,
