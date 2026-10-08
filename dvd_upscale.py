@@ -5181,6 +5181,9 @@ def default_output(src, base=None, height=1080):
         return src.parent / f"{height}p Upscale" / name
 
 
+GPU_VRAM_MB = {}        # Vulkan GPU index -> the memory ncnn may use there (MB), from the last probe
+
+
 def probe_vulkan_gpus():
     """[(index, name)] of the Vulkan GPUs, as ncnn numbers them (the numbers -g takes). Asked
     in a process of its own: ncnn loaded into this one would crash it when it exits (the
@@ -5189,14 +5192,23 @@ def probe_vulkan_gpus():
         return []
     code = ("import ncnn\n"
             "for i in range(ncnn.get_gpu_count()):\n"
-            "    print(i, ncnn.get_gpu_info(i).device_name())\n")
+            "    try:\n"
+            "        mb = int(ncnn.get_gpu_device(i).get_heap_budget())\n"
+            "    except Exception:\n"
+            "        mb = 0\n"
+            "    print(i, ncnn.get_gpu_info(i).device_name(), '|', mb)\n")
     try:
         r = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=60,
                            stdin=subprocess.DEVNULL, text=True, errors="replace")
     except (OSError, subprocess.SubprocessError):
         return []
-    return [(int(m[1]), m[2].strip()) for m in
-            (re.fullmatch(r"(\d+) (.+)", x.strip()) for x in r.stdout.splitlines()) if m]
+    found = []
+    for x in r.stdout.splitlines():
+        m = re.fullmatch(r"(\d+) (.+?) \| (\d+)", x.strip())
+        if m:
+            found.append((int(m[1]), m[2].strip()))
+            GPU_VRAM_MB[int(m[1])] = int(m[3])
+    return found
 
 
 def nvidia_driver_major():
@@ -5242,7 +5254,9 @@ def gpu_detect_main(argv):
     print(f"NVIDIA driver: {drv if drv else 'none found (no nvidia-smi)'}"
           + (" (570 or newer: the stress test is needed)" if drv and drv >= 570 else ""))
     for idx, name in probe_vulkan_gpus():
-        print(f"  Vulkan GPU {idx}: {name} -> {gpu_class(name)}")
+        mb = GPU_VRAM_MB.get(idx, 0)
+        print(f"  Vulkan GPU {idx}: {name} -> {gpu_class(name)}"
+              + (f", {mb / 1024:.1f} GB for the upscaler" if mb else ""))
     inject_gpu_hardware_profile(types.SimpleNamespace(gpu=None, gpu_given=False))
     print("Saved profile: " + (json.dumps(ncnn_saved()) if ncnn_saved() else "none"))
     return 0
@@ -5265,7 +5279,9 @@ def inject_gpu_hardware_profile(a):
         return                  # (nothing learned: nothing saved, the defaults stay)
     say("Hardware profile (first run on this computer):")
     for idx, name in gpus:
-        say(f"  GPU {idx}: {name} ({gpu_class(name)})")
+        mb = GPU_VRAM_MB.get(idx, 0)
+        say(f"  GPU {idx}: {name} ({gpu_class(name)}"
+            + (f", {mb / 1024:.1f} GB for the upscaler" if mb else "") + ")")
     # the GPU the movie runs on: the one given, else the first that isn't integrated, else 0
     if a.gpu_given:
         main_gpu = int(str(a.gpu).split(",")[0])
@@ -5274,8 +5290,13 @@ def inject_gpu_hardware_profile(a):
     name = dict(gpus).get(main_gpu, "")
     kind = gpu_class(name)
     tile = {"high": 1024, "mid": 200, "low": 64}[kind]
-    say(f"  -> GPU {main_gpu} ({kind}): "
-        + {"high": "whole frames", "mid": "200-pixel tiles", "low": "64-pixel tiles"}[kind])
+    mb = GPU_VRAM_MB.get(main_gpu, 0)
+    if kind == "high" and 0 < mb < 3000:
+        tile = 200          # (a whole frame of the big models needs about 1.5 GB: too little here)
+        say(f"  -> only {mb / 1024:.1f} GB of video memory: 200-pixel tiles instead of whole frames")
+    else:
+        say(f"  -> GPU {main_gpu} ({kind}): "
+            + {1024: "whole frames", 200: "200-pixel tiles", 64: "64-pixel tiles"}[tile])
     new = {**saved, "gpu": main_gpu, "tile": tile}
     # (no helper GPU: a weak second GPU is slower than none and some drivers fault on it;
     # --ncnn-bench-gpu measures it and saves one if it is worth having)
