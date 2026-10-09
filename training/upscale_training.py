@@ -35,7 +35,7 @@ never trained on, and prints that PSNR next to plain bicubic and the starting mo
 needs: ffmpeg + ffprobe on the PATH, pip install numpy opencv-python torch torchvision
 """
 import argparse, copy, csv, datetime, http.server, json, math, random, re, socket, struct
-import subprocess, sys, threading, time
+import os, shutil, subprocess, sys, threading, time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fractions import Fraction
@@ -271,12 +271,144 @@ def shutil_width():
         return 120
 
 
+# =============================== hardware: GPU watts, load, heat, CPU ===============================
+THROTTLE_BITS = ((0x4, "power cap"), (0x8, "hardware slowdown"), (0x20, "thermal"),
+                 (0x40, "hardware thermal"), (0x80, "power brake"))
+GPU_FIELDS = ("name,power.draw,power.limit,utilization.gpu,temperature.gpu,clocks.sm,clocks.max.sm,"
+              "memory.used,memory.total,clocks_throttle_reasons.active")
+
+
+def cpu_times():
+    """(busy, total) CPU time since boot, whole machine; None if it can't be read."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+            i, k, u = (wintypes.FILETIME() for _ in range(3))
+            ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(i), ctypes.byref(k), ctypes.byref(u))
+            v = lambda t: (t.dwHighDateTime << 32) | t.dwLowDateTime
+            idle, tot = v(i), v(k) + v(u)             # (kernel time includes idle)
+            return tot - idle, tot
+        f = open("/proc/stat").readline().split()[1:]
+        vals = [int(x) for x in f]
+        idle = vals[3] + (vals[4] if len(vals) > 4 else 0)
+        return sum(vals) - idle, sum(vals)
+    except Exception:
+        return None
+
+
+class HwMonitor:
+    """Samples the NVIDIA GPU (nvidia-smi: watts, load, heat, clock, memory, why it slows down) and the
+    processor load every 2 s in a thread. CPU watts are not readable without a driver or admin tool
+    (HWiNFO / Intel Power Gadget / Ryzen Master show them): CPU load is what is shown instead."""
+
+    def __init__(self, every=2.0):
+        self.every, self.gpu, self.cpu, self.err = every, None, None, ""
+        self.smi = shutil.which("nvidia-smi")
+        self.hist = []                                 # recent samples, for the verdict
+        self.lock = threading.Lock()
+        self._cpu_prev = cpu_times()
+        threading.Thread(target=self.loop, daemon=True).start()
+
+    def sample(self):
+        now = cpu_times()
+        if now and self._cpu_prev and now[1] > self._cpu_prev[1]:
+            self.cpu = 100 * (now[0] - self._cpu_prev[0]) / (now[1] - self._cpu_prev[1])
+        self._cpu_prev = now
+        if not self.smi:
+            return
+        try:
+            r = subprocess.run([self.smi, "--query-gpu=" + GPU_FIELDS, "--format=csv,noheader,nounits"],
+                               capture_output=True, text=True, timeout=8, stdin=subprocess.DEVNULL,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            v = [x.strip() for x in r.stdout.splitlines()[0].split(",")]
+            num = lambda x: float(x) if re.fullmatch(r"[\d.]+", x) else None
+            try:
+                bits = int(v[9], 16)
+            except ValueError:
+                bits = 0
+            self.gpu = dict(name=v[0], watts=num(v[1]), watts_max=num(v[2]), busy=num(v[3]), temp=num(v[4]),
+                            clock=num(v[5]), clock_max=num(v[6]), mem=num(v[7]), mem_max=num(v[8]),
+                            slowed=[n for b, n in THROTTLE_BITS if bits & b], bits=bits)
+        except (OSError, subprocess.SubprocessError, IndexError, ValueError) as e:
+            self.err = str(e)
+
+    def loop(self):
+        while True:
+            try:
+                self.sample()
+                with self.lock:
+                    self.hist = (self.hist + [(self.gpu, self.cpu)])[-15:]       # ~30 s
+            except Exception as e:
+                self.err = str(e)
+            time.sleep(self.every)
+
+    def line(self):
+        """Short pieces for the console line."""
+        g, out = self.gpu, []
+        if g:
+            if g["watts"] is not None:
+                out.append(f"GPU {g['watts']:.0f}/{g['watts_max'] or 0:.0f} W")
+            out.append(f"{g['busy']:.0f}% busy {g['temp']:.0f}C")
+        if self.cpu is not None:
+            out.append(f"CPU {self.cpu:.0f}%")
+        return out
+
+    def metrics(self):
+        g, m = self.gpu, {}
+        if g:
+            if g["watts"] is not None:
+                m["GPU power"] = f"{g['watts']:.0f} / {g['watts_max'] or 0:.0f} W"
+            m["GPU busy"] = f"{g['busy']:.0f} %"
+            m["GPU temp"] = f"{g['temp']:.0f} C"
+            m["GPU clock"] = f"{g['clock']:.0f} / {g['clock_max']:.0f} MHz"
+            m["GPU memory"] = f"{g['mem']:.0f} / {g['mem_max']:.0f} MiB"
+            m["slowed by"] = ", ".join(g["slowed"]) or "nothing"
+        if self.cpu is not None:
+            m["CPU"] = f"{self.cpu:.0f} %"
+        return m
+
+    def avg(self, key, which=0):
+        with self.lock:
+            vals = [(h[0] or {}).get(key) if which == 0 else h[1] for h in self.hist]
+        vals = [x for x in vals if x is not None]
+        return sum(vals) / len(vals) if vals else None
+
+
+def verdict(hw, wait_frac, step_s):
+    """One sentence: what is holding the training back right now. wait_frac = share of each step the GPU
+    spent waiting for the next batch from the data loader."""
+    g = hw.gpu
+    if wait_frac > 0.25:
+        cpu = hw.avg(None, 1)
+        return (f"SLOW: the GPU waits {100 * wait_frac:.0f}% of each step for data (disk/CPU loading PNGs)"
+                + (f", CPU {cpu:.0f}%" if cpu is not None else "")
+                + ". Try --train-workers 4 (or more) and keep the pairs folder on an SSD.")
+    if not g:
+        return "no nvidia-smi: can't see the GPU (data wait is %.0f%%)" % (100 * wait_frac)
+    recent = [(h[0] or {}).get("bits", 0) for h in hw.hist[-8:]]
+    if recent and sum(1 for b in recent if b & (0x20 | 0x40)) > len(recent) / 2:
+        return f"SLOW: the GPU is too hot ({g['temp']:.0f} C) and lowers its clock: more airflow / fan curve."
+    if recent and sum(1 for b in recent if b & 0x4) > len(recent) / 2:
+        return "the GPU is at its power limit (normal when fully loaded; it is working as hard as it is allowed)."
+    if recent and sum(1 for b in recent if b & 0x8) > len(recent) / 2:
+        return "SLOW: hardware slowdown flagged by the GPU (power supply or cable, or heat)."
+    if g["mem_max"] and g["mem"] / g["mem_max"] > 0.95:
+        return "GPU memory is nearly full: Windows may be swapping it; try --batch 4 or --checkpoint."
+    busy = hw.avg("busy")
+    if busy is not None and busy < 70:
+        return (f"GPU only {busy:.0f}% busy but data wait is {100 * wait_frac:.0f}%: something else on the "
+                "PC is using it, or the steps are too small.")
+    return "the GPU is the limit (busy, cool, not waiting for data): this is as fast as it goes. Lower --batch/--patch or --iters to finish sooner."
+
+
 # =============================== step 1: the DVD / Blu-ray pairs ===============================
 THUMB = (64, 36)
 PROG = None                 # the live progress page (--web), when asked for
 
 
 LIVE = None                 # the status line in the console
+HW = None                   # the hardware monitor (GPU watts, load, heat, CPU)
 
 
 def say(msg):
@@ -829,10 +961,14 @@ def stage_train(a, root, out):
     it = iter(dl)
     t0, run = time.time(), {}
     run_t0, start_step, last_l1 = time.time(), step, float("nan")
+    wait_t, loop_t, tick = 0.0, 0.0, time.time()      # data-loader wait vs whole step, for the verdict
     net.train()
     try:
         while step < a.iters:
-            lr_img, hr_img = (x.to(dev, non_blocking=True) for x in next(it))
+            w0 = time.time()
+            batch = next(it)                       # (blocks while the data loader is behind)
+            wait_t += time.time() - w0
+            lr_img, hr_img = (x.to(dev, non_blocking=True) for x in batch)
             lr_now = a.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * step / a.iters)))     # cosine to 10%
             for g in opt.param_groups:
                 g["lr"] = lr_now
@@ -865,6 +1001,8 @@ def stage_train(a, root, out):
             for k, v in logs.items():
                 run[k] = run.get(k, 0) + v
             last_l1 = logs["l1"]
+            loop_t += time.time() - tick
+            tick = time.time()
             if step % 10 == 0:
                 el = time.time() - run_t0
                 sps = el / max(step - start_step, 1)          # (average over this run, saves included)
@@ -872,9 +1010,10 @@ def stage_train(a, root, out):
                 live.fields([f"{bar(step / a.iters, 20)} {100 * step / a.iters:5.1f}%  {step}/{a.iters}",
                              f"ETA {hms(eta)} (~{clock_in(eta)})",
                              f"{sps:.2f} s/step", f"elapsed {hms(el)}",
-                             f"l1 {last_l1:.4f}"] + ([f"best {best:.2f} dB"] if best > -1e8 else []))
+                             f"l1 {last_l1:.4f}"] + HW.line() + ([f"best {best:.2f} dB"] if best > -1e8 else []))
                 if prog:
                     prog.set(step=step, eta=eta, speed_text=f"{sps:.2f} s/step")
+                    prog.metric(**HW.metrics())
             if step % 100 == 0:
                 el = time.time() - t0
                 say(f"step {step}/{a.iters}  " + "  ".join(f"{k} {v / 100:.4f}" for k, v in run.items())
@@ -882,7 +1021,19 @@ def stage_train(a, root, out):
                 if prog:
                     prog.point("loss (L1)", step, run["l1"] / 100)
                     prog.metric(**{k: f"{v / 100:.4f}" for k, v in run.items()})
-                run, t0 = {}, time.time()
+                wf = wait_t / loop_t if loop_t else 0.0
+                why = verdict(HW, wf, el / 100)
+                say(f"   hardware: " + "  ".join(f"{k} {v}" for k, v in HW.metrics().items()) + f"  | data wait {100 * wf:.0f}%")
+                say(f"   -> {why}")
+                if prog:
+                    prog.metric(**{"data wait": f"{100 * wf:.0f} %", "what limits it": why})
+                    if HW.gpu and HW.gpu["watts"] is not None:
+                        prog.point("GPU power (W)", step, HW.gpu["watts"])
+                    if HW.gpu:
+                        prog.point("GPU busy (%)", step, HW.gpu["busy"])
+                    if HW.cpu is not None:
+                        prog.point("CPU (%)", step, HW.cpu)
+                run, t0, wait_t, loop_t = {}, time.time(), 0.0, 0.0
             if step % a.save_every == 0 or step == a.iters:
                 score = psnr_on(ema, dev, root, val, a.val_crop)
                 net.train()
@@ -1106,8 +1257,9 @@ def main():
         if f and "pairs" in stages and not Path(f).exists():
             sys.exit(f"file not found: {f}")
 
-    global PROG, LIVE
+    global PROG, LIVE, HW
     LIVE = LiveLine()
+    HW = HwMonitor()
     PROG = Progress("DVD to Blu-ray training", a.web).start() if a.web else None
     if "train" in stages and not torch.cuda.is_available():
         print("WARNING: no CUDA GPU found: training would take weeks on the processor")
