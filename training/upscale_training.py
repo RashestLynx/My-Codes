@@ -1511,6 +1511,72 @@ def pick_gpus(spec):
     return ids
 
 
+def bench(a, devs, steps=12, warm=3):
+    """Patches per second for training steps on random data across `devs` (one card, or several split)."""
+    dev = devs[0]
+    net = make_net(a.arch, a.compact_feat, a.compact_convs).to(dev)
+    net.train()
+    model = nn.DataParallel(net, device_ids=[d.index for d in devs]) if len(devs) > 1 else net
+    batch = 8 * len(devs)                                       # (8 patches per card, so the cards are compared fairly)
+    opt = torch.optim.Adam(net.parameters(), lr=1e-5)
+    cuda = dev.type == "cuda"
+    scaler = torch.amp.GradScaler(enabled=cuda)
+    x = torch.rand(batch, 3, a.patch, a.patch)
+    y = torch.rand(batch, 3, 2 * a.patch, 2 * a.patch, device=dev)
+    for i in range(steps):
+        if i == warm:
+            if cuda:
+                torch.cuda.synchronize(dev)
+            t0 = time.time()
+        with torch.autocast(dev.type, torch.float16, enabled=cuda):
+            loss = F.l1_loss(model(x.to(dev)), y)
+        opt.zero_grad(set_to_none=True)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
+    if cuda:
+        torch.cuda.synchronize(dev)
+    return batch * (steps - warm) / (time.time() - t0)
+
+
+def gpu_test(a):
+    """--gpu-test: lists the NVIDIA GPUs, times each alone and all together, and says what to use."""
+    n = torch.cuda.device_count()
+    if not n:
+        print("no NVIDIA (CUDA) GPU found by PyTorch: check the driver (nvidia-smi) and that torch was installed with CUDA.")
+        return
+    print(f"{n} CUDA GPU(s):")
+    for i in range(n):
+        pr = torch.cuda.get_device_properties(i)
+        print(f"  {i}: {pr.name}, {pr.total_memory / 2 ** 30:.1f} GB")
+    if n < 2:
+        print("only one GPU: nothing to compare. A second card will show up here (and in nvidia-smi) once it is installed.")
+        return
+    torch.backends.cudnn.benchmark = True
+    results = {}
+    for ids in [[i] for i in range(n)] + [list(range(n))]:
+        try:
+            results[tuple(ids)] = bench(a, [torch.device(f"cuda:{i}") for i in ids])
+        except torch.cuda.OutOfMemoryError:
+            torch.cuda.empty_cache()
+            results[tuple(ids)] = None
+        r = results[tuple(ids)]
+        print(f"  --gpus {','.join(map(str, ids)):<6} " + ("ran out of memory" if r is None else f"{r:6.1f} patches/s"))
+    singles = {k: v for k, v in results.items() if len(k) == 1 and v}
+    both = results[tuple(range(n))]
+    if not singles:
+        return
+    best = max(singles, key=singles.get)
+    if both and both > 1.15 * singles[best]:
+        print(f"-> use all of them (the default, --gpus all): {both / singles[best]:.2f}x the best single card.")
+    else:
+        print(f"-> a second card does not speed this up (together: {both or 0:.1f} vs {singles[best]:.1f} patches/s alone). "
+              f"Use --gpus {best[0]}. Common causes: a card on a slow link (Thunderbolt/eGPU or a x1 slot), "
+              "or two very different cards.")
+    if len({torch.cuda.get_device_name(i) for i in range(n)}) > 1:
+        print("note: the cards are different models, so a joint run is paced by the slower one.")
+
+
 def batch_arg(v):
     return v if v == "auto" else int(v)
 
@@ -1567,6 +1633,8 @@ def main():
     g.add_argument("--gpu-memory", type=float, default=1.0, metavar="FRACTION",
                    help="--batch auto grows the batch until it no longer fits, up to this share of the graphics card's memory "
                         "(default 1.0: everything that fits; lower it to leave room for other programs)")
+    p.add_argument("--gpu-test", action="store_true",
+                   help="just list the NVIDIA GPUs and time each alone and together (to check a new card), then exit")
     g.add_argument("--gpus", default="all", metavar="LIST",
                    help="NVIDIA GPUs to train on: 'all' (default) or numbers like 0,1 (as nvidia-smi lists them). "
                         "With 2 or more, each step is split across them (needs matching cards; the slowest sets the pace)")
@@ -1585,6 +1653,8 @@ def main():
     if a.pretrained is None:
         a.pretrained = str(Path(__file__).resolve().parent / "RealESRGAN_x2plus.pth") if a.arch == "rrdb" else "none"
 
+    if a.gpu_test:
+        return gpu_test(a)
     stages = [s.strip() for s in a.stages.split(",") if s.strip()]
     if not stages or set(stages) - {"pairs", "train", "export"}:
         p.error("--stages is a list of: pairs, train, export")

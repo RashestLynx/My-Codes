@@ -47,6 +47,8 @@ or phone starts by itself (port 8643); the address is printed. `--web 0` turns i
 - Several NVIDIA GPUs: `--gpus all` (the default) splits every step across all of them, `--gpus 0,1` picks which
   (numbers as `nvidia-smi` lists them). Use matching cards: the slowest sets the pace. A laptop's integrated
   AMD/Intel graphics can't train; only NVIDIA (CUDA) cards count.
+- New GPU? `python upscale_training.py --gpu-test` lists the cards, times each alone and together, and says whether
+  the second one helps and which `--gpus` to use.
 - `--lpips` (needs `pip install lpips`) adds LPIPS to the held-out scores next to PSNR and SSIM.
 - `--gan` uses Real-ESRGAN's U-Net discriminator (`--disc patch` for the old one). `--rotate` also turns patches
   by 90 degrees; it is off because a DVD's blur has a direction.
