@@ -34,3 +34,17 @@ https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plu
   folders with renamed files), generalise better. Live action and animation want separate models.
 - A model trained on real Blu-ray frames may deserve more of the AI result than the default
   blend: try `--ai-blend 1.0`.
+
+## Stopping and carrying on
+- Press **Ctrl+C** at any time. `train.py` saves right then (even between its 1000-step saves) and
+  `make_pairs.py` keeps every pair already made.
+- Run **the same command again** to carry on from where it stopped. Nothing else to do.
+- `make_pairs.py --fresh` starts over (deletes the pairs in `--out`); `train.py` starts over if you
+  give it a new `--out` folder.
+- To train longer after it finished, run the same command with a bigger `--iters`.
+
+## Watching progress
+- PowerShell shows one live line: bar, percent, ETA with the clock time it should finish, speed.
+- A page for a browser or phone starts by itself (training: port 8643, pair-making: 8644). It prints
+  the address to open. `--web 0` turns it off. Read-only, no password: use it on your own Wi-Fi.
+- `train.py` uses `RealESRGAN_x2plus.pth` from this folder by default (`--pretrained` to change it).

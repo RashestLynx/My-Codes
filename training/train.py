@@ -189,7 +189,8 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--pairs", required=True, help="folder made by make_pairs.py")
     p.add_argument("--out", required=True)
-    p.add_argument("--pretrained", required=True, help="RealESRGAN_x2plus.pth (or 'none' for a test run)")
+    p.add_argument("--pretrained", default=str(Path(__file__).resolve().parent / "RealESRGAN_x2plus.pth"),
+                   help="the starting model (default: RealESRGAN_x2plus.pth next to this script; 'none' for a test run)")
     p.add_argument("--iters", type=int, default=20000)
     p.add_argument("--batch", type=int, default=8, help="patches per step (default 8)")
     p.add_argument("--patch", type=int, default=96, help="DVD patch size in pixels (default 96)")
@@ -200,8 +201,8 @@ def main():
     p.add_argument("--workers", type=int, default=2)
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--val-crop", type=int, default=384, help="held-out frames are judged on this centre square (DVD px)")
-    p.add_argument("--web", type=int, default=0, metavar="PORT",
-                   help="live progress page for a browser or phone, e.g. --web 8643 (see progress_web.py)")
+    p.add_argument("--web", type=int, default=8643, metavar="PORT",
+                   help="live progress page for a browser or phone (default port 8643; 0 turns it off)")
     a = p.parse_args()
     import progress_web
     prog = progress_web.Progress("Training", a.web).start() if a.web else None
@@ -212,6 +213,10 @@ def main():
         if prog:
             prog.log(msg)
 
+    if a.pretrained != "none" and not Path(a.pretrained).exists():
+        raise SystemExit(f"starting model not found: {a.pretrained}\nDownload RealESRGAN_x2plus.pth from\n"
+                         "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth\n"
+                         "and put it in the training folder (or pass its path with --pretrained).")
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if dev.type == "cpu":
         print("WARNING: no CUDA GPU found, training on the processor (very slow)")
@@ -267,78 +272,90 @@ def main():
     ds = Pairs(root, train, a.patch, per)
     dl = torch.utils.data.DataLoader(ds, batch_size=max(1, a.batch // per), num_workers=a.workers,
                                      collate_fn=collate, persistent_workers=a.workers > 0)
+    def save_state():
+        torch.save({"params_ema": ema.state_dict()}, out / "dvd2bd_latest.pth")
+        torch.save({"net": net.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
+                    "step": step, "best": best,
+                    **({"disc": disc.state_dict(), "d_opt": d_opt.state_dict()} if disc else {})}, state_path)
+
     it = iter(dl)
     t0, run = time.time(), {}
     run_t0, start_step, last_l1 = time.time(), step, float("nan")
     net.train()
-    while step < a.iters:
-        lr_img, hr_img = (x.to(dev, non_blocking=True) for x in next(it))
-        lr_now = a.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * step / a.iters)))     # cosine to 10%
-        for g in opt.param_groups:
-            g["lr"] = lr_now
-        with torch.autocast(dev.type, torch.float16, enabled=dev.type == "cuda"):
-            pred = net(lr_img)
-            loss = F.l1_loss(pred, hr_img)
-            logs = {"l1": loss.item()}
-            if vgg:
-                lp = vgg(pred.clamp(0, 1), hr_img)
-                loss = loss + a.perceptual * lp; logs["vgg"] = lp.item()
-            if disc:
-                lg = F.softplus(-disc(pred)).mean()           # fool the discriminator
-                loss = loss + a.gan * lg; logs["g"] = lg.item()
-        opt.zero_grad(set_to_none=True)
-        scaler.scale(loss).backward()
-        scaler.unscale_(opt)
-        nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-        scaler.step(opt); scaler.update()
-        if disc:
+    try:
+        while step < a.iters:
+            lr_img, hr_img = (x.to(dev, non_blocking=True) for x in next(it))
+            lr_now = a.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * step / a.iters)))     # cosine to 10%
+            for g in opt.param_groups:
+                g["lr"] = lr_now
             with torch.autocast(dev.type, torch.float16, enabled=dev.type == "cuda"):
-                ld = F.softplus(-disc(hr_img)).mean() + F.softplus(disc(pred.detach())).mean()
-            d_opt.zero_grad(set_to_none=True)
-            d_scaler.scale(ld).backward(); d_scaler.step(d_opt); d_scaler.update()
-            logs["d"] = ld.item()
-        step += 1
-        decay = min(0.999, (1 + step) / (10 + step))
-        with torch.no_grad():
-            for pe, pn in zip(ema.parameters(), net.parameters()):
-                pe.mul_(decay).add_(pn.detach(), alpha=1 - decay)
-        for k, v in logs.items():
-            run[k] = run.get(k, 0) + v
-        last_l1 = logs["l1"]
-        if step % 10 == 0:
-            el = time.time() - run_t0
-            sps = el / max(step - start_step, 1)          # (average over this run, saves included)
-            eta = (a.iters - step) * sps
-            live.fields([f"{progress_web.bar(step / a.iters, 20)} {100 * step / a.iters:5.1f}%  {step}/{a.iters}",
-                         f"ETA {progress_web.hms(eta)} (~{progress_web.clock_in(eta)})",
-                         f"{sps:.2f} s/step", f"elapsed {progress_web.hms(el)}",
-                         f"l1 {last_l1:.4f}"] + ([f"best {best:.2f} dB"] if best > -1e8 else []))
-            if prog:
-                prog.set(step=step, eta=eta, speed_text=f"{sps:.2f} s/step")
-        if step % 100 == 0:
-            el = time.time() - t0
-            say(f"step {step}/{a.iters}  " + "  ".join(f"{k} {v / 100:.4f}" for k, v in run.items())
-                + f"  lr {lr_now:.2e}  {el / 100:.2f} s/step")
-            if prog:
-                prog.point("loss (L1)", step, run["l1"] / 100)
-                prog.metric(**{k: f"{v / 100:.4f}" for k, v in run.items()})
-            run, t0 = {}, time.time()
-        if step % a.save_every == 0 or step == a.iters:
-            score = psnr_on(ema, dev, root, val, a.val_crop)
-            net.train()
-            note = ""
-            if score > best:
-                best = score; note = " (best)"
-                torch.save({"params_ema": ema.state_dict()}, out / "dvd2bd_best.pth")
-            torch.save({"params_ema": ema.state_dict()}, out / "dvd2bd_latest.pth")
-            torch.save({"net": net.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
-                        "step": step, "best": best,
-                        **({"disc": disc.state_dict(), "d_opt": d_opt.state_dict()} if disc else {})}, state_path)
-            say(f"== step {step}: held-out PSNR {score:.2f} dB{note}   (bicubic {floor:.2f}"
-                + (f", start {base:.2f}" if base is not None else "") + ")")
-            if prog:
-                prog.point("held-out PSNR (dB)", step, score)
-                prog.metric(**{"best PSNR": f"{best:.2f} dB"})
+                pred = net(lr_img)
+                loss = F.l1_loss(pred, hr_img)
+                logs = {"l1": loss.item()}
+                if vgg:
+                    lp = vgg(pred.clamp(0, 1), hr_img)
+                    loss = loss + a.perceptual * lp; logs["vgg"] = lp.item()
+                if disc:
+                    lg = F.softplus(-disc(pred)).mean()           # fool the discriminator
+                    loss = loss + a.gan * lg; logs["g"] = lg.item()
+            opt.zero_grad(set_to_none=True)
+            scaler.scale(loss).backward()
+            scaler.unscale_(opt)
+            nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+            scaler.step(opt); scaler.update()
+            if disc:
+                with torch.autocast(dev.type, torch.float16, enabled=dev.type == "cuda"):
+                    ld = F.softplus(-disc(hr_img)).mean() + F.softplus(disc(pred.detach())).mean()
+                d_opt.zero_grad(set_to_none=True)
+                d_scaler.scale(ld).backward(); d_scaler.step(d_opt); d_scaler.update()
+                logs["d"] = ld.item()
+            step += 1
+            decay = min(0.999, (1 + step) / (10 + step))
+            with torch.no_grad():
+                for pe, pn in zip(ema.parameters(), net.parameters()):
+                    pe.mul_(decay).add_(pn.detach(), alpha=1 - decay)
+            for k, v in logs.items():
+                run[k] = run.get(k, 0) + v
+            last_l1 = logs["l1"]
+            if step % 10 == 0:
+                el = time.time() - run_t0
+                sps = el / max(step - start_step, 1)          # (average over this run, saves included)
+                eta = (a.iters - step) * sps
+                live.fields([f"{progress_web.bar(step / a.iters, 20)} {100 * step / a.iters:5.1f}%  {step}/{a.iters}",
+                             f"ETA {progress_web.hms(eta)} (~{progress_web.clock_in(eta)})",
+                             f"{sps:.2f} s/step", f"elapsed {progress_web.hms(el)}",
+                             f"l1 {last_l1:.4f}"] + ([f"best {best:.2f} dB"] if best > -1e8 else []))
+                if prog:
+                    prog.set(step=step, eta=eta, speed_text=f"{sps:.2f} s/step")
+            if step % 100 == 0:
+                el = time.time() - t0
+                say(f"step {step}/{a.iters}  " + "  ".join(f"{k} {v / 100:.4f}" for k, v in run.items())
+                    + f"  lr {lr_now:.2e}  {el / 100:.2f} s/step")
+                if prog:
+                    prog.point("loss (L1)", step, run["l1"] / 100)
+                    prog.metric(**{k: f"{v / 100:.4f}" for k, v in run.items()})
+                run, t0 = {}, time.time()
+            if step % a.save_every == 0 or step == a.iters:
+                score = psnr_on(ema, dev, root, val, a.val_crop)
+                net.train()
+                note = ""
+                if score > best:
+                    best = score; note = " (best)"
+                    torch.save({"params_ema": ema.state_dict()}, out / "dvd2bd_best.pth")
+                save_state()
+                say(f"== step {step}: held-out PSNR {score:.2f} dB{note}   (bicubic {floor:.2f}"
+                    + (f", start {base:.2f}" if base is not None else "") + ")")
+                if prog:
+                    prog.point("held-out PSNR (dB)", step, score)
+                    prog.metric(**{"best PSNR": f"{best:.2f} dB"})
+    except KeyboardInterrupt:
+        live.clear()
+        print("\nStopping: saving where you are...", flush=True)
+        save_state()
+        print(f"Saved at step {step}/{a.iters}. Run the same command again to carry on from here.")
+        if prog:
+            prog.set(phase=f"stopped at step {step} (run the command again to resume)")
+        return
     if prog:
         prog.set(phase="finished", step=a.iters, eta=0, finished=True)
     live.clear()

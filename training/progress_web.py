@@ -63,6 +63,7 @@ class Progress:
                   "speed_text": "", "metrics": {}, "series": {}, "refs": {}, "log": [],
                   "finished": False, "updated": time.time()}
         self.port, self.lock = port, threading.Lock()
+        self.last_hit = 0.0
 
     def set(self, **kw):
         with self.lock:
@@ -91,11 +92,11 @@ class Progress:
             self.s["log"] = (self.s["log"] + [text])[-40:]
             self.s["updated"] = time.time()
 
-    def hold(self, seconds=300):
-        """Keep the page up after the work ends, so a phone can still see 'finished'."""
-        if not getattr(self, "started", False):
+    def hold(self, seconds=60):
+        """If someone has the page open, keep it up a little after the end so they see 'finished'."""
+        if not getattr(self, "started", False) or time.time() - self.last_hit > 120:
             return
-        print(f"(the progress page stays up for {seconds // 60} more minutes; Ctrl+C closes it)", flush=True)
+        print(f"(the progress page stays up {seconds} more seconds; Ctrl+C closes it)", flush=True)
         try:
             time.sleep(seconds)
         except KeyboardInterrupt:
@@ -110,6 +111,7 @@ class Progress:
 
         class H(http.server.BaseHTTPRequestHandler):
             def do_GET(self):
+                prog.last_hit = time.time()
                 if self.path.split("?")[0] in ("/", "/index.html"):
                     body, kind = PAGE.encode(), "text/html; charset=utf-8"
                 elif self.path.split("?")[0] == "/state.json":

@@ -270,8 +270,10 @@ def main():
     p.add_argument("--max-warp", type=float, default=0.05, help="largest scale/shear the alignment may apply")
     p.add_argument("--workers", type=int, default=3, help="frames made at the same time (default 3)")
     p.add_argument("--seed", type=int, default=1)
-    p.add_argument("--web", type=int, default=0, metavar="PORT",
-                   help="live progress page for a browser or phone, e.g. --web 8644 (see progress_web.py)")
+    p.add_argument("--web", type=int, default=8644, metavar="PORT",
+                   help="live progress page for a browser or phone (default port 8644; 0 turns it off)")
+    p.add_argument("--fresh", action="store_true",
+                   help="start over: delete the pairs already in --out (by default a run carries on from them)")
     a = p.parse_args()
     global PROG, LIVE
     import progress_web
@@ -282,6 +284,24 @@ def main():
     out = Path(a.out)
     (out / "lr").mkdir(parents=True, exist_ok=True)
     (out / "hr").mkdir(exist_ok=True)
+    csv_path = out / "pairs.csv"
+    if a.fresh:
+        for sub in ("lr", "hr"):
+            for f in (out / sub).glob("*.png"):
+                f.unlink()
+        if csv_path.exists():
+            csv_path.unlink()
+    done_times, have = set(), 0
+    if csv_path.exists():
+        with open(csv_path, newline="") as fh:
+            for r in csv.DictReader(fh):
+                done_times.add(round(float(r["t_dvd"]), 3))
+                have = max(have, int(r["name"]))
+    if have:
+        say(f"found {have} pairs already in {out}: carrying on from there (--fresh starts over)")
+        if have >= a.count:
+            say(f"already {have} pairs, which is --count {a.count} or more: nothing to do")
+            return
     dw, dh, dsar, ddur, _ = probe(a.dvd)
     bw, bh, _, bdur, bd_fps = probe(a.bluray)
     print(f"DVD {dw}x{dh} sar {dsar}, {ddur / 60:.1f} min;  Blu-ray {bw}x{bh}, {bdur / 60:.1f} min")
@@ -312,14 +332,17 @@ def main():
     n_try = int(a.count * 1.6)
     times = [lo + (hi - lo) * (i + rng.random()) / n_try for i in range(n_try)]
     rng.shuffle(times)
-    done, rejects = 0, Counter()
+    times = [t for t in times if round(t, 3) not in done_times]
+    done, rejects = have, Counter()
     t_start = time.time()
     if PROG:
-        PROG.set(phase="making pairs", step=0, total=a.count, unit="pairs", eta=None, speed_text="")
+        PROG.set(phase="making pairs", step=have, total=a.count, unit="pairs", eta=None, speed_text="")
     work = lambda t: make_pair(a, t, dvd_crop, bd_crop, dvd_pre, lrw, lrh, anchors, bd_fps)
-    with open(out / "pairs.csv", "w", newline="") as fh, ThreadPoolExecutor(max(1, a.workers)) as ex:
+    stopped = False
+    with open(csv_path, "a" if have else "w", newline="") as fh, ThreadPoolExecutor(max(1, a.workers)) as ex:
         wr = csv.writer(fh)
-        wr.writerow(["name", "t_dvd", "t_bd", "ecc", "ncc", "sharp_ratio"])
+        if not have:
+            wr.writerow(["name", "t_dvd", "t_bd", "ecc", "ncc", "sharp_ratio"])
         futs = [ex.submit(work, t) for t in times]
         try:
             for f in as_completed(futs):
@@ -336,20 +359,30 @@ def main():
                 if done % 25 == 0:
                     say(f"  {done}/{a.count} pairs  (rejected: {dict(rejects)})")
                 el = time.time() - t_start
-                eta = el / done * (a.count - done)
+                new = done - have                       # (made in this run: the speed and ETA are from these)
+                eta = el / new * (a.count - done)
                 LIVE.fields([f"{progress_web.bar(done / a.count, 20)} {100 * done / a.count:5.1f}%  {done}/{a.count}",
                              f"ETA {progress_web.hms(eta)} (~{progress_web.clock_in(eta)})",
-                             f"{done / el * 60:.1f} pairs/min", f"elapsed {progress_web.hms(el)}",
+                             f"{new / el * 60:.1f} pairs/min", f"elapsed {progress_web.hms(el)}",
                              f"rejected {sum(rejects.values())}"])
                 if PROG:
-                    PROG.set(step=done, eta=eta, speed_text=f"{done / el * 60:.1f} pairs/min")
+                    PROG.set(step=done, eta=eta, speed_text=f"{new / el * 60:.1f} pairs/min")
                     PROG.metric(rejected=sum(rejects.values()))
                 if done >= a.count:
                     break
+        except KeyboardInterrupt:
+            stopped = True
+            LIVE.clear()
+            print("\nStopping (finishing the frames in progress)...", flush=True)
         finally:
             for f in futs:
                 f.cancel()
     LIVE.clear()
+    if stopped:
+        say(f"Stopped with {done} pairs saved in {out}. Run the same command again to carry on from here.")
+        if PROG:
+            PROG.set(phase=f"stopped at {done} pairs (run the command again to resume)")
+        return
     say(f"done: {done} pairs in {out}  (rejected: {dict(rejects)})")
     if PROG:
         PROG.set(phase="finished", step=done, eta=0, finished=True)
