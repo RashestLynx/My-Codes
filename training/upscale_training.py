@@ -327,8 +327,9 @@ class HwMonitor:
                 bits = int(v[9], 16)
             except ValueError:
                 bits = 0
-            self.gpu = dict(name=v[0], watts=num(v[1]), watts_max=num(v[2]), busy=num(v[3]), temp=num(v[4]),
-                            clock=num(v[5]), clock_max=num(v[6]), mem=num(v[7]), mem_max=num(v[8]),
+            z = lambda x: num(x) or 0.0                  # (a "[N/A]" reading shows as 0, never crashes the training)
+            self.gpu = dict(name=v[0], watts=num(v[1]), watts_max=num(v[2]), busy=z(v[3]), temp=z(v[4]),
+                            clock=z(v[5]), clock_max=z(v[6]), mem=z(v[7]), mem_max=z(v[8]),
                             slowed=[n for b, n in THROTTLE_BITS if bits & b], bits=bits)
         except (OSError, subprocess.SubprocessError, IndexError, ValueError) as e:
             self.err = str(e)
