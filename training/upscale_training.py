@@ -417,8 +417,8 @@ def verdict(hw, wait_frac, step_s):
         return "GPU memory is nearly full: Windows may be swapping it; try --batch 4 or --checkpoint."
     busy = hw.avg("busy")
     if busy is not None and busy < 70:
-        return (f"GPU only {busy:.0f}% busy but data wait is {100 * wait_frac:.0f}%: something else on the "
-                "PC is using it, or the steps are too small.")
+        return (f"GPU only {busy:.0f}% busy but data wait is {100 * wait_frac:.0f}%: the steps are too small for it "
+                "(try --batch auto), or something else on the PC is using it.")
     return "the GPU is the limit (busy, cool, not waiting for data): this is as fast as it goes. Lower --batch/--patch or --iters to finish sooner."
 
 
@@ -1035,6 +1035,36 @@ def fmt_scores(r):
     return f"{r['psnr']:.2f} dB, SSIM {r['ssim']:.4f}" + (f", LPIPS {r['lpips']:.4f}" if "lpips" in r else "")
 
 
+def auto_batch(net, dev, patch, per, frac):
+    """The largest batch (a multiple of --crops, up to 48) whose forward + backward pass stays within `frac`
+    of the graphics card's memory (less when --gan / --perceptual need room for a second network)."""
+    total = torch.cuda.get_device_properties(dev).total_memory
+    best = max(per, 8 - 8 % per)
+    net.train()
+    for b in (8, 12, 16, 24, 32, 48):
+        b = max(per, b - b % per)
+        if b <= best:
+            continue
+        try:
+            torch.cuda.empty_cache()
+            torch.cuda.reset_peak_memory_stats(dev)
+            x = torch.rand(b, 3, patch, patch, device=dev)
+            with torch.autocast(dev.type, torch.float16):
+                loss = net(x).float().mean()
+            loss.backward()
+            peak = torch.cuda.max_memory_allocated(dev)
+        except torch.cuda.OutOfMemoryError:
+            break
+        finally:
+            net.zero_grad(set_to_none=True)
+            x = loss = None
+            torch.cuda.empty_cache()
+        if peak > frac * total:
+            break
+        best = b
+    return best
+
+
 def stage_train(a, root, out):
     """Step 2: fine-tune on the pairs in root. Carries on from out/train_state.pt.
     True when finished, False when stopped with Ctrl+C."""
@@ -1073,6 +1103,12 @@ def stage_train(a, root, out):
     else:
         print("WARNING: random start (--pretrained none): only for testing the scripts")
     net.use_checkpoint = a.checkpoint
+    cl = dev.type == "cuda" and not a.no_channels_last
+    if cl:
+        net = net.to(memory_format=torch.channels_last)          # (the layout tensor cores like: faster fp16 convolutions)
+    if a.batch == "auto":
+        a.batch = auto_batch(net, dev, a.patch, max(1, a.crops), 0.6 if (a.gan or a.perceptual) else 0.75) if dev.type == "cuda" else 8
+        say(f"--batch auto: {a.batch} patches per step")
     ema = copy.deepcopy(net).eval()
     for q in ema.parameters():
         q.requires_grad = False
@@ -1142,6 +1178,8 @@ def stage_train(a, root, out):
             batch = next(it)                       # (blocks while the data loader is behind)
             wait_t += time.time() - w0
             lr_img, hr_img = (x.to(dev, non_blocking=True) for x in batch)
+            if cl:
+                lr_img = lr_img.contiguous(memory_format=torch.channels_last)
             lr_now = a.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * step / a.iters)))     # cosine to 10%
             for g in opt.param_groups:
                 g["lr"] = lr_now
@@ -1404,6 +1442,10 @@ def stage_export(a, run_dir, work):
     return True
 
 
+def batch_arg(v):
+    return v if v == "auto" else int(v)
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dvd", help="the DVD movie file")
@@ -1429,7 +1471,7 @@ def main():
     g.add_argument("--min-ecc", type=float, default=0.90)
     g.add_argument("--min-ncc", type=float, default=0.93)
     g.add_argument("--max-warp", type=float, default=0.05, help="largest scale/shear the alignment may apply")
-    g.add_argument("--pair-workers", type=int, default=3, help="frames made at the same time (default 3)")
+    g.add_argument("--pair-workers", type=int, default=None, help="frames made at the same time (default: from the number of processor cores, 2 to 6)")
     g.add_argument("--seed", type=int, default=1)
     g = p.add_argument_group("step 2: train")
     g.add_argument("--arch", choices=["rrdb", "compact"], default="rrdb",
@@ -1440,7 +1482,9 @@ def main():
     g.add_argument("--pretrained", default=None,
                    help="the starting model (default: RealESRGAN_x2plus.pth next to this script for rrdb, none for compact)")
     g.add_argument("--iters", type=int, default=20000)
-    g.add_argument("--batch", type=int, default=8, help="patches per step (default 8)")
+    g.add_argument("--batch", type=batch_arg, default=8,
+                   help="patches per step (default 8). 'auto' tries bigger and bigger batches and keeps the largest "
+                        "that fits in the graphics card's memory: use it when the monitor shows the GPU under-used")
     g.add_argument("--patch", type=int, default=96, help="DVD patch size in pixels (default 96)")
     g.add_argument("--lr", type=float, default=5e-5)
     g.add_argument("--perceptual", type=float, default=0.0)
@@ -1450,13 +1494,19 @@ def main():
     g.add_argument("--rotate", action="store_true", help="also turn patches by 90 degrees (off: a DVD's blur has a direction)")
     g.add_argument("--lpips", action="store_true", help="also judge held-out frames with LPIPS (pip install lpips)")
     g.add_argument("--checkpoint", action="store_true", help="trade speed for much less GPU memory")
-    g.add_argument("--train-workers", type=int, default=2, help="data loading processes (default 2)")
+    g.add_argument("--train-workers", type=int, default=None, help="data loading processes (default: from the number of processor cores, 2 to 8)")
+    g.add_argument("--no-channels-last", action="store_true", help="turn off the GPU-friendly memory layout (on by default with CUDA)")
     g.add_argument("--save-every", type=int, default=1000)
     g.add_argument("--val-crop", type=int, default=384, help="held-out frames are judged on this centre square (DVD px)")
     g = p.add_argument_group("step 3: export")
     g.add_argument("--name", default="upscale-training-x2", help="model name for dvd_upscale.py --model (default upscale-training-x2)")
     g.add_argument("--models", help="the upscaler's models folder (default: found next to realesrgan-ncnn-vulkan)")
     a = p.parse_args()
+    cores = os.cpu_count() or 4
+    if a.train_workers is None:
+        a.train_workers = max(2, min(8, cores // 2))
+    if a.pair_workers is None:
+        a.pair_workers = max(2, min(6, cores // 3))
     if a.pretrained is None:
         a.pretrained = str(Path(__file__).resolve().parent / "RealESRGAN_x2plus.pth") if a.arch == "rrdb" else "none"
 

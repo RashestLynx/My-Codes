@@ -40,6 +40,10 @@ or phone starts by itself (port 8643); the address is printed. `--web 0` turns i
 - The progress line and page also show GPU watts / load / temperature / clock, CPU load, and a one-line
   verdict on what limits the speed (data loading, heat, power limit, or the GPU itself). CPU watts can't be read
   from Python: use HWiNFO for those.
+- Using more of the PC: the processor workers now scale with your core count (override with `--train-workers`,
+  `--pair-workers`), the GPU memory layout is tensor-core friendly, and `--batch auto` picks the biggest batch that
+  fits in the graphics card's memory. Use it when the monitor shows the GPU under 90% busy; if it is already
+  ~100% busy, the GPU is maxed out and only a smaller job (`--iters`, `--arch compact`) will finish sooner.
 - `--lpips` (needs `pip install lpips`) adds LPIPS to the held-out scores next to PSNR and SSIM.
 - `--gan` uses Real-ESRGAN's U-Net discriminator (`--disc patch` for the old one). `--rotate` also turns patches
   by 90 degrees; it is off because a DVD's blur has a direction.
