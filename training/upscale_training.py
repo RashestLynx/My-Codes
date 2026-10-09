@@ -450,6 +450,153 @@ def verdict(hw, wait_frac, step_s):
     return "the GPU is the limit (busy, cool, not waiting for data): this is as fast as it goes. Lower --batch/--patch or --iters to finish sooner."
 
 
+# =============================== keeping a long run safe (the same habits as dvd_upscale.py) ===============================
+def fsync_file(path):
+    """Push a just-written file to the disk, so a power cut right after can't leave it cut short."""
+    try:
+        with open(path, "rb+") as f:
+            os.fsync(f.fileno())
+    except OSError:
+        pass
+
+
+def replace_file(src, dst):
+    """os.replace, retried for a few seconds on Windows, where a virus scanner or the search indexer
+    briefly holds a file it has just seen written."""
+    for attempt in range(20):
+        try:
+            return os.replace(src, dst)
+        except PermissionError:
+            if os.name != "nt" or attempt == 19:
+                raise
+            time.sleep(0.5)
+
+
+def save_durably(obj, path, keep_prev=False):
+    """torch.save so that a crash or power cut never leaves a half-written file: a temporary file, flushed to
+    disk, then renamed over the old one (which stays as name.prev with keep_prev)."""
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(obj, tmp)
+    fsync_file(tmp)
+    if keep_prev and path.exists():
+        replace_file(path, path.with_name(path.name + ".prev"))
+    replace_file(tmp, path)
+
+
+def write_png_durably(path, img):
+    ok, buf = cv2.imencode(".png", img)
+    if not ok:
+        raise OSError(f"can't write {path}")
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "wb") as f:
+        f.write(buf.tobytes())
+        f.flush()
+        os.fsync(f.fileno())
+    replace_file(tmp, path)
+
+
+def write_json_durably(path, obj):
+    path = Path(path)
+    tmp = path.with_name(path.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=1)
+        f.flush()
+        os.fsync(f.fileno())
+    replace_file(tmp, path)
+
+
+def load_state(path, dev):
+    """(state, file) from train_state.pt, or from the one before it when the newest can't be read.
+    (None, None) when there is neither: a fresh start. Stops if files exist but none can be read."""
+    path, found = Path(path), False
+    for p in (path, path.with_name(path.name + ".prev")):
+        if p.exists():
+            found = True
+            try:
+                return torch.load(p, map_location=dev, weights_only=False), p      # (our own file)
+            except Exception as e:
+                say(f"{p.name} can't be read ({str(e).strip().splitlines()[0][:70] if str(e).strip() else 'damaged'}): trying the one before it")
+    if found:
+        sys.exit(f"the saved training in {path.parent} can't be read (both {path.name} and its backup are damaged).\n"
+                 "Move that folder away to start the training over (the pairs are kept if they are in --work).")
+    return None, None
+
+
+def check_disk(folder, need, what):
+    """A warning, not a stop, when the drive of `folder` has less than `need` bytes free."""
+    try:
+        Path(folder).mkdir(parents=True, exist_ok=True)
+        free = shutil.disk_usage(folder).free
+    except OSError:
+        return                                            # (a share that can't say how much is free)
+    if free < need:
+        say(f"WARNING: the drive of {folder} has {free / 1e9:.1f} GB free; {what} needs about {need / 1e9:.1f} GB there.")
+
+
+def keep_awake():
+    """CPU/GPU work doesn't count as activity: keep the computer from sleeping while this runs (released
+    when it exits; closing a laptop's lid still sleeps). On Windows also run above normal priority, so a
+    browser or antivirus scan doesn't take the processor first and leave the GPU waiting for data."""
+    if os.name == "nt":
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+        try:
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            k32.SetPriorityClass(ctypes.c_void_p(k32.GetCurrentProcess()), 0x00008000)      # (the loader processes inherit it)
+        except (OSError, AttributeError):
+            pass
+        return
+    pid = str(os.getpid())
+    for cmd in (["caffeinate", "-i", "-w", pid],
+                ["systemd-inhibit", "--what=sleep:idle", "--who=upscale_training.py",
+                 "--why=training an upscaling model", "tail", f"--pid={pid}", "-f", "/dev/null"]):
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+            return
+
+
+def hold_lock(path, message):
+    """Take a lock file, or exit with message if another run holds it. The OS releases the lock by itself when
+    this run exits, crashes or the PC shuts down, so it never needs clearing. Keep the returned file open."""
+    f = open(path, "a+")
+    try:
+        if os.name == "nt":
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(message)
+    return f
+
+
+SETTINGS_KEYS = ("arch", "compact_feat", "compact_convs", "patch", "crops", "batch", "lr", "iters", "perceptual",
+                 "gan", "disc", "rotate", "pretrained")
+
+
+def note_settings(a, run_dir, resuming):
+    """Remember the training settings; when resuming, say which ones differ from the earlier run."""
+    now = {k: str(getattr(a, k)) for k in SETTINGS_KEYS}
+    f = Path(run_dir) / "settings.json"
+    if resuming:
+        try:
+            old = json.loads(f.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            old = {}
+        diff = [f"--{k.replace('_', '-')} {old[k]} -> {now[k]}" for k in SETTINGS_KEYS if k in old and old[k] != now[k]]
+        if diff:
+            say("NOTE: resuming with different settings than the earlier run: " + ";  ".join(diff))
+    write_json_durably(f, now)
+
+
 # =============================== step 1: the DVD / Blu-ray pairs ===============================
 THUMB = (64, 36)
 PROG = None                 # the live progress page (--web), when asked for
@@ -457,6 +604,7 @@ PROG = None                 # the live progress page (--web), when asked for
 
 LIVE = None                 # the status line in the console
 HW = None                   # the hardware monitor (GPU watts, load, heat, CPU)
+LOCK = None                 # the open lock file of the work folder (kept open while running)
 
 
 def say(msg):
@@ -708,6 +856,7 @@ def stage_pairs(a, out):
               "(a re-framed transfer: pairs will be rejected or distorted)")
     lrw -= lrw % 2
     lrh -= lrh % 2
+    check_disk(out, int((a.count - have) * lrw * lrh * 3 * 5 * 0.55 * 1.2), f"{a.count} pairs")
 
     cropped_bd_pre = ([f"crop={bd_crop[0]}:{bd_crop[1]}:{bd_crop[2]}:{bd_crop[3]}"] if bd_crop else [])
     cropped_dvd_pre = dvd_pre + [f"crop={dvd_crop[0]}:{dvd_crop[1]}:{dvd_crop[2]}:{dvd_crop[3]}"]
@@ -746,10 +895,11 @@ def stage_pairs(a, out):
                     continue
                 done += 1
                 name = f"{done:06d}"
-                cv2.imwrite(str(out / "lr" / f"{name}.png"), lr)
-                cv2.imwrite(str(out / "hr" / f"{name}.png"), hr)
+                write_png_durably(out / "lr" / f"{name}.png", lr)
+                write_png_durably(out / "hr" / f"{name}.png", hr)
                 wr.writerow([name, info["t_dvd"], info["t_bd"], info["ecc"], info["ncc"], info["sharp_ratio"]])
                 fh.flush()
+                os.fsync(fh.fileno())
                 if done % 25 == 0:
                     say(f"  {done}/{a.count} pairs  (rejected: {dict(rejects)})")
                 el = time.time() - t_start
@@ -1166,8 +1316,10 @@ def stage_train(a, root, out):
 
     step, best = 0, -1e9
     state_path = out / "train_state.pt"
-    if state_path.exists():
-        st = torch.load(state_path, map_location=dev, weights_only=False)   # (our own file)
+    note_settings(a, out, state_path.exists() or state_path.with_name(state_path.name + ".prev").exists())
+    check_disk(out, int(10 * 4 * sum(q.numel() for q in net.parameters()) * 1.2), "the saved training (and its backup)")
+    if state_path.exists() or state_path.with_name(state_path.name + ".prev").exists():
+        st, used = load_state(state_path, dev)
         if st.get("arch", "rrdb") != a.arch:
             raise SystemExit(f"{state_path} is a '{st.get('arch', 'rrdb')}' training, not '{a.arch}': "
                              "use --arch to match it, or another --work folder for the new network")
@@ -1200,16 +1352,19 @@ def stage_train(a, root, out):
     per = max(1, a.crops)
     ds = Pairs(root, train, a.patch, per, a.rotate)
     workers = a.train_workers * max(1, len(ids))              # (more GPUs eat data faster)
-    dl = torch.utils.data.DataLoader(ds, batch_size=max(1, a.batch // per), num_workers=workers,
-                                     collate_fn=collate, persistent_workers=workers > 0,
-                                     pin_memory=dev.type == "cuda", prefetch_factor=4 if workers > 0 else None)
+    def make_loader():
+        return torch.utils.data.DataLoader(ds, batch_size=max(1, a.batch // per), num_workers=workers,
+                                           collate_fn=collate, persistent_workers=workers > 0,
+                                           pin_memory=dev.type == "cuda", prefetch_factor=4 if workers > 0 else None)
+    dl = make_loader()
+    oom_steps = 0                                        # times the batch was halved after running out of GPU memory
     ema_params, net_params = list(ema.parameters()), list(net.parameters())
     bad = 0                                              # steps in a row with a loss that is not a number
     def save_state():
-        torch.save({"params_ema": ema.state_dict()}, out / "upscale_training_latest.pth")
-        torch.save({"net": net.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
-                    "step": step, "best": best, "scaler": scaler.state_dict(), "arch": a.arch,
-                    **({"disc": disc.state_dict(), "d_opt": d_opt.state_dict()} if disc else {})}, state_path)
+        save_durably({"params_ema": ema.state_dict()}, out / "upscale_training_latest.pth")
+        save_durably({"net": net.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
+                      "step": step, "best": best, "scaler": scaler.state_dict(), "arch": a.arch,
+                      **({"disc": disc.state_dict(), "d_opt": d_opt.state_dict()} if disc else {})}, state_path, keep_prev=True)
 
     it = iter(dl)
     t0, run = time.time(), {}
@@ -1217,104 +1372,124 @@ def stage_train(a, root, out):
     wait_t, loop_t, tick = 0.0, 0.0, time.time()      # data-loader wait vs whole step, for the verdict
     net.train()
     try:
-        while step < a.iters:
-            w0 = time.time()
-            batch = next(it)                       # (blocks while the data loader is behind)
-            wait_t += time.time() - w0
-            lr_img, hr_img = (x.to(dev, non_blocking=True) for x in batch)
-            if cl:
-                lr_img = lr_img.contiguous(memory_format=torch.channels_last)
-            lr_now = a.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * step / a.iters)))     # cosine to 10%
-            for g in opt.param_groups:
-                g["lr"] = lr_now
-            with torch.autocast(dev.type, torch.float16, enabled=dev.type == "cuda"):
-                pred = model(lr_img)
-                loss = F.l1_loss(pred, hr_img)
-                logs = {"l1": loss.item()}
-                if vgg:
-                    lp = vgg(pred.clamp(0, 1), hr_img)
-                    loss = loss + a.perceptual * lp; logs["vgg"] = lp.item()
-                if disc:
-                    disc.requires_grad_(False)                    # (only the generator learns from this score)
-                    lg = F.softplus(-disc(pred)).mean()           # fool the discriminator
-                    disc.requires_grad_(True)
-                    loss = loss + a.gan * lg; logs["g"] = lg.item()
-            if not math.isfinite(logs["l1"]):
-                bad += 1
-                if bad >= 50:
-                    raise SystemExit("the loss has not been a number for 50 steps in a row: training has blown up. "
-                                     "Run again with a lower --lr (e.g. half), or fewer --gan / --perceptual.")
-            else:
-                bad = 0
+        while True:
+            try:
+                while step < a.iters:
+                    w0 = time.time()
+                    batch = next(it)                       # (blocks while the data loader is behind)
+                    wait_t += time.time() - w0
+                    lr_img, hr_img = (x.to(dev, non_blocking=True) for x in batch)
+                    if cl:
+                        lr_img = lr_img.contiguous(memory_format=torch.channels_last)
+                    lr_now = a.lr * (0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * step / a.iters)))     # cosine to 10%
+                    for g in opt.param_groups:
+                        g["lr"] = lr_now
+                    with torch.autocast(dev.type, torch.float16, enabled=dev.type == "cuda"):
+                        pred = model(lr_img)
+                        loss = F.l1_loss(pred, hr_img)
+                        logs = {"l1": loss.item()}
+                        if vgg:
+                            lp = vgg(pred.clamp(0, 1), hr_img)
+                            loss = loss + a.perceptual * lp; logs["vgg"] = lp.item()
+                        if disc:
+                            disc.requires_grad_(False)                    # (only the generator learns from this score)
+                            lg = F.softplus(-disc(pred)).mean()           # fool the discriminator
+                            disc.requires_grad_(True)
+                            loss = loss + a.gan * lg; logs["g"] = lg.item()
+                    if not math.isfinite(logs["l1"]):
+                        bad += 1
+                        if bad >= 50:
+                            raise SystemExit("the loss has not been a number for 50 steps in a row: training has blown up. "
+                                             "Run again with a lower --lr (e.g. half), or fewer --gan / --perceptual.")
+                    else:
+                        bad = 0
+                    opt.zero_grad(set_to_none=True)
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(opt)
+                    nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+                    scaler.step(opt); scaler.update()
+                    if disc:
+                        with torch.autocast(dev.type, torch.float16, enabled=dev.type == "cuda"):
+                            ld = F.softplus(-disc(hr_img)).mean() + F.softplus(disc(pred.detach())).mean()
+                        d_opt.zero_grad(set_to_none=True)
+                        d_scaler.scale(ld).backward(); d_scaler.step(d_opt); d_scaler.update()
+                        logs["d"] = ld.item()
+                    step += 1
+                    decay = min(0.999, (1 + step) / (10 + step))
+                    with torch.no_grad():
+                        torch._foreach_mul_(ema_params, decay)               # (one fused call, not a python loop over ~500 tensors)
+                        torch._foreach_add_(ema_params, net_params, alpha=1 - decay)
+                    for k, v in logs.items():
+                        run[k] = run.get(k, 0) + v
+                    last_l1 = logs["l1"]
+                    loop_t += time.time() - tick
+                    tick = time.time()
+                    if step % 10 == 0:
+                        el = time.time() - run_t0
+                        sps = el / max(step - start_step, 1)          # (average over this run, saves included)
+                        eta = (a.iters - step) * sps
+                        live.fields([f"{bar(step / a.iters, 20)} {100 * step / a.iters:5.1f}%  {step}/{a.iters}",
+                                     f"ETA {hms(eta)} (~{clock_in(eta)})",
+                                     f"{sps:.2f} s/step", f"elapsed {hms(el)}",
+                                     f"l1 {last_l1:.4f}"] + HW.line() + ([f"best {best:.2f} dB"] if best > -1e8 else []))
+                        if prog:
+                            prog.set(step=step, eta=eta, speed_text=f"{sps:.2f} s/step")
+                            prog.metric(**HW.metrics())
+                    if step % 100 == 0:
+                        el = time.time() - t0
+                        say(f"step {step}/{a.iters}  " + "  ".join(f"{k} {v / 100:.4f}" for k, v in run.items())
+                            + f"  lr {lr_now:.2e}  {el / 100:.2f} s/step")
+                        if prog:
+                            prog.point("loss (L1)", step, run["l1"] / 100)
+                            prog.metric(**{k: f"{v / 100:.4f}" for k, v in run.items()})
+                        wf = wait_t / loop_t if loop_t else 0.0
+                        why = verdict(HW, wf, el / 100)
+                        say(f"   hardware: " + "  ".join(f"{k} {v}" for k, v in HW.metrics().items()) + f"  | data wait {100 * wf:.0f}%")
+                        say(f"   -> {why}")
+                        if prog:
+                            prog.metric(**{"data wait": f"{100 * wf:.0f} %", "what limits it": why})
+                            if HW.gpu and HW.gpu["watts"] is not None:
+                                prog.point("GPU power (W)", step, HW.gpu["watts"])
+                            if HW.gpu and HW.gpu["busy"] is not None:
+                                prog.point("GPU busy (%)", step, HW.gpu["busy"])
+                            if HW.cpu is not None:
+                                prog.point("CPU (%)", step, HW.cpu)
+                        run, t0, wait_t, loop_t = {}, time.time(), 0.0, 0.0
+                    if step % a.save_every == 0 or step == a.iters:
+                        res = eval_on(ema, dev, root, val, a.val_crop, lpips_net)
+                        score = res["psnr"]
+                        net.train()
+                        note = ""
+                        if score > best:
+                            best = score; note = " (best)"
+                            save_durably({"params_ema": ema.state_dict()}, out / "upscale_training_best.pth")
+                        save_state()
+                        say(f"== step {step}: held-out {fmt_scores(res)}{note}   (bicubic {fmt_scores(floor)}"
+                            + (f"; start {fmt_scores(base)}" if base is not None else "") + ")")
+                        if prog:
+                            prog.point("held-out PSNR (dB)", step, score)
+                            prog.point("held-out SSIM", step, res["ssim"])
+                            if "lpips" in res:
+                                prog.point("held-out LPIPS (lower is better)", step, res["lpips"])
+                            prog.metric(**{"best PSNR": f"{best:.2f} dB"})
+                break
+            except torch.cuda.OutOfMemoryError:
+                if oom_steps >= 4 or max(1, a.batch // per) <= 1:
+                    raise                               # (nothing smaller left to try: handled below, progress saved)
+            # (outside the except block, so the failed step's tensors can really be freed)
+            oom_steps += 1
+            batch = loss = pred = lr_img = hr_img = None
             opt.zero_grad(set_to_none=True)
-            scaler.scale(loss).backward()
-            scaler.unscale_(opt)
-            nn.utils.clip_grad_norm_(net.parameters(), 1.0)
-            scaler.step(opt); scaler.update()
             if disc:
-                with torch.autocast(dev.type, torch.float16, enabled=dev.type == "cuda"):
-                    ld = F.softplus(-disc(hr_img)).mean() + F.softplus(disc(pred.detach())).mean()
                 d_opt.zero_grad(set_to_none=True)
-                d_scaler.scale(ld).backward(); d_scaler.step(d_opt); d_scaler.update()
-                logs["d"] = ld.item()
-            step += 1
-            decay = min(0.999, (1 + step) / (10 + step))
-            with torch.no_grad():
-                torch._foreach_mul_(ema_params, decay)               # (one fused call, not a python loop over ~500 tensors)
-                torch._foreach_add_(ema_params, net_params, alpha=1 - decay)
-            for k, v in logs.items():
-                run[k] = run.get(k, 0) + v
-            last_l1 = logs["l1"]
-            loop_t += time.time() - tick
-            tick = time.time()
-            if step % 10 == 0:
-                el = time.time() - run_t0
-                sps = el / max(step - start_step, 1)          # (average over this run, saves included)
-                eta = (a.iters - step) * sps
-                live.fields([f"{bar(step / a.iters, 20)} {100 * step / a.iters:5.1f}%  {step}/{a.iters}",
-                             f"ETA {hms(eta)} (~{clock_in(eta)})",
-                             f"{sps:.2f} s/step", f"elapsed {hms(el)}",
-                             f"l1 {last_l1:.4f}"] + HW.line() + ([f"best {best:.2f} dB"] if best > -1e8 else []))
-                if prog:
-                    prog.set(step=step, eta=eta, speed_text=f"{sps:.2f} s/step")
-                    prog.metric(**HW.metrics())
-            if step % 100 == 0:
-                el = time.time() - t0
-                say(f"step {step}/{a.iters}  " + "  ".join(f"{k} {v / 100:.4f}" for k, v in run.items())
-                    + f"  lr {lr_now:.2e}  {el / 100:.2f} s/step")
-                if prog:
-                    prog.point("loss (L1)", step, run["l1"] / 100)
-                    prog.metric(**{k: f"{v / 100:.4f}" for k, v in run.items()})
-                wf = wait_t / loop_t if loop_t else 0.0
-                why = verdict(HW, wf, el / 100)
-                say(f"   hardware: " + "  ".join(f"{k} {v}" for k, v in HW.metrics().items()) + f"  | data wait {100 * wf:.0f}%")
-                say(f"   -> {why}")
-                if prog:
-                    prog.metric(**{"data wait": f"{100 * wf:.0f} %", "what limits it": why})
-                    if HW.gpu and HW.gpu["watts"] is not None:
-                        prog.point("GPU power (W)", step, HW.gpu["watts"])
-                    if HW.gpu and HW.gpu["busy"] is not None:
-                        prog.point("GPU busy (%)", step, HW.gpu["busy"])
-                    if HW.cpu is not None:
-                        prog.point("CPU (%)", step, HW.cpu)
-                run, t0, wait_t, loop_t = {}, time.time(), 0.0, 0.0
-            if step % a.save_every == 0 or step == a.iters:
-                res = eval_on(ema, dev, root, val, a.val_crop, lpips_net)
-                score = res["psnr"]
-                net.train()
-                note = ""
-                if score > best:
-                    best = score; note = " (best)"
-                    torch.save({"params_ema": ema.state_dict()}, out / "upscale_training_best.pth")
-                save_state()
-                say(f"== step {step}: held-out {fmt_scores(res)}{note}   (bicubic {fmt_scores(floor)}"
-                    + (f"; start {fmt_scores(base)}" if base is not None else "") + ")")
-                if prog:
-                    prog.point("held-out PSNR (dB)", step, score)
-                    prog.point("held-out SSIM", step, res["ssim"])
-                    if "lpips" in res:
-                        prog.point("held-out LPIPS (lower is better)", step, res["lpips"])
-                    prog.metric(**{"best PSNR": f"{best:.2f} dB"})
+            torch.cuda.empty_cache()
+            a.batch = max(1, a.batch // per // 2) * per
+            live.clear()
+            say(f"the graphics card ran out of memory: carrying on with half the batch ({a.batch} patches per step)")
+            del it
+            dl = make_loader()
+            it = iter(dl)
+            wait_t, loop_t, tick = 0.0, 0.0, time.time()
     except torch.cuda.OutOfMemoryError:
         live.clear()
         torch.cuda.empty_cache()
@@ -1703,6 +1878,10 @@ def main():
     if "train" in stages and not torch.cuda.is_available():
         print("WARNING: no CUDA GPU found: training would take weeks on the processor")
     work.mkdir(parents=True, exist_ok=True)
+    global LOCK
+    LOCK = hold_lock(work / ".lock", f"Another run is already using the work folder '{work}'. Wait for it to finish (or stop it) first.")
+    if "pairs" in stages or "train" in stages:
+        keep_awake()
     say(f"working folder: {work}")
     titles = {"pairs": "making the DVD / Blu-ray pairs", "train": "training", "export": "making the model for the upscaler"}
     for n, stage in enumerate(stages, 1):
@@ -1726,4 +1905,21 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    for stream in (sys.stdout, sys.stderr):      # a name the console can't show becomes '?', not a crash
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    # ffmpeg/ffprobe next to this script work even when the movies are elsewhere (as with dvd_upscale.py)
+    _here = str(Path(__file__).resolve().parent)
+    if any(shutil.which(t, path=_here) for t in ("ffmpeg", "ffprobe")):
+        os.environ["PATH"] = _here + os.pathsep + os.environ.get("PATH", "")
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nStopped. Run the same command again to carry on.", file=sys.stderr)
+        sys.exit(130)
+    except (subprocess.CalledProcessError, RuntimeError) as e:
+        sys.exit(f"\nFailed: {e}\nRun the same command again to carry on from where it stopped.")
+    except OSError as e:                          # disk full, file in use, missing folder...
+        sys.exit(f"\nFailed: {e}\nFix that and run the same command again: the saved pairs and training are kept.")

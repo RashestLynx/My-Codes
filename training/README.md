@@ -49,6 +49,10 @@ or phone starts by itself (port 8643); the address is printed. `--web 0` turns i
   AMD/Intel graphics can't train; only NVIDIA (CUDA) cards count.
 - New GPU? `python upscale_training.py --gpu-test` lists the cards, times each alone and together, and says whether
   the second one helps and which `--gpus` to use.
+- Safe to interrupt and to leave running: saves are written to a temporary file and renamed (a power cut can't
+  leave a half-written file; the training keeps a `.prev` backup of its save), the PC is kept awake, two runs can't
+  use the same `--work` folder, a changed setting on resume is reported, and if the GPU runs out of memory the
+  batch is halved automatically and training carries on.
 - `--lpips` (needs `pip install lpips`) adds LPIPS to the held-out scores next to PSNR and SSIM.
 - `--gan` uses Real-ESRGAN's U-Net discriminator (`--disc patch` for the old one). `--rotate` also turns patches
   by 90 degrees; it is off because a DVD's blur has a direction.
