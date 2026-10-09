@@ -24,7 +24,7 @@ How the two movies are lined up:
 
 needs: ffmpeg + ffprobe on the PATH, pip install numpy opencv-python
 """
-import argparse, csv, json, os, random, re, subprocess, sys
+import argparse, csv, json, os, random, re, subprocess, sys, time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fractions import Fraction
@@ -33,6 +33,13 @@ import numpy as np
 import cv2
 
 THUMB = (64, 36)
+PROG = None                 # the live progress page (--web), when asked for
+
+
+def say(msg):
+    print(msg, flush=True)
+    if PROG:
+        PROG.log(msg)
 
 
 def run(cmd, binary=False):
@@ -122,8 +129,11 @@ def build_offsets(a, dvd_pre, bd_pre, ddur):
         i += 1
         off, sc = anchor_offset(a, t, guess, span, dvd_pre, bd_pre)
         ok = off is not None and sc >= a.min_anchor
-        print(f"  offset {i}/{n_total} at {t / 60:5.1f} min: "
-              + (f"Blu-ray {off:+7.2f} s, match {sc:.3f}" if ok else f"no clear match ({sc:.2f})"), flush=True)
+        say(f"  offset {i}/{n_total} at {t / 60:5.1f} min: "
+            + (f"Blu-ray {off:+7.2f} s, match {sc:.3f}" if ok else f"no clear match ({sc:.2f})"))
+        if PROG:
+            PROG.set(phase="measuring the offset between the discs", step=i, total=n_total,
+                     unit="offset measurements")
         if ok:
             anchors.append((t, off)); guess, span = off, 40
         else:
@@ -254,7 +264,13 @@ def main():
     p.add_argument("--max-warp", type=float, default=0.05, help="largest scale/shear the alignment may apply")
     p.add_argument("--workers", type=int, default=3, help="frames made at the same time (default 3)")
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--web", type=int, default=0, metavar="PORT",
+                   help="live progress page for a browser or phone, e.g. --web 8644 (see progress_web.py)")
     a = p.parse_args()
+    global PROG
+    if a.web:
+        import progress_web
+        PROG = progress_web.Progress("Making pairs", a.web).start()
 
     out = Path(a.out)
     (out / "lr").mkdir(parents=True, exist_ok=True)
@@ -290,6 +306,9 @@ def main():
     times = [lo + (hi - lo) * (i + rng.random()) / n_try for i in range(n_try)]
     rng.shuffle(times)
     done, rejects = 0, Counter()
+    t_start = time.time()
+    if PROG:
+        PROG.set(phase="making pairs", step=0, total=a.count, unit="pairs", eta=None, speed_text="")
     work = lambda t: make_pair(a, t, dvd_crop, bd_crop, dvd_pre, lrw, lrh, anchors, bd_fps)
     with open(out / "pairs.csv", "w", newline="") as fh, ThreadPoolExecutor(max(1, a.workers)) as ex:
         wr = csv.writer(fh)
@@ -308,15 +327,23 @@ def main():
                 wr.writerow([name, info["t_dvd"], info["t_bd"], info["ecc"], info["ncc"], info["sharp_ratio"]])
                 fh.flush()
                 if done % 25 == 0:
-                    print(f"  {done}/{a.count} pairs  (rejected: {dict(rejects)})", flush=True)
+                    say(f"  {done}/{a.count} pairs  (rejected: {dict(rejects)})")
+                if PROG:
+                    el = time.time() - t_start
+                    PROG.set(step=done, eta=el / done * (a.count - done), speed_text=f"{done / el * 60:.1f} pairs/min")
+                    PROG.metric(rejected=sum(rejects.values()))
                 if done >= a.count:
                     break
         finally:
             for f in futs:
                 f.cancel()
-    print(f"done: {done} pairs in {out}  (rejected: {dict(rejects)})")
+    say(f"done: {done} pairs in {out}  (rejected: {dict(rejects)})")
+    if PROG:
+        PROG.set(phase="finished", step=done, eta=0, finished=True)
     if done < a.count // 2:
         print("few pairs survived: check the picture areas above, or lower --min-thumb/--min-ecc/--min-ncc")
+    if PROG:
+        PROG.hold()
 
 
 if __name__ == "__main__":

@@ -200,7 +200,18 @@ def main():
     p.add_argument("--workers", type=int, default=2)
     p.add_argument("--save-every", type=int, default=1000)
     p.add_argument("--val-crop", type=int, default=384, help="held-out frames are judged on this centre square (DVD px)")
+    p.add_argument("--web", type=int, default=0, metavar="PORT",
+                   help="live progress page for a browser or phone, e.g. --web 8643 (see progress_web.py)")
     a = p.parse_args()
+    prog = None
+    if a.web:
+        import progress_web
+        prog = progress_web.Progress("Training", a.web).start()
+
+    def say(msg):
+        print(msg, flush=True)
+        if prog:
+            prog.log(msg)
 
     dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if dev.type == "cpu":
@@ -212,7 +223,9 @@ def main():
     train = [n for n in names if n not in set(val)]
     if len(train) < 8:
         raise SystemExit(f"only {len(names)} pairs in {root}: make more with make_pairs.py")
-    print(f"{len(train)} training pairs, {len(val)} held out; device {dev}")
+    say(f"{len(train)} training pairs, {len(val)} held out; device {dev}")
+    if prog:
+        prog.set(title=f"Training: {out.name}", total=a.iters, phase="starting")
 
     net = RRDBNetX2().to(dev)
     if a.pretrained != "none":
@@ -238,13 +251,18 @@ def main():
         if disc and "disc" in st:
             disc.load_state_dict(st["disc"]); d_opt.load_state_dict(st["d_opt"])
         step, best = st["step"], st["best"]
-        print(f"resuming at step {step}")
+        say(f"resuming at step {step}")
 
     # where we start from, on frames never trained on
     floor = psnr_plain(root, val, a.val_crop)
     base = psnr_on(ema, dev, root, val, a.val_crop) if step == 0 else None
     if base is not None:
-        print(f"held-out PSNR: plain bicubic {floor:.2f} dB, starting model {base:.2f} dB", flush=True)
+        say(f"held-out PSNR: plain bicubic {floor:.2f} dB, starting model {base:.2f} dB")
+    if prog:
+        prog.ref("held-out PSNR (dB)", "bicubic", floor)
+        if base is not None:
+            prog.ref("held-out PSNR (dB)", "start", base)
+        prog.set(step=step, phase="training")
 
     per = 4
     ds = Pairs(root, train, a.patch, per)
@@ -288,8 +306,12 @@ def main():
             run[k] = run.get(k, 0) + v
         if step % 100 == 0:
             el = time.time() - t0
-            print(f"step {step}/{a.iters}  " + "  ".join(f"{k} {v / 100:.4f}" for k, v in run.items())
-                  + f"  lr {lr_now:.2e}  {el / 100:.2f} s/step", flush=True)
+            say(f"step {step}/{a.iters}  " + "  ".join(f"{k} {v / 100:.4f}" for k, v in run.items())
+                + f"  lr {lr_now:.2e}  {el / 100:.2f} s/step")
+            if prog:
+                prog.set(step=step, eta=(a.iters - step) * el / 100, speed_text=f"{el / 100:.2f} s/step")
+                prog.point("loss (L1)", step, run["l1"] / 100)
+                prog.metric(**{k: f"{v / 100:.4f}" for k, v in run.items()})
             run, t0 = {}, time.time()
         if step % a.save_every == 0 or step == a.iters:
             score = psnr_on(ema, dev, root, val, a.val_crop)
@@ -302,9 +324,16 @@ def main():
             torch.save({"net": net.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
                         "step": step, "best": best,
                         **({"disc": disc.state_dict(), "d_opt": d_opt.state_dict()} if disc else {})}, state_path)
-            print(f"== step {step}: held-out PSNR {score:.2f} dB{note}   (bicubic {floor:.2f}"
-                  + (f", start {base:.2f}" if base is not None else "") + ")", flush=True)
+            say(f"== step {step}: held-out PSNR {score:.2f} dB{note}   (bicubic {floor:.2f}"
+                + (f", start {base:.2f}" if base is not None else "") + ")")
+            if prog:
+                prog.point("held-out PSNR (dB)", step, score)
+                prog.metric(**{"best PSNR": f"{best:.2f} dB"})
+    if prog:
+        prog.set(phase="finished", step=a.iters, eta=0, finished=True)
     print(f"done. Convert with:  python export_ncnn.py {out / 'dvd2bd_latest.pth'} --name dvd2bd-x2")
+    if prog:
+        prog.hold()
 
 
 if __name__ == "__main__":
