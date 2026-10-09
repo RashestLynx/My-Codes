@@ -1036,12 +1036,12 @@ def fmt_scores(r):
 
 
 def auto_batch(net, dev, patch, per, frac):
-    """The largest batch (a multiple of --crops, up to 48) whose forward + backward pass stays within `frac`
+    """The largest batch (a multiple of --crops, up to 96) whose forward + backward pass stays within `frac`
     of the graphics card's memory (less when --gan / --perceptual need room for a second network)."""
     total = torch.cuda.get_device_properties(dev).total_memory
     best = max(per, 8 - 8 % per)
     net.train()
-    for b in (8, 12, 16, 24, 32, 48):
+    for b in (8, 12, 16, 24, 32, 48, 64, 96):
         b = max(per, b - b % per)
         if b <= best:
             continue
@@ -1106,8 +1106,10 @@ def stage_train(a, root, out):
     cl = dev.type == "cuda" and not a.no_channels_last
     if cl:
         net = net.to(memory_format=torch.channels_last)          # (the layout tensor cores like: faster fp16 convolutions)
+    if not 0.1 <= a.gpu_memory <= 0.95:
+        raise SystemExit("--gpu-memory is a share of the card's memory between 0.1 and 0.95 (e.g. 0.9)")
     if a.batch == "auto":
-        a.batch = auto_batch(net, dev, a.patch, max(1, a.crops), 0.6 if (a.gan or a.perceptual) else 0.75) if dev.type == "cuda" else 8
+        a.batch = auto_batch(net, dev, a.patch, max(1, a.crops), a.gpu_memory * (0.8 if (a.gan or a.perceptual) else 1.0)) if dev.type == "cuda" else 8
         say(f"--batch auto: {a.batch} patches per step")
     ema = copy.deepcopy(net).eval()
     for q in ema.parameters():
@@ -1495,6 +1497,9 @@ def main():
     g.add_argument("--lpips", action="store_true", help="also judge held-out frames with LPIPS (pip install lpips)")
     g.add_argument("--checkpoint", action="store_true", help="trade speed for much less GPU memory")
     g.add_argument("--train-workers", type=int, default=None, help="data loading processes (default: from the number of processor cores, 2 to 8)")
+    g.add_argument("--gpu-memory", type=float, default=0.75, metavar="FRACTION",
+                   help="--batch auto fills up to this share of the graphics card's memory (default 0.75; 0.9 uses nearly all, "
+                        "but leaves little room for Windows and other programs and may run out of memory)")
     g.add_argument("--no-channels-last", action="store_true", help="turn off the GPU-friendly memory layout (on by default with CUDA)")
     g.add_argument("--save-every", type=int, default=1000)
     g.add_argument("--val-crop", type=int, default=384, help="held-out frames are judged on this centre square (DVD px)")
