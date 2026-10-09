@@ -1,50 +1,39 @@
-# Train the upscaler on real DVD / Blu-ray pairs
+# Train the upscaler on real DVD / Blu-ray pairs: one file, one command
 
-Three steps, one script each. Needs Python with `torch` (CUDA build), `torchvision`, `numpy`,
-`opencv-python`, and `ffmpeg`/`ffprobe` on the PATH.
+`dvd2bd.py` does everything: it makes aligned frame pairs from a movie you have on both discs,
+fine-tunes Real-ESRGAN x2plus on them, and writes the model your upscaler loads.
+
+Needs Python with `numpy opencv-python torch torchvision` (torch with CUDA), and `ffmpeg`/`ffprobe`
+on the PATH. Put `RealESRGAN_x2plus.pth` next to `dvd2bd.py`
+(https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth).
+The converter to the upscaler's format is built in, so `dvd2bd.py` works on its own.
 
 ```
-# 1. Aligned frame pairs from one movie you own on both discs (about 3000, ~10 GB of PNGs)
-python make_pairs.py --dvd movie_dvd.mkv --bluray movie_bd.mkv --out pairs --count 3000
-
-# 2. Fine-tune Real-ESRGAN x2plus on them (RTX 3060 laptop, 6 GB: ~1-2 s/step, 20000 steps)
-python train.py --pairs pairs --out run1 --pretrained RealESRGAN_x2plus.pth
-
-# 3. Convert for dvd_upscale.py (into the folder where realesrgan-x2plus.param/.bin live)
-python export_ncnn.py run1/dvd2bd_latest.pth --name dvd2bd-x2 --models "C:\DVD Upscaler\models"
-python dvd_upscale.py movie.mkv --model dvd2bd-x2 --scale 2 --test 60     # 60 s preview
+python dvd2bd.py --dvd "movie_dvd.mkv" --bluray "movie_bd.mkv"
 ```
 
-Get `RealESRGAN_x2plus.pth` from
-https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth
+1. **pairs** (a few hours): 3000 aligned DVD / Blu-ray frame pairs into `dvd2bd_work\pairs`
+2. **train** (about 2 hours on an RTX 3060): into `dvd2bd_work\run`
+3. **export**: `dvd2bd-x2.param` / `.bin` into the upscaler's `models` folder (found next to
+   `realesrgan-ncnn-vulkan`; `--models` to point elsewhere)
 
-## What to check
-
-- **make_pairs** prints the offset between the discs from three places in the movie; they must agree
-  (`+2.50 s`, `+2.50 s`, `+2.49 s`). It also prints how many candidates it rejected and why.
-  Look at a few `pairs/lr` / `pairs/hr` pairs yourself. PAL discs: `--speed 1.0427`.
-- **train** prints, on frames it never trains on, the PSNR of plain bicubic, of the starting model,
-  and of your model every 1000 steps. If yours is not clearly above the starting model, the pairs are
-  the problem (misalignment, different grade or cut), not the training.
-- Out of memory: `--batch 4`, `--patch 64`, or `--checkpoint`.
-- Stage 1 (L1 only, the default) is the safe one. `--perceptual 0.5 --gan 0.05` (start from the
-  stage 1 result) adds texture and can invent detail.
-- One film teaches its own grain and grade. A few different films, put together
-  (`make_pairs.py --out pairs` once per film into one folder tree, then merge the `lr`/`hr`
-  folders with renamed files), generalise better. Live action and animation want separate models.
-- A model trained on real Blu-ray frames may deserve more of the AI result than the default
-  blend: try `--ai-blend 1.0`.
+Then: `python dvd_upscale.py <movie> --model dvd2bd-x2 --scale 2`
 
 ## Stopping and carrying on
-- Press **Ctrl+C** at any time. `train.py` saves right then (even between its 1000-step saves) and
-  `make_pairs.py` keeps every pair already made.
-- Run **the same command again** to carry on from where it stopped. Nothing else to do.
-- `make_pairs.py --fresh` starts over (deletes the pairs in `--out`); `train.py` starts over if you
-  give it a new `--out` folder.
-- To train longer after it finished, run the same command with a bigger `--iters`.
+Ctrl+C any time, then run **the same command again**. Finished steps are skipped, the pairs and the
+training both carry on from where they stopped. `--stages train,export` or `--stages export` runs
+only some steps. `--fresh` starts the pairs over. A bigger `--iters` trains longer.
 
 ## Watching progress
-- PowerShell shows one live line: bar, percent, ETA with the clock time it should finish, speed.
-- A page for a browser or phone starts by itself (training: port 8643, pair-making: 8644). It prints
-  the address to open. `--web 0` turns it off. Read-only, no password: use it on your own Wi-Fi.
-- `train.py` uses `RealESRGAN_x2plus.pth` from this folder by default (`--pretrained` to change it).
+PowerShell shows one live line with an ETA and the clock time it should finish. A page for a browser
+or phone starts by itself (port 8643); the address is printed. `--web 0` turns it off.
+
+## What to check
+- The pairs step prints the offset between the discs along the movie (it can change by a minute or
+  more); look at a few `pairs\lr` / `pairs\hr` pictures with the same name: same moment, `hr` sharper.
+- The train step prints, on frames it never trains on, the PSNR of plain bicubic, of the starting
+  model and of yours. Yours should climb past both. If it doesn't, the pairs are the problem.
+- Out of memory: `--batch 4`, `--patch 64`, or `--checkpoint`. PAL disc: `--speed 1.0427`.
+- `--perceptual 0.5 --gan 0.05` adds texture but can invent detail. Do the default first.
+- One film teaches its own grain and grade; test on a movie that wasn't in the training.
+  Live action and animation want separate models. Try `--ai-blend 1.0` with the new model.
