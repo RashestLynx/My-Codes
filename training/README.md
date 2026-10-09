@@ -1,23 +1,23 @@
 # Train the upscaler on real DVD / Blu-ray pairs: one file, one command
 
-`dvd2bd.py` does everything: it makes aligned frame pairs from a movie you have on both discs,
+`upscale_training.py` does everything: it makes aligned frame pairs from a movie you have on both discs,
 fine-tunes Real-ESRGAN x2plus on them, and writes the model your upscaler loads.
 
 Needs Python with `numpy opencv-python torch torchvision` (torch with CUDA), and `ffmpeg`/`ffprobe`
-on the PATH. Put `RealESRGAN_x2plus.pth` next to `dvd2bd.py`
+on the PATH. Put `RealESRGAN_x2plus.pth` next to `upscale_training.py`
 (https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth).
-The converter to the upscaler's format is built in, so `dvd2bd.py` works on its own.
+The converter to the upscaler's format is built in, so `upscale_training.py` works on its own.
 
 ```
-python dvd2bd.py --dvd "movie_dvd.mkv" --bluray "movie_bd.mkv"
+python upscale_training.py --dvd "movie_dvd.mkv" --bluray "movie_bd.mkv"
 ```
 
-1. **pairs** (a few hours): 3000 aligned DVD / Blu-ray frame pairs into `dvd2bd_work\pairs`
-2. **train** (about 2 hours on an RTX 3060): into `dvd2bd_work\run`
-3. **export**: `dvd2bd-x2.param` / `.bin` into the upscaler's `models` folder (found next to
+1. **pairs** (a few hours): 3000 aligned DVD / Blu-ray frame pairs into `upscale_training_work\pairs`
+2. **train** (about 2 hours on an RTX 3060): into `upscale_training_work\run`
+3. **export**: `upscale-training-x2.param` / `.bin` into the upscaler's `models` folder (found next to
    `realesrgan-ncnn-vulkan`; `--models` to point elsewhere)
 
-Then: `python dvd_upscale.py <movie> --model dvd2bd-x2 --scale 2`
+Then: `python dvd_upscale.py <movie> --model upscale-training-x2 --scale 2`
 
 ## Stopping and carrying on
 Ctrl+C any time, then run **the same command again**. Finished steps are skipped, the pairs and the

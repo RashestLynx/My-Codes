@@ -1,19 +1,19 @@
 """DVD -> Blu-ray training in one command: pairs, training, and the model for dvd_upscale.py.
 
 usage:
-  python dvd2bd.py --dvd movie_dvd.mkv --bluray movie_bd.mkv
+  python upscale_training.py --dvd movie_dvd.mkv --bluray movie_bd.mkv
 
 It does three steps, one after the other, and tells you which one it is on:
   1. pairs   aligned DVD / Blu-ray frame pairs from the two movies        (a few hours)
   2. train   fine-tunes Real-ESRGAN x2plus on them                        (about 2 hours on an RTX 3060)
-  3. export  writes dvd2bd-x2.param / .bin into the upscaler's models folder (seconds)
-Everything goes in a folder next to the DVD file (dvd2bd_work/pairs, dvd2bd_work/run); --work puts it elsewhere.
+  3. export  writes upscale-training-x2.param / .bin into the upscaler's models folder (seconds)
+Everything goes in a folder next to the DVD file (upscale_training_work/pairs, upscale_training_work/run); --work puts it elsewhere.
 
 Ctrl+C at any time, then run the same command again: it carries on where it stopped (steps already
 finished are skipped; the pairs and the training both resume). --stages picks steps, e.g.
   --stages train,export        (pairs already made)       --stages export     (just convert again)
 
-Then upscale with:  python dvd_upscale.py <movie> --model dvd2bd-x2 --scale 2
+Then upscale with:  python dvd_upscale.py <movie> --model upscale-training-x2 --scale 2
 
 While it runs, PowerShell shows one live line with an ETA, and a page opens on port 8643 for a browser
 or a phone on the same Wi-Fi (the address is printed; --web 0 turns it off; read-only, no password).
@@ -821,7 +821,7 @@ def stage_train(a, root, out):
     dl = torch.utils.data.DataLoader(ds, batch_size=max(1, a.batch // per), num_workers=a.train_workers,
                                      collate_fn=collate, persistent_workers=a.train_workers > 0)
     def save_state():
-        torch.save({"params_ema": ema.state_dict()}, out / "dvd2bd_latest.pth")
+        torch.save({"params_ema": ema.state_dict()}, out / "upscale_training_latest.pth")
         torch.save({"net": net.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
                     "step": step, "best": best,
                     **({"disc": disc.state_dict(), "d_opt": d_opt.state_dict()} if disc else {})}, state_path)
@@ -889,7 +889,7 @@ def stage_train(a, root, out):
                 note = ""
                 if score > best:
                     best = score; note = " (best)"
-                    torch.save({"params_ema": ema.state_dict()}, out / "dvd2bd_best.pth")
+                    torch.save({"params_ema": ema.state_dict()}, out / "upscale_training_best.pth")
                 save_state()
                 say(f"== step {step}: held-out PSNR {score:.2f} dB{note}   (bicubic {floor:.2f}"
                     + (f", start {base:.2f}" if base is not None else "") + ")")
@@ -1027,7 +1027,7 @@ def find_models_dir():
 
 def stage_export(a, run_dir, work):
     """Step 3: the trained model as .param/.bin where dvd_upscale.py finds it."""
-    best, latest = run_dir / "dvd2bd_best.pth", run_dir / "dvd2bd_latest.pth"
+    best, latest = run_dir / "upscale_training_best.pth", run_dir / "upscale_training_latest.pth"
     # best = highest held-out PSNR, which only means something for the plain L1 training
     pth = best if best.exists() and not (a.gan or a.perceptual) else latest
     if not pth.exists():
@@ -1048,7 +1048,7 @@ def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--dvd", help="the DVD movie file")
     p.add_argument("--bluray", help="the Blu-ray movie file (the same film)")
-    p.add_argument("--work", help="folder for the pairs and the training (default: dvd2bd_work next to the DVD file)")
+    p.add_argument("--work", help="folder for the pairs and the training (default: upscale_training_work next to the DVD file)")
     p.add_argument("--stages", default="pairs,train,export", help="which steps to run (default: pairs,train,export)")
     p.add_argument("--web", type=int, default=8643, metavar="PORT",
                    help="live progress page for a browser or phone (default port 8643; 0 turns it off)")
@@ -1085,7 +1085,7 @@ def main():
     g.add_argument("--save-every", type=int, default=1000)
     g.add_argument("--val-crop", type=int, default=384, help="held-out frames are judged on this centre square (DVD px)")
     g = p.add_argument_group("step 3: export")
-    g.add_argument("--name", default="dvd2bd-x2", help="model name for dvd_upscale.py --model (default dvd2bd-x2)")
+    g.add_argument("--name", default="upscale-training-x2", help="model name for dvd_upscale.py --model (default upscale-training-x2)")
     g.add_argument("--models", help="the upscaler's models folder (default: found next to realesrgan-ncnn-vulkan)")
     a = p.parse_args()
 
@@ -1096,12 +1096,12 @@ def main():
         p.error("--dvd and --bluray are needed to make the pairs")
     if not a.work and not a.dvd:
         p.error("--work (or --dvd, to put it next to the DVD) is needed")
-    work = Path(a.work) if a.work else Path(a.dvd).resolve().parent / "dvd2bd_work"
+    work = Path(a.work) if a.work else Path(a.dvd).resolve().parent / "upscale_training_work"
     pairs_dir, run_dir = work / "pairs", work / "run"
     # fail now, not after hours of pairs
     if "train" in stages and a.pretrained != "none" and not Path(a.pretrained).exists():
         sys.exit(f"starting model not found: {a.pretrained}\nDownload RealESRGAN_x2plus.pth from\n{PRETRAINED_URL}\n"
-                 "and put it in the same folder as dvd2bd.py (or pass its path with --pretrained).")
+                 "and put it in the same folder as upscale_training.py (or pass its path with --pretrained).")
     for f in (a.dvd, a.bluray):
         if f and "pairs" in stages and not Path(f).exists():
             sys.exit(f"file not found: {f}")
