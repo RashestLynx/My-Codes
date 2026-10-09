@@ -35,5 +35,13 @@ or phone starts by itself (port 8643); the address is printed. `--web 0` turns i
   model and of yours. Yours should climb past both. If it doesn't, the pairs are the problem.
 - Out of memory: `--batch 4`, `--patch 64`, or `--checkpoint`. PAL disc: `--speed 1.0427`.
 - `--perceptual 0.5 --gan 0.05` adds texture but can invent detail. Do the default first.
+- `--arch compact` trains a small, fast network that upscales several times quicker, but it learns from zero:
+  use `--iters 100000` or more and `--count 6000` or more pairs. The default (`--arch rrdb`) has the best quality.
+- The progress line and page also show GPU watts / load / temperature / clock, CPU load, and a one-line
+  verdict on what limits the speed (data loading, heat, power limit, or the GPU itself). CPU watts can't be read
+  from Python: use HWiNFO for those.
+- `--lpips` (needs `pip install lpips`) adds LPIPS to the held-out scores next to PSNR and SSIM.
+- `--gan` uses Real-ESRGAN's U-Net discriminator (`--disc patch` for the old one). `--rotate` also turns patches
+  by 90 degrees; it is off because a DVD's blur has a direction.
 - One film teaches its own grain and grade; test on a movie that wasn't in the training.
   Live action and animation want separate models. Try `--ai-blend 1.0` with the new model.

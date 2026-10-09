@@ -275,7 +275,8 @@ def shutil_width():
 THROTTLE_BITS = ((0x4, "power cap"), (0x8, "hardware slowdown"), (0x20, "thermal"),
                  (0x40, "hardware thermal"), (0x80, "power brake"))
 GPU_FIELDS = ("name,power.draw,power.limit,utilization.gpu,temperature.gpu,clocks.sm,clocks.max.sm,"
-              "memory.used,memory.total,clocks_throttle_reasons.active")
+              "memory.used,memory.total")
+REASON_FIELDS = ("clocks_throttle_reasons.active", "clocks_event_reasons.active", None)   # (renamed in newer drivers)
 
 
 def cpu_times():
@@ -304,6 +305,7 @@ class HwMonitor:
 
     def __init__(self, every=2.0):
         self.every, self.gpu, self.cpu, self.err = every, None, None, ""
+        self.reason_field = 0                          # which of REASON_FIELDS this driver understands
         self.smi = shutil.which("nvidia-smi")
         self.hist = []                                 # recent samples, for the verdict
         self.lock = threading.Lock()
@@ -317,21 +319,33 @@ class HwMonitor:
         self._cpu_prev = now
         if not self.smi:
             return
-        try:
-            r = subprocess.run([self.smi, "--query-gpu=" + GPU_FIELDS, "--format=csv,noheader,nounits"],
-                               capture_output=True, text=True, timeout=8, stdin=subprocess.DEVNULL,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            v = [x.strip() for x in r.stdout.splitlines()[0].split(",")]
-            num = lambda x: float(x) if re.fullmatch(r"[\d.]+", x) else None
+        while True:
+            field = REASON_FIELDS[self.reason_field]
             try:
-                bits = int(v[9], 16)
+                r = subprocess.run([self.smi, "--query-gpu=" + GPU_FIELDS + (("," + field) if field else ""),
+                                    "--format=csv,noheader,nounits"],
+                                   capture_output=True, text=True, timeout=8, stdin=subprocess.DEVNULL,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except (OSError, subprocess.SubprocessError) as e:
+                self.err = str(e)
+                return
+            if r.returncode == 0 and r.stdout.strip():
+                break
+            if self.reason_field + 1 >= len(REASON_FIELDS):      # (even the plain query fails: give up quietly)
+                self.err = (r.stderr or "nvidia-smi failed").strip()[:80]
+                return
+            self.reason_field += 1                                # (this driver doesn't know that field: try the next)
+        try:
+            v = [x.strip() for x in r.stdout.splitlines()[0].split(",")]
+            num = lambda x: float(x) if re.fullmatch(r"[\d.]+", x) else None      # ("[N/A]" -> None)
+            try:
+                bits = int(v[9], 16) if len(v) > 9 else 0
             except ValueError:
                 bits = 0
-            z = lambda x: num(x) or 0.0                  # (a "[N/A]" reading shows as 0, never crashes the training)
-            self.gpu = dict(name=v[0], watts=num(v[1]), watts_max=num(v[2]), busy=z(v[3]), temp=z(v[4]),
-                            clock=z(v[5]), clock_max=z(v[6]), mem=z(v[7]), mem_max=z(v[8]),
+            self.gpu = dict(name=v[0], watts=num(v[1]), watts_max=num(v[2]), busy=num(v[3]), temp=num(v[4]),
+                            clock=num(v[5]), clock_max=num(v[6]), mem=num(v[7]), mem_max=num(v[8]),
                             slowed=[n for b, n in THROTTLE_BITS if bits & b], bits=bits)
-        except (OSError, subprocess.SubprocessError, IndexError, ValueError) as e:
+        except (IndexError, ValueError) as e:
             self.err = str(e)
 
     def loop(self):
@@ -350,7 +364,7 @@ class HwMonitor:
         if g:
             if g["watts"] is not None:
                 out.append(f"GPU {g['watts']:.0f}/{g['watts_max'] or 0:.0f} W")
-            out.append(f"{g['busy']:.0f}% busy {g['temp']:.0f}C")
+            out.append(f"{fv(g['busy'], '{:.0f}%')} busy {fv(g['temp'], '{:.0f}C')}")
         if self.cpu is not None:
             out.append(f"CPU {self.cpu:.0f}%")
         return out
@@ -360,10 +374,10 @@ class HwMonitor:
         if g:
             if g["watts"] is not None:
                 m["GPU power"] = f"{g['watts']:.0f} / {g['watts_max'] or 0:.0f} W"
-            m["GPU busy"] = f"{g['busy']:.0f} %"
-            m["GPU temp"] = f"{g['temp']:.0f} C"
-            m["GPU clock"] = f"{g['clock']:.0f} / {g['clock_max']:.0f} MHz"
-            m["GPU memory"] = f"{g['mem']:.0f} / {g['mem_max']:.0f} MiB"
+            m["GPU busy"] = fv(g["busy"], "{:.0f} %")
+            m["GPU temp"] = fv(g["temp"], "{:.0f} C")
+            m["GPU clock"] = fv(g["clock"], "{:.0f}") + " / " + fv(g["clock_max"], "{:.0f} MHz")
+            m["GPU memory"] = fv(g["mem"], "{:.0f}") + " / " + fv(g["mem_max"], "{:.0f} MiB")
             m["slowed by"] = ", ".join(g["slowed"]) or "nothing"
         if self.cpu is not None:
             m["CPU"] = f"{self.cpu:.0f} %"
@@ -374,6 +388,11 @@ class HwMonitor:
             vals = [(h[0] or {}).get(key) if which == 0 else h[1] for h in self.hist]
         vals = [x for x in vals if x is not None]
         return sum(vals) / len(vals) if vals else None
+
+
+def fv(v, fmt):
+    """A GPU reading for display; the driver's "[N/A]" is shown as n/a."""
+    return "n/a" if v is None else fmt.format(v)
 
 
 def verdict(hw, wait_frac, step_s):
@@ -389,12 +408,12 @@ def verdict(hw, wait_frac, step_s):
         return "no nvidia-smi: can't see the GPU (data wait is %.0f%%)" % (100 * wait_frac)
     recent = [(h[0] or {}).get("bits", 0) for h in hw.hist[-8:]]
     if recent and sum(1 for b in recent if b & (0x20 | 0x40)) > len(recent) / 2:
-        return f"SLOW: the GPU is too hot ({g['temp']:.0f} C) and lowers its clock: more airflow / fan curve."
+        return f"SLOW: the GPU is too hot ({fv(g['temp'], '{:.0f} C')}) and lowers its clock: more airflow / fan curve."
     if recent and sum(1 for b in recent if b & 0x4) > len(recent) / 2:
         return "the GPU is at its power limit (normal when fully loaded; it is working as hard as it is allowed)."
     if recent and sum(1 for b in recent if b & 0x8) > len(recent) / 2:
         return "SLOW: hardware slowdown flagged by the GPU (power supply or cable, or heat)."
-    if g["mem_max"] and g["mem"] / g["mem_max"] > 0.95:
+    if g["mem_max"] and g["mem"] is not None and g["mem"] / g["mem_max"] > 0.95:
         return "GPU memory is nearly full: Windows may be swapping it; try --batch 4 or --checkpoint."
     busy = hw.avg("busy")
     if busy is not None and busy < 70:
@@ -782,6 +801,40 @@ class RRDBNetX2(nn.Module):
         return s.conv_last(s.lrelu(s.conv_hr(feat)))
 
 
+class SRVGGNetCompactX2(nn.Module):
+    """Real-ESRGAN's small, fast 'compact' network (realesr-animevideov3 / general-x4v3 style) as a 2x:
+    plain convs + PReLU, a pixel-shuffle at the end and a nearest-neighbour copy of the input added back.
+    Several times faster than RRDBNetX2, but there is no 2x starting model: it trains from random."""
+
+    def __init__(s, nf=64, nconv=16):
+        super().__init__()
+        s.body = nn.ModuleList([nn.Conv2d(3, nf, 3, 1, 1), nn.PReLU(num_parameters=nf)])
+        for _ in range(nconv):
+            s.body += [nn.Conv2d(nf, nf, 3, 1, 1), nn.PReLU(num_parameters=nf)]
+        s.body.append(nn.Conv2d(nf, 3 * 4, 3, 1, 1))
+        s.use_checkpoint = False                          # (kept so both networks take the same switch)
+
+    def forward(s, x):
+        out = x
+        for layer in s.body:
+            out = layer(out)
+        return F.pixel_shuffle(out, 2) + F.interpolate(x, scale_factor=2, mode="nearest")
+
+
+def arch_of(sd):
+    """('rrdb', {}) or ('compact', {nf, nconv}) from the names in a state dict."""
+    if "conv_first.weight" in sd:
+        return "rrdb", {}
+    if "body.0.weight" in sd:
+        last = max(int(k.split(".")[1]) for k in sd if k.startswith("body.") and k.endswith(".weight"))
+        return "compact", dict(nf=sd["body.0.weight"].shape[0], nconv=(last - 2) // 2)
+    raise ValueError("unknown network: neither RRDBNetX2 nor SRVGGNetCompactX2 weights")
+
+
+def make_net(arch, nf=64, nconv=16):
+    return SRVGGNetCompactX2(nf, nconv) if arch == "compact" else RRDBNetX2()
+
+
 def load_weights(net, path):
     sd = torch.load(path, map_location="cpu", weights_only=True)
     net.load_state_dict(sd.get("params_ema", sd.get("params", sd)), strict=True)
@@ -791,8 +844,8 @@ def load_weights(net, path):
 class Pairs(torch.utils.data.Dataset):
     """Each item: `crops` random patches of one random pair -> (lr [n,3,p,p], hr [n,3,2p,2p])."""
 
-    def __init__(s, root, names, patch, crops):
-        s.root, s.names, s.p, s.n = Path(root), names, patch, crops
+    def __init__(s, root, names, patch, crops, rotate=False):
+        s.root, s.names, s.p, s.n, s.rotate = Path(root), names, patch, crops, rotate
 
     def __len__(s):
         return 10 ** 7
@@ -817,8 +870,16 @@ class Pairs(torch.utils.data.Dataset):
                     best = (v, y, x)
             _, y, x = best
             a, b = lr[y:y + p, x:x + p], hr[2 * y:2 * (y + p), 2 * x:2 * (x + p)]
+            # flips are safe. 90-degree turns are off by default: a DVD is stretched sideways (anamorphic),
+            # so its blur and artifacts have a direction the model should learn the right way round (--rotate)
             if random.random() < 0.5:
                 a, b = a[:, ::-1], b[:, ::-1]
+            if random.random() < 0.5:
+                a, b = a[::-1], b[::-1]
+            if s.rotate:
+                k = random.randrange(4)
+                if k:
+                    a, b = np.rot90(a, k), np.rot90(b, k)
             lrs.append(a); hrs.append(b)
         t = lambda L: torch.from_numpy(np.ascontiguousarray(np.stack(L)[..., ::-1])).permute(0, 3, 1, 2).float() / 255
         return t(lrs), t(hrs)
@@ -865,7 +926,37 @@ class VGGLoss(nn.Module):
         return sum(w * F.l1_loss(fp[i], ft[i]) for i, w in s.LAYERS.items())
 
 
-def discriminator():
+class UNetDiscriminatorSN(nn.Module):
+    """Real-ESRGAN's U-Net discriminator with spectral norm: a real/fake score for every pixel, so it
+    judges both the whole picture and the fine detail. Needs --patch a multiple of 4."""
+
+    def __init__(s, nf=64):
+        super().__init__()
+        sn = nn.utils.spectral_norm
+        s.conv0 = nn.Conv2d(3, nf, 3, 1, 1)
+        s.conv1 = sn(nn.Conv2d(nf, nf * 2, 4, 2, 1, bias=False))
+        s.conv2 = sn(nn.Conv2d(nf * 2, nf * 4, 4, 2, 1, bias=False))
+        s.conv3 = sn(nn.Conv2d(nf * 4, nf * 8, 4, 2, 1, bias=False))
+        s.conv4 = sn(nn.Conv2d(nf * 8, nf * 4, 3, 1, 1, bias=False))
+        s.conv5 = sn(nn.Conv2d(nf * 4, nf * 2, 3, 1, 1, bias=False))
+        s.conv6 = sn(nn.Conv2d(nf * 2, nf, 3, 1, 1, bias=False))
+        s.conv7 = sn(nn.Conv2d(nf, nf, 3, 1, 1, bias=False))
+        s.conv8 = sn(nn.Conv2d(nf, nf, 3, 1, 1, bias=False))
+        s.conv9 = nn.Conv2d(nf, 1, 3, 1, 1)
+
+    def forward(s, x):
+        lr = lambda t: F.leaky_relu(t, 0.2)
+        up = lambda t: F.interpolate(t, scale_factor=2, mode="bilinear", align_corners=False)
+        x0 = lr(s.conv0(x)); x1 = lr(s.conv1(x0)); x2 = lr(s.conv2(x1)); x3 = lr(s.conv3(x2))
+        x4 = lr(s.conv4(up(x3))) + x2
+        x5 = lr(s.conv5(up(x4))) + x1
+        x6 = lr(s.conv6(up(x5))) + x0
+        return s.conv9(lr(s.conv8(lr(s.conv7(x6)))))
+
+
+def discriminator(kind="unet"):
+    if kind == "unet":
+        return UNetDiscriminatorSN()
     sn = nn.utils.spectral_norm
     c = lambda i, o, k, st: sn(nn.Conv2d(i, o, k, st, k // 2))
     return nn.Sequential(c(3, 64, 3, 1), nn.LeakyReLU(0.2), c(64, 64, 4, 2), nn.LeakyReLU(0.2),
@@ -875,29 +966,73 @@ def discriminator():
 
 
 # ---- evaluation ----
+_SSIM_WIN = {}
+
+
+def ssim(a, b):
+    """Structural similarity of two [1,3,H,W] images in 0..1 (11x11 gaussian window, sigma 1.5)."""
+    key = (a.device, a.dtype)
+    if key not in _SSIM_WIN:
+        g = torch.exp(-((torch.arange(11, dtype=torch.float32) - 5) ** 2) / (2 * 1.5 ** 2))
+        g = g / g.sum()
+        _SSIM_WIN[key] = (g[:, None] * g[None, :]).expand(3, 1, 11, 11).contiguous().to(a.device, a.dtype)
+    w = _SSIM_WIN[key]
+    f = lambda t: F.conv2d(t, w, groups=3)
+    mu_a, mu_b = f(a), f(b)
+    va, vb, cov = f(a * a) - mu_a ** 2, f(b * b) - mu_b ** 2, f(a * b) - mu_a * mu_b
+    c1, c2 = 0.01 ** 2, 0.03 ** 2
+    return (((2 * mu_a * mu_b + c1) * (2 * cov + c2)) / ((mu_a ** 2 + mu_b ** 2 + c1) * (va + vb + c2))).mean().item()
+
+
+def make_lpips(dev):
+    """LPIPS (pip install lpips) if asked for and available, else None."""
+    try:
+        import lpips
+        return lpips.LPIPS(net="alex", verbose=False).to(dev).eval()
+    except Exception as e:
+        print(f"WARNING: --lpips needs 'pip install lpips' and a first-time download ({str(e).splitlines()[0][:80]}): skipped")
+        return None
+
+
+def scores(out, hr, lp):
+    out = out.float().clamp(0, 1)
+    mse = F.mse_loss(out, hr).item()
+    r = {"psnr": -10 * math.log10(max(mse, 1e-10)), "ssim": ssim(out, hr)}
+    if lp is not None:
+        r["lpips"] = lp(out * 2 - 1, hr * 2 - 1).mean().item()
+    return r
+
+
+def mean_scores(rows):
+    return {k: float(np.mean([r[k] for r in rows])) for k in rows[0]}
+
+
 @torch.no_grad()
-def psnr_on(net, dev, root, names, crop):
+def eval_on(net, dev, root, names, crop, lp=None):
+    """Mean PSNR / SSIM (/ LPIPS) of the network on the held-out pairs."""
     net.eval()
-    vals = []
+    rows = []
     for n in names:
         lr, hr = load_frame(root, n, crop)
         with torch.autocast(dev.type, torch.float16, enabled=dev.type == "cuda"):
             out = net(lr.to(dev))
-        mse = F.mse_loss(out.float().clamp(0, 1), hr.to(dev)).item()
-        vals.append(-10 * math.log10(max(mse, 1e-10)))
-    return float(np.mean(vals))
+        rows.append(scores(out, hr.to(dev), lp))
+    return mean_scores(rows)
 
 
 @torch.no_grad()
-def psnr_plain(root, names, crop):
-    """PSNR of a plain bicubic 2x of the DVD frame: the floor any model must beat."""
-    vals = []
+def eval_plain(dev, root, names, crop, lp=None):
+    """The same for a plain bicubic 2x of the DVD frame: the floor any model must beat."""
+    rows = []
     for n in names:
         lr, hr = load_frame(root, n, crop)
-        up = F.interpolate(lr, scale_factor=2, mode="bicubic", align_corners=False).clamp(0, 1)
-        vals.append(-10 * math.log10(max(F.mse_loss(up, hr).item(), 1e-10)))
-    return float(np.mean(vals))
+        up = F.interpolate(lr.to(dev), scale_factor=2, mode="bicubic", align_corners=False)
+        rows.append(scores(up, hr.to(dev), lp))
+    return mean_scores(rows)
 
+
+def fmt_scores(r):
+    return f"{r['psnr']:.2f} dB, SSIM {r['ssim']:.4f}" + (f", LPIPS {r['lpips']:.4f}" if "lpips" in r else "")
 
 
 def stage_train(a, root, out):
@@ -925,9 +1060,16 @@ def stage_train(a, root, out):
     if prog:
         prog.set(title=f"Training: {out.name}", total=a.iters, phase="starting")
 
-    net = RRDBNetX2().to(dev)
+    if dev.type == "cuda":
+        torch.backends.cudnn.benchmark = True            # (every step has the same shape: the fastest kernels are picked once)
+    if a.gan > 0 and a.disc == "unet" and a.patch % 4:
+        raise SystemExit(f"--patch {a.patch}: the U-Net discriminator needs a multiple of 4 (or use --disc patch)")
+    net = make_net(a.arch, a.compact_feat, a.compact_convs).to(dev)
     if a.pretrained != "none":
         load_weights(net, a.pretrained)
+    elif a.arch == "compact":
+        print("note: the compact network has no 2x starting model, so it learns from zero: it needs far more "
+              "steps than the default (try --iters 100000 or more) and more pairs (--count 6000+)")
     else:
         print("WARNING: random start (--pretrained none): only for testing the scripts")
     net.use_checkpoint = a.checkpoint
@@ -937,7 +1079,8 @@ def stage_train(a, root, out):
     opt = torch.optim.Adam(net.parameters(), lr=a.lr, betas=(0.9, 0.99))
     scaler = torch.amp.GradScaler(enabled=dev.type == "cuda")
     vgg = VGGLoss().to(dev) if a.perceptual > 0 else None
-    disc = discriminator().to(dev) if a.gan > 0 else None
+    disc = discriminator(a.disc).to(dev) if a.gan > 0 else None
+    lpips_net = make_lpips(dev) if a.lpips else None
     d_opt = torch.optim.Adam(disc.parameters(), lr=a.lr, betas=(0.9, 0.99)) if disc else None
     d_scaler = torch.amp.GradScaler(enabled=dev.type == "cuda")
 
@@ -945,33 +1088,47 @@ def stage_train(a, root, out):
     state_path = out / "train_state.pt"
     if state_path.exists():
         st = torch.load(state_path, map_location=dev, weights_only=False)   # (our own file)
+        if st.get("arch", "rrdb") != a.arch:
+            raise SystemExit(f"{state_path} is a '{st.get('arch', 'rrdb')}' training, not '{a.arch}': "
+                             "use --arch to match it, or another --work folder for the new network")
         net.load_state_dict(st["net"]); ema.load_state_dict(st["ema"]); opt.load_state_dict(st["opt"])
         if disc and "disc" in st:
-            disc.load_state_dict(st["disc"]); d_opt.load_state_dict(st["d_opt"])
+            try:
+                disc.load_state_dict(st["disc"]); d_opt.load_state_dict(st["d_opt"])
+            except (RuntimeError, ValueError):
+                say("the saved discriminator is a different kind (--disc): starting a new one")
+                disc = discriminator(a.disc).to(dev)
+                d_opt = torch.optim.Adam(disc.parameters(), lr=a.lr, betas=(0.9, 0.99))
         step, best = st["step"], st["best"]
         if "scaler" in st:
             scaler.load_state_dict(st["scaler"])
         say(f"resuming at step {step}")
 
     # where we start from, on frames never trained on
-    floor = psnr_plain(root, val, a.val_crop)
-    base = psnr_on(ema, dev, root, val, a.val_crop) if step == 0 else None
+    floor = eval_plain(dev, root, val, a.val_crop, lpips_net)
+    base = eval_on(ema, dev, root, val, a.val_crop, lpips_net) if step == 0 else None
     if base is not None:
-        say(f"held-out PSNR: plain bicubic {floor:.2f} dB, starting model {base:.2f} dB")
+        say(f"held-out: plain bicubic {fmt_scores(floor)};  starting model {fmt_scores(base)}")
     if prog:
-        prog.ref("held-out PSNR (dB)", "bicubic", floor)
-        if base is not None:
-            prog.ref("held-out PSNR (dB)", "start", base)
+        for key, name in (("psnr", "held-out PSNR (dB)"), ("ssim", "held-out SSIM"), ("lpips", "held-out LPIPS (lower is better)")):
+            if key in floor:
+                prog.ref(name, "bicubic", floor[key])
+                if base is not None:
+                    prog.ref(name, "start", base[key])
         prog.set(step=step, phase="training")
 
-    per = 4
-    ds = Pairs(root, train, a.patch, per)
-    dl = torch.utils.data.DataLoader(ds, batch_size=max(1, a.batch // per), num_workers=a.train_workers,
-                                     collate_fn=collate, persistent_workers=a.train_workers > 0)
+    per = max(1, a.crops)
+    ds = Pairs(root, train, a.patch, per, a.rotate)
+    workers = a.train_workers
+    dl = torch.utils.data.DataLoader(ds, batch_size=max(1, a.batch // per), num_workers=workers,
+                                     collate_fn=collate, persistent_workers=workers > 0,
+                                     pin_memory=dev.type == "cuda", prefetch_factor=4 if workers > 0 else None)
+    ema_params, net_params = list(ema.parameters()), list(net.parameters())
+    bad = 0                                              # steps in a row with a loss that is not a number
     def save_state():
         torch.save({"params_ema": ema.state_dict()}, out / "upscale_training_latest.pth")
         torch.save({"net": net.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
-                    "step": step, "best": best, "scaler": scaler.state_dict(),
+                    "step": step, "best": best, "scaler": scaler.state_dict(), "arch": a.arch,
                     **({"disc": disc.state_dict(), "d_opt": d_opt.state_dict()} if disc else {})}, state_path)
 
     it = iter(dl)
@@ -996,8 +1153,17 @@ def stage_train(a, root, out):
                     lp = vgg(pred.clamp(0, 1), hr_img)
                     loss = loss + a.perceptual * lp; logs["vgg"] = lp.item()
                 if disc:
+                    disc.requires_grad_(False)                    # (only the generator learns from this score)
                     lg = F.softplus(-disc(pred)).mean()           # fool the discriminator
+                    disc.requires_grad_(True)
                     loss = loss + a.gan * lg; logs["g"] = lg.item()
+            if not math.isfinite(logs["l1"]):
+                bad += 1
+                if bad >= 50:
+                    raise SystemExit("the loss has not been a number for 50 steps in a row: training has blown up. "
+                                     "Run again with a lower --lr (e.g. half), or fewer --gan / --perceptual.")
+            else:
+                bad = 0
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
@@ -1012,8 +1178,8 @@ def stage_train(a, root, out):
             step += 1
             decay = min(0.999, (1 + step) / (10 + step))
             with torch.no_grad():
-                for pe, pn in zip(ema.parameters(), net.parameters()):
-                    pe.mul_(decay).add_(pn.detach(), alpha=1 - decay)
+                torch._foreach_mul_(ema_params, decay)               # (one fused call, not a python loop over ~500 tensors)
+                torch._foreach_add_(ema_params, net_params, alpha=1 - decay)
             for k, v in logs.items():
                 run[k] = run.get(k, 0) + v
             last_l1 = logs["l1"]
@@ -1045,23 +1211,27 @@ def stage_train(a, root, out):
                     prog.metric(**{"data wait": f"{100 * wf:.0f} %", "what limits it": why})
                     if HW.gpu and HW.gpu["watts"] is not None:
                         prog.point("GPU power (W)", step, HW.gpu["watts"])
-                    if HW.gpu:
+                    if HW.gpu and HW.gpu["busy"] is not None:
                         prog.point("GPU busy (%)", step, HW.gpu["busy"])
                     if HW.cpu is not None:
                         prog.point("CPU (%)", step, HW.cpu)
                 run, t0, wait_t, loop_t = {}, time.time(), 0.0, 0.0
             if step % a.save_every == 0 or step == a.iters:
-                score = psnr_on(ema, dev, root, val, a.val_crop)
+                res = eval_on(ema, dev, root, val, a.val_crop, lpips_net)
+                score = res["psnr"]
                 net.train()
                 note = ""
                 if score > best:
                     best = score; note = " (best)"
                     torch.save({"params_ema": ema.state_dict()}, out / "upscale_training_best.pth")
                 save_state()
-                say(f"== step {step}: held-out PSNR {score:.2f} dB{note}   (bicubic {floor:.2f}"
-                    + (f", start {base:.2f}" if base is not None else "") + ")")
+                say(f"== step {step}: held-out {fmt_scores(res)}{note}   (bicubic {fmt_scores(floor)}"
+                    + (f"; start {fmt_scores(base)}" if base is not None else "") + ")")
                 if prog:
                     prog.point("held-out PSNR (dB)", step, score)
+                    prog.point("held-out SSIM", step, res["ssim"])
+                    if "lpips" in res:
+                        prog.point("held-out LPIPS (lower is better)", step, res["lpips"])
                     prog.metric(**{"best PSNR": f"{best:.2f} dB"})
     except KeyboardInterrupt:
         live.clear()
@@ -1084,7 +1254,8 @@ def export_ncnn(pth_file, dest_dir, model_name):
     realesrgan-x2plus, kept as it was). The weights are read back strictly: a wrong file stops here."""
     sd = torch.load(pth_file, map_location="cpu", weights_only=True)   # (weights only: no pickled code runs)
     sd = sd.get("params_ema", sd.get("params", sd))
-    RRDBNetX2().load_state_dict(sd, strict=True)
+    arch, kw = arch_of(sd)
+    make_net(arch, **kw).load_state_dict(sd, strict=True)
     ops, binbuf = [], bytearray()
 
     def fp16_weights(w):
@@ -1114,6 +1285,25 @@ def export_ncnn(pth_file, dest_dir, model_name):
 
     def up2(name, inp, outp):
         ops.append(["Interp", name, [inp], [outp], "0=1 1=2.000000e+00 2=2.000000e+00"])
+
+    if arch == "compact":
+        # conv + PReLU ..., conv to 12 channels, PixelShuffle, plus the input enlarged by nearest-neighbour
+        def prelu(name, inp, outp, key):
+            slope = sd[key + ".weight"]
+            ops.append(["PReLU", name, [inp], [outp], f"0={slope.numel()}"])
+            binbuf.extend(slope.detach().cpu().numpy().astype("<f4").tobytes())
+
+        ops.append(["Input", "data", [], ["data"], ""])
+        x, last = "data", 2 * kw["nconv"] + 2
+        for i in range(0, last, 2):
+            conv(f"conv{i}", x, f"c{i}", f"body.{i}")
+            prelu(f"prelu{i}", f"c{i}", f"p{i}", f"body.{i + 1}")
+            x = f"p{i}"
+        conv(f"conv{last}", x, "c_last", f"body.{last}")
+        ops.append(["PixelShuffle", "shuffle", ["c_last"], ["shuffled"], "0=2"])
+        up2("base", "data", "base_up")
+        add("sum", "shuffled", "base_up", "output")
+        return finish_ncnn(ops, binbuf, dest_dir, model_name)
 
     # first conv folded: W6[o, c, 2*ky+i, 2*kx+j] = W3[o, c*4 + i*2 + j, ky, kx]
     w3 = sd["conv_first.weight"]
@@ -1153,8 +1343,11 @@ def export_ncnn(pth_file, dest_dir, model_name):
     up2("up2", "u1r", "u2"); conv("conv_up2", "u2", "u2c", "conv_up2"); relu("r_up2", "u2c", "u2r")
     conv("conv_hr", "u2r", "hrc", "conv_hr"); relu("r_hr", "hrc", "hrr")
     conv("conv_last", "hrr", "output", "conv_last")
+    return finish_ncnn(ops, binbuf, dest_dir, model_name)
 
-    # ncnn: a blob read by several layers goes through a Split, one copy per reader
+
+def finish_ncnn(ops, binbuf, dest_dir, model_name):
+    """Write the layer list: a blob read by several layers goes through a Split, one copy per reader."""
     readers = {}
     for li, op in enumerate(ops):
         for k, b in enumerate(op[2]):
@@ -1239,14 +1432,23 @@ def main():
     g.add_argument("--pair-workers", type=int, default=3, help="frames made at the same time (default 3)")
     g.add_argument("--seed", type=int, default=1)
     g = p.add_argument_group("step 2: train")
-    g.add_argument("--pretrained", default=str(Path(__file__).resolve().parent / "RealESRGAN_x2plus.pth"),
-                   help="the starting model (default: RealESRGAN_x2plus.pth next to this script; 'none' for a test run)")
+    g.add_argument("--arch", choices=["rrdb", "compact"], default="rrdb",
+                   help="rrdb: Real-ESRGAN x2plus, best quality, slow (default). compact: a small fast network "
+                        "(upscales several times quicker) that learns from zero, so it needs --iters 100000+")
+    g.add_argument("--compact-feat", type=int, default=64, help="compact: channels (default 64)")
+    g.add_argument("--compact-convs", type=int, default=16, help="compact: conv layers (default 16; fewer = faster)")
+    g.add_argument("--pretrained", default=None,
+                   help="the starting model (default: RealESRGAN_x2plus.pth next to this script for rrdb, none for compact)")
     g.add_argument("--iters", type=int, default=20000)
     g.add_argument("--batch", type=int, default=8, help="patches per step (default 8)")
     g.add_argument("--patch", type=int, default=96, help="DVD patch size in pixels (default 96)")
     g.add_argument("--lr", type=float, default=5e-5)
     g.add_argument("--perceptual", type=float, default=0.0)
     g.add_argument("--gan", type=float, default=0.0)
+    g.add_argument("--disc", choices=["unet", "patch"], default="unet", help="discriminator for --gan (default: Real-ESRGAN's U-Net)")
+    g.add_argument("--crops", type=int, default=4, help="patches cut from each pair per step (default 4: --batch 8 loads 2 pairs per step)")
+    g.add_argument("--rotate", action="store_true", help="also turn patches by 90 degrees (off: a DVD's blur has a direction)")
+    g.add_argument("--lpips", action="store_true", help="also judge held-out frames with LPIPS (pip install lpips)")
     g.add_argument("--checkpoint", action="store_true", help="trade speed for much less GPU memory")
     g.add_argument("--train-workers", type=int, default=2, help="data loading processes (default 2)")
     g.add_argument("--save-every", type=int, default=1000)
@@ -1255,6 +1457,8 @@ def main():
     g.add_argument("--name", default="upscale-training-x2", help="model name for dvd_upscale.py --model (default upscale-training-x2)")
     g.add_argument("--models", help="the upscaler's models folder (default: found next to realesrgan-ncnn-vulkan)")
     a = p.parse_args()
+    if a.pretrained is None:
+        a.pretrained = str(Path(__file__).resolve().parent / "RealESRGAN_x2plus.pth") if a.arch == "rrdb" else "none"
 
     stages = [s.strip() for s in a.stages.split(",") if s.strip()]
     if not stages or set(stages) - {"pairs", "train", "export"}:
