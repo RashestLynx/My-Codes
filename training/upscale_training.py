@@ -1036,12 +1036,13 @@ def fmt_scores(r):
 
 
 def auto_batch(net, dev, patch, per, frac):
-    """The largest batch (a multiple of --crops, up to 96) whose forward + backward pass stays within `frac`
+    """The largest batch (a multiple of --crops, up to 256) whose forward + backward pass stays within `frac`
     of the graphics card's memory (less when --gan / --perceptual need room for a second network)."""
     total = torch.cuda.get_device_properties(dev).total_memory
+    fixed = 3 * 4 * sum(q.numel() for q in net.parameters())     # (the averaged copy and Adam's two states; the pass counts the rest)
     best = max(per, 8 - 8 % per)
     net.train()
-    for b in (8, 12, 16, 24, 32, 48, 64, 96):
+    for b in (8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256):
         b = max(per, b - b % per)
         if b <= best:
             continue
@@ -1059,7 +1060,7 @@ def auto_batch(net, dev, patch, per, frac):
             net.zero_grad(set_to_none=True)
             x = loss = None
             torch.cuda.empty_cache()
-        if peak > frac * total:
+        if peak + fixed > frac * total:
             break
         best = b
     return best
@@ -1106,8 +1107,8 @@ def stage_train(a, root, out):
     cl = dev.type == "cuda" and not a.no_channels_last
     if cl:
         net = net.to(memory_format=torch.channels_last)          # (the layout tensor cores like: faster fp16 convolutions)
-    if not 0.1 <= a.gpu_memory <= 0.95:
-        raise SystemExit("--gpu-memory is a share of the card's memory between 0.1 and 0.95 (e.g. 0.9)")
+    if not 0.1 <= a.gpu_memory <= 1.0:
+        raise SystemExit("--gpu-memory is a share of the card's memory between 0.1 and 1.0 (e.g. 0.9)")
     if a.batch == "auto":
         a.batch = auto_batch(net, dev, a.patch, max(1, a.crops), a.gpu_memory * (0.8 if (a.gan or a.perceptual) else 1.0)) if dev.type == "cuda" else 8
         say(f"--batch auto: {a.batch} patches per step")
@@ -1273,6 +1274,15 @@ def stage_train(a, root, out):
                     if "lpips" in res:
                         prog.point("held-out LPIPS (lower is better)", step, res["lpips"])
                     prog.metric(**{"best PSNR": f"{best:.2f} dB"})
+    except torch.cuda.OutOfMemoryError:
+        live.clear()
+        torch.cuda.empty_cache()
+        save_state()
+        print(f"\nThe graphics card ran out of memory at step {step}; progress is saved. Run the same command again with a "
+              f"smaller --batch (now {a.batch}) or --gpu-memory 0.9, or add --checkpoint.", flush=True)
+        if prog:
+            prog.set(phase=f"out of GPU memory at step {step}: run again with a smaller --batch")
+        return False
     except KeyboardInterrupt:
         live.clear()
         print("\nStopping: saving where you are...", flush=True)
@@ -1497,9 +1507,9 @@ def main():
     g.add_argument("--lpips", action="store_true", help="also judge held-out frames with LPIPS (pip install lpips)")
     g.add_argument("--checkpoint", action="store_true", help="trade speed for much less GPU memory")
     g.add_argument("--train-workers", type=int, default=None, help="data loading processes (default: from the number of processor cores, 2 to 8)")
-    g.add_argument("--gpu-memory", type=float, default=0.75, metavar="FRACTION",
-                   help="--batch auto fills up to this share of the graphics card's memory (default 0.75; 0.9 uses nearly all, "
-                        "but leaves little room for Windows and other programs and may run out of memory)")
+    g.add_argument("--gpu-memory", type=float, default=1.0, metavar="FRACTION",
+                   help="--batch auto grows the batch until it no longer fits, up to this share of the graphics card's memory "
+                        "(default 1.0: everything that fits; lower it to leave room for other programs)")
     g.add_argument("--no-channels-last", action="store_true", help="turn off the GPU-friendly memory layout (on by default with CUDA)")
     g.add_argument("--save-every", type=int, default=1000)
     g.add_argument("--val-crop", type=int, default=384, help="held-out frames are judged on this centre square (DVD px)")
