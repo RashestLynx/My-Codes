@@ -1539,6 +1539,25 @@ def bench(a, devs, steps=12, warm=3):
     return batch * (steps - warm) / (time.time() - t0)
 
 
+def pcie_links():
+    """{gpu number: 'Gen3 x4 (card supports Gen4 x16)'} from nvidia-smi, {} if it can't be read."""
+    smi = shutil.which("nvidia-smi")
+    if not smi:
+        return {}
+    try:
+        r = subprocess.run([smi, "--query-gpu=index,pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,"
+                            "pcie.link.width.max", "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                           timeout=8, stdin=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    out = {}
+    for row in r.stdout.splitlines():
+        v = [x.strip() for x in row.split(",")]
+        if len(v) == 5 and v[0].isdigit():
+            out[int(v[0])] = f"Gen{v[1]} x{v[2]} (card supports Gen{v[3]} x{v[4]})"
+    return out
+
+
 def gpu_test(a):
     """--gpu-test: lists the NVIDIA GPUs, times each alone and all together, and says what to use."""
     n = torch.cuda.device_count()
@@ -1562,6 +1581,11 @@ def gpu_test(a):
             results[tuple(ids)] = None
         r = results[tuple(ids)]
         print(f"  --gpus {','.join(map(str, ids)):<6} " + ("ran out of memory" if r is None else f"{r:6.1f} patches/s"))
+    links = pcie_links()                                       # (read now, while the cards are busy: an idle card drops its link speed)
+    if links:
+        print("PCIe link of each card (an external M.2 / OCuLink case is usually x4):")
+        for i in range(n):
+            print(f"  {i}: {links.get(i, 'unknown')}")
     singles = {k: v for k, v in results.items() if len(k) == 1 and v}
     both = results[tuple(range(n))]
     if not singles:
