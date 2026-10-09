@@ -54,7 +54,8 @@ VHS captures (--type vhs, normally detected by itself): a capture card's 720x480
 - --stabilize steadies a shaky camcorder tape: the camera shake is measured once over the whole
   video (ffmpeg's vid.stab; on Windows the gyan.dev "full" build has it), then smoothed out with
   the picture zoomed in 4% (--stabilize strong: 8%) so no moving edges show. Slow pans stay.
-- --faces [strength] restores faces after the upscale (live action and VHS/home video only):
+- Faces are restored after the upscale (on by itself for live action and VHS/home video once
+  its extras are installed; --faces for 3D animation too, --no-faces for none; --faces [strength]):
   GFPGAN 1.4 (or --face-model codeformer, licensed for non-commercial use only) redraws each
   face it finds, steadied from frame to frame, as 0.6 of the final picture's face (or the
   strength given, up to the AI frames' share, --ai-blend: 0.75 for live and VHS). Needs pip
@@ -110,12 +111,21 @@ queue.txt has one movie per line, exactly what you'd type after "python dvd_upsc
 - While it runs the PC is kept from going to sleep (single movies too). Keep it plugged in, and if you
   close the lid, set the lid action to "Do nothing" for when it's plugged in.
 Progress is logged to queue_log.txt next to the queue file.
+
+Progress on your phone (iPhone or Android, any browser): on by itself for every run
+(--no-phone turns it off). It prints an address like http://192.168.1.20:8642 : open it on a
+phone on the same Wi-Fi (add it to the home screen to keep it handy). It shows the movie, % done, time left for this movie
+and all of them, the current step and the latest output, refreshed every 3 s, and the NVIDIA
+graphics card's load, temperature, power, memory and clock (from nvidia-smi). --phone 8650
+uses another port. The first time, Windows asks whether Python may use the network: allow it
+on private networks (the Wi-Fi must be set as a Private network in Windows).
 """
 import argparse, json, math, operator, os, re, shutil, signal, statistics, struct, subprocess, sys
 import atexit, tempfile
-import threading, time
+import threading, time, types
+import http.server, socket
 from bisect import bisect_right as _bisect
-from collections import Counter
+from collections import Counter, deque
 from operator import add, sub
 from fractions import Fraction
 from pathlib import Path
@@ -152,6 +162,7 @@ def eta_text(secs):
 
 def status_line(msg=""):
     """A progress line that keeps being overwritten, in a console window only ("" clears it)."""
+    phone_line(msg)
     if not sys.stdout.isatty():
         return
     width = max(20, shutil.get_terminal_size((80, 24)).columns - 1)  # a full line would wrap
@@ -162,6 +173,571 @@ def status_line(msg=""):
 def say(msg):
     status_line()
     print(msg, flush=True)
+
+
+# ---- --phone: the progress on a web page that a phone on the same Wi-Fi opens ----
+# The run that was given --phone serves the page. Each movie's run (the same process for a single
+# movie, a new one per movie with --all/--queue) copies what it prints, and its progress line,
+# into a small status file the page reads; the --all/--queue run itself adds its own lines
+# (Movie 2 of 5, DONE, FAILED) from memory.
+PHONE_PORT = 8642
+PHONE = None                # what the page shows, once phone_setup turned it on
+PHONE_LOCK = threading.Lock()
+PHONE_FILE = None           # the status file this process writes (a movie's run)
+PHONE_PATH = None           # the status file the page reads (the process serving the page)
+PHONE_QUEUE = [False]       # the page is served by an --all/--queue run
+PHONE_DIRTY = [False]
+PHONE_CACHE = [None]
+PHONE_ETA = re.compile(r"((?:\d+ h )?\d+ min left, done ~[^,()]*?\d{1,2}:\d\d(?: ?[AP]M)?)")
+
+
+def phone_line(msg):
+    if PHONE is None:
+        return
+    with PHONE_LOCK:
+        PHONE["line"] = msg.strip()
+        PHONE["t"] = time.time()
+        PHONE_DIRTY[0] = True
+
+
+def phone_log(text):
+    text = text.strip()
+    if PHONE is None or not text:
+        return
+    with PHONE_LOCK:
+        now = time.time()
+        PHONE["log"].append([now, text])
+        PHONE["t"] = now
+        m = re.match(r"\[(\d+)/(\d+)\]", text)
+        if m:
+            PHONE["chunk"] = [int(m[1]), int(m[2])]
+            PHONE["eta"] = "finishing the file" if "all chunks done" in text else ""
+        eta = PHONE_ETA.search(text)
+        if eta:
+            PHONE["eta_all" if text.startswith("all ") and " movies:" in text else "eta"] = eta[1]
+        m = re.match(r"=== Movie (\d+) of (\d+): (.*) ===$", text)
+        if m:
+            PHONE["n"], PHONE["of"], PHONE["movie"] = int(m[1]), int(m[2]), m[3]
+        PHONE_DIRTY[0] = True
+
+
+class PhoneTee:
+    """sys.stdout/sys.stderr that also hands each finished line to the page (the progress
+    line's own writes, between carriage returns, are left out: phone_line has those)."""
+    def __init__(self, stream):
+        self._stream, self._buf = stream, ""
+
+    def write(self, text):
+        n = self._stream.write(text)
+        try:
+            buf = self._buf + text
+            *lines, buf = buf.split("\n")
+            for line in lines:
+                phone_log(line.rstrip("\r").split("\r")[-1])
+            self._buf = buf[buf.rfind("\r") + 1:][-2000:]
+        except Exception:           # (the page is a nicety: never let it stop a run)
+            pass
+        return n
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+def phone_movie(name):
+    if PHONE is not None:
+        with PHONE_LOCK:
+            PHONE["movie"] = str(name)
+            PHONE_DIRTY[0] = True
+
+
+PHONE_WRITE_LOCK = threading.Lock()
+
+
+def phone_write():
+    if not PHONE_FILE or not PHONE_DIRTY[0]:
+        return
+    with PHONE_WRITE_LOCK:      # (the writer thread and the exit hook never write together)
+        with PHONE_LOCK:
+            data = dict(PHONE, log=list(PHONE["log"]))
+            PHONE_DIRTY[0] = False
+        tmp = PHONE_FILE + f".{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f)
+            os.replace(tmp, PHONE_FILE)
+        except OSError:             # (Windows: the page was reading it right then) next time
+            PHONE_DIRTY[0] = True
+
+
+def phone_writer():
+    while True:
+        time.sleep(1)
+        phone_write()
+
+
+def phone_setup(queue_parent):
+    """Turn the page's copy of the output on, in a run started by --phone (or by a queue that
+    was): a movie's run writes the status file, an --all/--queue run keeps its lines in memory."""
+    global PHONE, PHONE_FILE
+    path = os.environ.get("DVD_UPSCALE_PHONE")
+    if not path:
+        return
+    PHONE = dict(movie="", n=0, of=0, line="", chunk=None, eta="", eta_all="",
+                 log=deque(maxlen=80), t=time.time(), started=time.time())
+    try:
+        q = json.loads(os.environ.get("DVD_UPSCALE_QUEUE") or "null")
+        if q:
+            PHONE["n"], PHONE["of"] = int(q["n"]), int(q["of"])
+    except (ValueError, TypeError, KeyError):
+        pass
+    sys.stdout, sys.stderr = PhoneTee(sys.stdout), PhoneTee(sys.stderr)
+    if not queue_parent:
+        PHONE_FILE = path
+        threading.Thread(target=phone_writer, daemon=True).start()
+        atexit.register(phone_write)        # (the last lines, "Failed: ..." among them)
+
+
+PHONE_GPU = dict(t=0.0, gpus=[])
+PHONE_GPU_LOCK = threading.Lock()
+PHONE_GPU_FIELDS = ("index,name,temperature.gpu,power.draw,power.limit,utilization.gpu,"
+                    "memory.used,memory.total,clocks.sm,clocks.max.sm,fan.speed,"
+                    "clocks_throttle_reasons.active")
+
+
+def phone_gpus():
+    """The NVIDIA GPUs right now (nvidia-smi; at most every 2.5 s, only while the page is open),
+    [] without nvidia-smi. A value the GPU doesn't report (a laptop's fan) is None."""
+    with PHONE_GPU_LOCK:
+        if time.time() - PHONE_GPU["t"] < 2.5 or not shutil.which("nvidia-smi"):
+            return PHONE_GPU["gpus"]
+        PHONE_GPU["t"] = time.time()
+        gpus = []
+        try:
+            r = subprocess.run(["nvidia-smi", "--query-gpu=" + PHONE_GPU_FIELDS,
+                                "--format=csv,noheader,nounits"], capture_output=True,
+                               text=True, timeout=8, stdin=subprocess.DEVNULL,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            for row in r.stdout.splitlines():
+                v = [x.strip() for x in row.split(",")]
+                if len(v) != 12:
+                    continue
+                num = lambda x: (float(x) if re.fullmatch(r"[\d.]+", x) else None)
+                try:
+                    reasons = int(v[11], 16)
+                except ValueError:
+                    reasons = 0
+                why = [name for bit, name in THROTTLE_BITS if reasons & bit]
+                gpus.append(dict(index=v[0], name=v[1], temp=num(v[2]), power=num(v[3]),
+                                 power_max=num(v[4]), busy=num(v[5]), mem=num(v[6]),
+                                 mem_max=num(v[7]), clock=num(v[8]), clock_max=num(v[9]),
+                                 fan=num(v[10]), slowed=why))
+        except (OSError, subprocess.SubprocessError):
+            pass
+        PHONE_GPU["gpus"] = gpus
+        return gpus
+
+
+def phone_snapshot():
+    try:
+        with open(PHONE_PATH, encoding="utf-8") as f:
+            PHONE_CACHE[0] = json.load(f)
+    except (OSError, ValueError, TypeError):
+        pass                            # (not written yet, or being replaced: the last one)
+    out = dict(now=time.time(), movie=PHONE_CACHE[0], queue=None, gpus=phone_gpus())
+    if PHONE_QUEUE[0] and PHONE is not None:
+        with PHONE_LOCK:
+            out["queue"] = dict(PHONE, log=list(PHONE["log"]))
+    return out
+
+
+def phone_host_ok(host):
+    """The Host a request was made to: an address (the phone typed one), localhost, this PC's
+    name, or a Tailscale name. A web page on the internet that points its own name at this PC
+    (DNS rebinding) arrives with ITS name and is refused."""
+    host = str(host or "").strip().lower()
+    if host.startswith("["):                     # an IPv6 address in brackets
+        return True
+    host = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+    if re.fullmatch(r"\d{1,3}(\.\d{1,3}){3}", host) or host in ("localhost", ""):
+        return True
+    mine = {socket.gethostname().lower(), socket.gethostname().lower().split(".")[0]}
+    return host in mine or host.endswith(".ts.net") or host.endswith(".local")
+
+
+class PhoneHandler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if not phone_host_ok(self.headers.get("Host")):
+            self.send_error(403)
+            return
+        if self.path.startswith("/status"):
+            body, kind = json.dumps(phone_snapshot()).encode(), "application/json"
+        elif self.path in ("/", "/index.html"):
+            body, kind = PHONE_PAGE.encode("utf-8"), "text/html; charset=utf-8"
+        else:
+            self.send_error(404)
+            return
+        self.send_response(200)
+        self.send_header("Content-Type", kind)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):       # (each request would print a line in the window)
+        pass
+
+    def handle(self):
+        try:
+            super().handle()
+        except OSError:                 # (a phone that locked its screen or left the Wi-Fi)
+            pass
+
+
+def is_tailscale_ip(ip):
+    """100.64.0.0/10: the addresses Tailscale gives its devices."""
+    try:
+        a, b = (int(x) for x in str(ip).split(".")[:2])
+    except ValueError:
+        return False
+    return a == 100 and 64 <= b <= 127
+
+
+class PhoneServer(http.server.ThreadingHTTPServer):
+    """The page's server. Windows lets a second program take a port that is in use when it asks
+    to reuse addresses (Python's servers do), so two runs at once would share 8642 and the
+    phone would see either: there the port is taken exclusively instead, and the second run
+    says the port is in use."""
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        # (HTTPServer.server_bind asks the network for this PC's full name, which can take
+        # seconds on a PC with no DNS: the page doesn't use it)
+        import socketserver
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = "dvd_upscale", self.server_address[1]
+
+    def handle_error(self, request, client_address):
+        pass                            # (a dropped connection is not an error worth a traceback)
+
+
+def lan_ip():
+    """This PC's address on the home network (no packet is sent: it only picks the route; a
+    Tailscale route to that range is passed over)."""
+    for probe in ("10.255.255.255", "192.168.255.255", "172.31.255.255"):
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((probe, 1))
+            ip = s.getsockname()[0]
+            if not is_tailscale_ip(ip) and not ip.startswith("127."):
+                return ip
+        except OSError:
+            pass
+        finally:
+            s.close()
+    return ""
+
+
+def tailscale_addresses():
+    """This PC's Tailscale name and address, if Tailscale is running here: the phone can open
+    the page through it from anywhere (mobile data, another Wi-Fi), with Tailscale on the phone
+    too. From the Tailscale program (its MagicDNS name, e.g. laptop.tail1234.ts.net, and its
+    100.x.y.z address); without it, from this PC's own addresses. [] if none."""
+    found = []
+    exe = shutil.which("tailscale")
+    for path in ([os.path.join(os.environ[v], "Tailscale", "tailscale.exe")
+                  for v in ("ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA")
+                  if os.environ.get(v)]       # (never a path relative to the current folder)
+                 + ["/Applications/Tailscale.app/Contents/MacOS/Tailscale"]):
+        if not exe and os.path.isabs(path) and os.path.isfile(path):
+            exe = path
+    if exe:
+        try:
+            r = subprocess.run([exe, "status", "--json"], capture_output=True, timeout=8,
+                               stdin=subprocess.DEVNULL,
+                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            j = json.loads(r.stdout.decode("utf-8", "replace") or "{}")
+            me = j.get("Self") or {}
+            if j.get("BackendState", "Running") == "Running":
+                name = str(me.get("DNSName") or "").rstrip(".")
+                found += [name] if name else []
+                found += [ip for ip in me.get("TailscaleIPs") or [] if is_tailscale_ip(ip)][:1]
+        except (OSError, ValueError, subprocess.SubprocessError, AttributeError):
+            pass
+    if not found:
+        try:
+            found = sorted({i[4][0] for i in socket.getaddrinfo(socket.gethostname(), None,
+                                                                 socket.AF_INET)
+                            if is_tailscale_ip(i[4][0])})[:1]
+        except OSError:
+            pass
+    return found
+
+
+PHONE_ASKED = [False]       # --phone was typed: the firewall is opened for this run (Windows)
+PHONE_RULE = "dvd_upscale phone page"
+
+
+def phone_firewall_command(port, pid):
+    """PowerShell that opens the phone page's port in Windows Firewall, waits until the run with
+    that process id ends, then closes it again: one admin prompt covers the whole run, and
+    nothing stays open. Two rules, named for the port (a second run on another port never
+    deletes this one's): the local subnet on PRIVATE and DOMAIN networks only (not a café's
+    or hotel's Wi-Fi), and Tailscale's own addresses on any."""
+    n = f"{PHONE_RULE} {int(port)}"
+    return (f"$n = '{n}'; $t = '{n} (Tailscale)'; "
+            "Remove-NetFirewallRule -DisplayName $n,$t -ErrorAction SilentlyContinue; "
+            f"New-NetFirewallRule -DisplayName $n -Direction Inbound -Action Allow -Protocol TCP "
+            f"-LocalPort {int(port)} -Profile Private,Domain -RemoteAddress LocalSubnet "
+            "| Out-Null; "
+            f"New-NetFirewallRule -DisplayName $t -Direction Inbound -Action Allow -Protocol TCP "
+            f"-LocalPort {int(port)} -Profile Any -RemoteAddress 100.64.0.0/10 | Out-Null; "
+            f"Wait-Process -Id {int(pid)} -ErrorAction SilentlyContinue; "
+            "Remove-NetFirewallRule -DisplayName $n,$t -ErrorAction SilentlyContinue")
+
+
+def phone_firewall(port):
+    """--phone on Windows: ask (the Windows admin prompt, UAC) to open the page's port for this
+    run, so the phone reaches it through Tailscale and any home network. Returns a line to show."""
+    if os.name != "nt":
+        return ""
+    import base64
+    import ctypes
+    script = phone_firewall_command(port, os.getpid())
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        # ("runas": the admin prompt; the helper runs hidden and on its own, so the run doesn't wait)
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", "powershell.exe",
+            f"-NoProfile -WindowStyle Hidden -EncodedCommand {encoded}", None, 0)
+    except (OSError, AttributeError):
+        rc = 0
+    if rc > 32:
+        return (f"       firewall: port {port} opened for this run (home network and Tailscale "
+                "only); it closes by itself when the run ends")
+    return ("       firewall: not opened (the admin prompt was declined): the page works on the "
+            "home Wi-Fi if Python is allowed there")
+
+
+def phone_args(argv):
+    """Take --phone [port] and --no-phone out of argv (so every parser and every movie's run
+    never sees them). The page is on by itself: the port to serve it on, or None for --no-phone,
+    an --analyze run, or a movie of --all/--queue (the queue's own run serves the page)."""
+    off = "--no-phone" in argv
+    while "--no-phone" in argv:
+        argv.remove("--no-phone")
+    port = PHONE_PORT
+    for i, w in enumerate(argv):
+        if w == "--phone" or w.startswith("--phone="):
+            val = w.split("=", 1)[1] if "=" in w else None
+            if val is None and i + 1 < len(argv) and argv[i + 1].isdigit():
+                val = argv[i + 1]
+                del argv[i + 1]
+            del argv[i]
+            if val and not val.isdigit():
+                sys.exit(f"--phone: '{val}' isn't a port number (e.g. --phone 8642)")
+            port = int(val) if val else PHONE_PORT
+            if not 1 <= port <= 65535:
+                sys.exit(f"--phone: {port} isn't a port number (1-65535, e.g. --phone 8642)")
+            PHONE_ASKED[0] = True
+            break
+    if off:
+        os.environ["DVD_UPSCALE_NO_PHONE"] = "1"       # (the movies of --all/--queue inherit it)
+    # a run that only prints help or a list, a set-up command, or a movie's run under a queue
+    # that serves the page, doesn't start the page
+    quiet = ("-h", "--help", "--commands", "commands", "--gpu-detect", "--clip") + tuple(
+        w for w in argv if w.startswith("--ncnn-"))
+    if off or os.environ.get("DVD_UPSCALE_NO_PHONE") or "--analyze" in argv \
+            or os.environ.get("DVD_UPSCALE_PHONE") or any(w in quiet for w in argv):
+        return None
+    return port
+
+
+def phone_start(port, queue_parent):
+    """The page is a nicety: whatever goes wrong here, the run goes on without it."""
+    try:
+        _phone_start(port, queue_parent)
+    except Exception as e:           # (a full temp folder, a firewall tool that fails...)
+        print(f"Phone page: couldn't start it ({e}); the run goes on without it.", flush=True)
+
+
+def _phone_start(port, queue_parent):
+    global PHONE_PATH
+    folder = Path(tempfile.mkdtemp(prefix="dvd_upscale_phone_"))
+    atexit.register(shutil.rmtree, folder, True)
+    server, err = None, None
+    for attempt in range(6):
+        # (on Windows the port is taken exclusively, and the last run's closed connections hold
+        # it for a little while: a run started right after another waits a few seconds)
+        try:
+            server = PhoneServer(("0.0.0.0", port), PhoneHandler)
+            break
+        except OSError as e:
+            err = e
+            time.sleep(1)
+    if server is None:
+        print(f"Phone page: port {port} can't be used ({err.strerror or err}; another run?): "
+              f"this run goes on without it; --phone {port + 1} would serve it on another port.",
+              flush=True)
+        return
+    server.daemon_threads = True
+    PHONE_PATH = str(folder / "status.json")
+    PHONE_QUEUE[0] = queue_parent
+    os.environ["DVD_UPSCALE_PHONE"] = PHONE_PATH        # (each movie's run writes it)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    ip = lan_ip()
+    print((f"Phone: on the same Wi-Fi, open  http://{ip}:{port}  in the phone's browser\n"
+           if ip else "Phone: no home-network address found for this PC (Wi-Fi off?)\n")
+          + "       (if Windows asks, allow Python on private networks)", flush=True)
+    if PHONE_ASKED[0]:
+        note = phone_firewall(port)
+        if note:
+            print(note, flush=True)
+    ts = tailscale_addresses()
+    if ts:
+        print("       anywhere, through Tailscale (on the phone too):  "
+              + "  or  ".join(f"http://{x}:{port}" for x in ts), flush=True)
+
+
+PHONE_PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#111418">
+<title>Upscale progress</title>
+<style>
+:root{--bg:#f4f5f7;--card:#fff;--fg:#15181d;--dim:#667080;--line:#e2e5ea;--acc:#2f6fed;
+--ok:#1f9d55;--warn:#c27c0e;--bad:#d64545}
+@media (prefers-color-scheme:dark){:root{--bg:#111418;--card:#1a1e24;--fg:#eef0f3;--dim:#8d96a3;
+--line:#2a3039;--acc:#5b8cff;--ok:#3ccf7c;--warn:#f0b13c;--bad:#ff6b6b}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 -apple-system,system-ui,
+"Segoe UI",Roboto,sans-serif;padding:max(16px,env(safe-area-inset-top)) 16px 32px}
+.wrap{max-width:560px;margin:0 auto}
+header{display:flex;align-items:center;justify-content:space-between;margin-bottom:12px}
+h1{font-size:15px;font-weight:600;color:var(--dim);margin:0;letter-spacing:.02em}
+.pill{font-size:13px;padding:3px 10px;border-radius:99px;border:1px solid var(--line);color:var(--dim)}
+.pill::before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;
+margin-right:6px;background:currentColor;vertical-align:1px}
+.live{color:var(--ok)}.stale{color:var(--warn)}.off{color:var(--bad)}
+.card{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:16px;margin-bottom:12px}
+.movie{font-size:19px;font-weight:650;word-break:break-word}
+.sub{color:var(--dim);font-size:14px;margin-top:2px}
+.pct{font-size:44px;font-weight:700;font-variant-numeric:tabular-nums;margin:12px 0 6px}
+.bar{height:10px;background:var(--line);border-radius:99px;overflow:hidden}
+.bar>i{display:block;height:100%;width:0;background:var(--acc);border-radius:99px;transition:width .6s}
+.row{display:flex;justify-content:space-between;gap:12px;margin-top:10px;font-size:14px}
+.row b{font-weight:600;text-align:right}
+.now{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:var(--dim);
+margin-top:12px;word-break:break-word;min-height:1.4em}
+h2{font-size:13px;color:var(--dim);font-weight:600;margin:0 0 8px;text-transform:uppercase;letter-spacing:.05em}
+ol{list-style:none;margin:0;padding:0;font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+li{padding:5px 0;border-top:1px solid var(--line);display:flex;gap:10px;word-break:break-word}
+li:first-child{border-top:0}
+li time{color:var(--dim);flex:none}
+.err{color:var(--bad)}.done{color:var(--ok)}
+.gpu+.gpu{margin-top:14px;padding-top:14px;border-top:1px solid var(--line)}
+.gname{font-weight:600;font-size:15px;margin-bottom:10px}
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.tile{background:var(--bg);border-radius:10px;padding:10px 12px}
+.tile:last-child:nth-child(odd){grid-column:1/-1}
+.tile small{display:block;color:var(--dim);font-size:12px}
+.tile b{font-size:22px;font-weight:700;font-variant-numeric:tabular-nums}
+.tile span{color:var(--dim);font-size:13px;margin-left:3px}
+.mini{height:5px;background:var(--line);border-radius:9px;margin-top:7px;overflow:hidden}
+.mini>i{display:block;height:100%;background:var(--acc)}
+.hot b{color:var(--warn)}.vhot b{color:var(--bad)}
+.slow{margin-top:10px;font-size:13px;color:var(--warn)}
+.banner{display:none;background:var(--bad);color:#fff;border-radius:12px;padding:12px 14px;
+margin-bottom:12px;font-size:14px}
+footer{color:var(--dim);font-size:12px;text-align:center;margin-top:8px}
+</style></head><body><div class="wrap">
+<header><h1>DVD UPSCALE</h1><span id="pill" class="pill">connecting</span></header>
+<div id="banner" class="banner">Can't reach the PC. The run may have finished or been stopped,
+or the PC is asleep or off this Wi-Fi. Showing the last thing it reported.</div>
+<div class="card">
+ <div class="movie" id="movie">Waiting for the first update...</div>
+ <div class="sub" id="which"></div>
+ <div class="pct" id="pct">--</div>
+ <div class="bar"><i id="fill"></i></div>
+ <div class="row"><span>Chunks</span><b id="chunks">-</b></div>
+ <div class="row"><span>This movie</span><b id="eta">-</b></div>
+ <div class="row" id="allrow" hidden><span>All movies</span><b id="etaall">-</b></div>
+ <div class="now" id="now"></div>
+</div>
+<div class="card" id="gcard" hidden><h2>Graphics card</h2><div id="gpus"></div></div>
+<div class="card" id="qcard" hidden><h2>Queue</h2><ol id="qlog"></ol></div>
+<div class="card"><h2>Recent output</h2><ol id="log"></ol></div>
+<footer id="foot"></footer>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+let last=null,lastOk=0,skew=0;
+function hm(t){const d=new Date((t-skew)*1000);return d.toLocaleTimeString([],{hour:'numeric',minute:'2-digit'})}
+function fill(ol,items,n){ol.textContent='';items.slice(-n).reverse().forEach(([t,s])=>{
+ const li=document.createElement('li'),tm=document.createElement('time'),sp=document.createElement('span');
+ tm.textContent=hm(t);sp.textContent=s;
+ if(/fail|error|warning|⚠/i.test(s))sp.className='err';else if(/^(✅ )?DONE|^Finished|Saved/.test(s))sp.className='done';
+ li.append(tm,sp);ol.append(li)})}
+function show(d){
+ const m=d.movie,q=d.queue;
+ if(q&&q.log.length){$('qcard').hidden=false;fill($('qlog'),q.log,8)}
+ if(!m){if(q){$('movie').textContent=q.movie||'Getting ready...';
+   $('which').textContent=q.of?`Movie ${q.n} of ${q.of}`:''}return}
+ $('movie').textContent=m.movie||'Getting ready...';
+ $('which').textContent=m.of?`Movie ${m.n} of ${m.of}`:'';
+ if(m.chunk){const p=m.chunk[0]/m.chunk[1];$('pct').textContent=Math.floor(p*100)+'%';
+  $('fill').style.width=(p*100)+'%';$('chunks').textContent=`${m.chunk[0]} of ${m.chunk[1]}`}
+ else{$('pct').textContent='Preparing';$('fill').style.width='0';$('chunks').textContent='-'}
+ $('eta').textContent=m.eta||'-';
+ $('allrow').hidden=!m.eta_all;$('etaall').textContent=m.eta_all||'';
+ $('now').textContent=m.line||'';
+ fill($('log'),m.log,25);
+}
+function tile(label,val,unit,frac,cls){
+ const t=document.createElement('div');t.className='tile '+(cls||'');
+ const sm=document.createElement('small');sm.textContent=label;
+ const b=document.createElement('b');b.textContent=val==null?'n/a':val;
+ t.append(sm,b);if(unit&&val!=null){const u=document.createElement('span');u.textContent=unit;t.append(u)}
+ if(frac!=null){const m=document.createElement('div');m.className='mini';const i=document.createElement('i');
+  i.style.width=Math.min(100,Math.max(0,frac*100))+'%';m.append(i);t.append(m)}
+ return t}
+const r0=x=>x==null?null:Math.round(x);
+function showGpus(gs){
+ const box=$('gpus');$('gcard').hidden=!gs||!gs.length;if(!gs||!gs.length)return;box.textContent='';
+ gs.forEach(g=>{const d=document.createElement('div');d.className='gpu';
+  const n=document.createElement('div');n.className='gname';n.textContent=g.name;d.append(n);
+  const ts=document.createElement('div');ts.className='tiles';
+  ts.append(tile('Busy',r0(g.busy),'%',g.busy==null?null:g.busy/100));
+  ts.append(tile('Temperature',r0(g.temp),'°C',null,g.temp>=87?'vhot':g.temp>=78?'hot':''));
+  ts.append(tile('Power',r0(g.power),g.power_max?`W of ${r0(g.power_max)}`:'W',
+   g.power!=null&&g.power_max?g.power/g.power_max:null));
+  ts.append(tile('Memory',g.mem==null?null:(g.mem/1024).toFixed(1),
+   g.mem_max?`of ${(g.mem_max/1024).toFixed(0)} GB`:'GB',g.mem!=null&&g.mem_max?g.mem/g.mem_max:null));
+  ts.append(tile('Clock',r0(g.clock),g.clock_max?`MHz (max ${r0(g.clock_max)})`:'MHz',
+   g.clock!=null&&g.clock_max?g.clock/g.clock_max:null));
+  if(g.fan!=null)ts.append(tile('Fan',r0(g.fan),'%',g.fan/100));
+  d.append(ts);
+  if(g.slowed&&g.slowed.length){const w=document.createElement('div');w.className='slow';
+   w.textContent='⚠ Slowing itself down: '+g.slowed.join(', ');d.append(w)}
+  box.append(d)})}
+function status(){
+ const pill=$('pill'),now=Date.now()/1000,off=now-lastOk>12;
+ $('banner').style.display=off&&lastOk?'block':'none';
+ if(!last){return}
+ const t=Math.max(last.movie?last.movie.t:0,last.queue?last.queue.t:0),age=last.now-t;
+ if(off){pill.className='pill off';pill.textContent='offline'}
+ else if(age>300){pill.className='pill stale';pill.textContent='quiet '+Math.round(age/60)+' min'}
+ else{pill.className='pill live';pill.textContent='live'}
+ $('foot').textContent='PC last reported '+(age<60?Math.round(age)+' s':Math.round(age/60)+' min')+' ago · refreshes every 3 s';
+}
+async function poll(){
+ try{const r=await fetch('/status.json',{cache:'no-store'});const d=await r.json();
+  last=d;lastOk=Date.now()/1000;skew=d.now-lastOk;show(d);showGpus(d.gpus)}catch(e){}
+ status()}
+poll();setInterval(poll,3000);
+</script></body></html>"""
 
 
 def short_time(secs):
@@ -603,6 +1179,44 @@ def vhs_prefilter(a):
     return ",".join(f)
 
 
+def bar_rows_valid(a, ih, m):
+    """m rows of black off the top and the bottom of an ih-line picture can be taken off before
+    the upscale and put back after it: the output height of what is left, and the offset it
+    sits at, must be whole even numbers (4:2:0 pictures)."""
+    if m <= 0 or ih - 2 * m < ih // 2:
+        return False
+    keep, off = a.height * (ih - 2 * m), a.height * m
+    return keep % ih == 0 and off % ih == 0 and (keep // ih) % 2 == 0 and (off // ih) % 2 == 0
+
+
+def detect_bars(a, info, samples=24):
+    """Black bars above and below a widescreen movie: the rows to cut off at the top and
+    bottom (the same number, 0: none). They cost the upscaler as much as the picture does
+    (2.39:1 on a DVD: a quarter of every frame), so the picture alone goes to the GPU and the
+    bars are put back after it, the same picture. ffmpeg's cropdetect on `samples` spots across
+    the movie: only the rows black at EVERY spot count (a scene with the picture over the whole
+    frame, or a dark one that reads as bars, keeps the crop small), less a safety margin."""
+    ih, dur = info["h"], float(info["duration"])
+    tops, bots = [], []
+    for k in range(samples):
+        at = dur * (0.03 + 0.94 * k / max(1, samples - 1))
+        rc, txt = capture(["ffmpeg", "-hide_banner", "-ss", f"{at:.1f}", "-i", a.input, "-an",
+                           "-sn", "-vf", "cropdetect=24:2:0", "-frames:v", "25", "-f", "null",
+                           "-"])
+        found = re.findall(r"crop=(\d+):(\d+):(\d+):(\d+)", txt)
+        if found:
+            w, h, x, y = (int(v) for v in found[-1])
+            tops.append(y)
+            bots.append(ih - (y + h))
+    if len(tops) < samples * 0.75:
+        return 0                    # (couldn't read enough of the movie: no crop)
+    m = min(min(tops), min(bots)) - 6           # (a margin: soft or noisy edges)
+    for cand in range(m, 15, -1):
+        if bar_rows_valid(a, ih, cand):
+            return cand
+    return 0
+
+
 def prefilter(a):
     if a.type == "vhs":
         return vhs_prefilter(a)
@@ -634,6 +1248,8 @@ def prefilter(a):
     else:
         f += ["scale=trunc(iw*sar/2)*2:ih:flags=lanczos"]      # anamorphic -> square pixels
     f += ["setsar=1", f"hqdn3d={a.denoise}"]
+    if getattr(a, "crop_rows", 0):
+        f += [f"crop=iw:ih-{2 * a.crop_rows}:0:{a.crop_rows}"]    # (the bars are put back after)
     if getattr(a, "dvd_trim", 0):
         f += [f"trim=start_frame={a.dvd_trim}", "setpts=PTS-STARTPTS"]   # chunk warm-up frames
     f += [f"fps={a.fps}"]
@@ -643,8 +1259,16 @@ def prefilter(a):
 def postfilter(a):
     # exact width (multiple of 8, e.g. 1920 or 1440): some TVs and hardware decoders reject
     # odd sizes like 1918x1080
-    f = [f"scale={a.out_w}:{a.height}:flags=lanczos+accurate_rnd",
-         "format=yuv420p10le",
+    m, ih = getattr(a, "crop_rows", 0), getattr(a, "crop_src_h", 0)
+    if m and ih:
+        # the picture without its bars, scaled to the same size it has in the full frame, then
+        # the bars put back (black) where they were
+        keep, off = a.height * (ih - 2 * m) // ih, a.height * m // ih
+        f = [f"scale={a.out_w}:{keep}:flags=lanczos+accurate_rnd",
+             f"pad={a.out_w}:{a.height}:0:{off}:black"]
+    else:
+        f = [f"scale={a.out_w}:{a.height}:flags=lanczos+accurate_rnd"]
+    f += ["format=yuv420p10le",
          # SD (601) -> HD (709) colours. HD sources are 709 already; through the AI the frames
          # come back from RGB as 601 (the PNG step's default), so only --fast keeps their 709
          "colorspace=all=bt709:iall="
@@ -658,6 +1282,29 @@ def postfilter(a):
     if not a.hevc:
         f += ["format=yuv420p"]          # H.264 for compatibility is 8-bit
     return ",".join(f)
+
+
+# --ai-blend where the picture is busy: crowds of small people, grass, gravel, foliage. The models
+# paint such dense small detail flat (people turn waxy and run together) and it shimmers from frame
+# to frame, so there the plain upscale gets more say. "Busy" is the fine detail (Laplacian) of
+# the source frame, averaged over SIGMA pixels: a single strong outline (a close-up face, a
+# wall's edge) averages out low, a crowd or a lawn stays high. Below LO the AI keeps all of
+# --ai-blend, from HI on it gets LOW_BLEND (at most --ai-blend), linearly in between. Measured on
+# a real pedestrian video shrunk to DVD size, upscaled with realesrgan-x2plus and compared with
+# the real full-size frames (in the people: SSIM 0.860 -> 0.879, gradient error 0.155 -> 0.140,
+# shimmer of the still background 2.6x -> 2.2x the real video's; the same as --ai-blend 0.4
+# everywhere, but smooth scenes keep the AI as they were)
+DETAIL_BLEND = dict(sigma=6, lo=8, hi=25, low_blend=0.4)
+
+
+def detail_blend_mask(a):
+    """ffmpeg filters turning a source frame into the maskedmerge mask (0 = the AI frame,
+    255 = the plain upscale) at the source frame's size."""
+    d, high = DETAIL_BLEND, a.ai_blend
+    low = min(high, d["low_blend"] if getattr(a, "busy_blend", None) is None else a.busy_blend)
+    share = (f"{high}-({high}-{low})*clip((val-{d['lo']})/({d['hi']}-{d['lo']})\\,0\\,1)")
+    return (f"format=gray,convolution=0m='0 -1 0 -1 4 -1 0 -1 0':0rdiv=1:0bias=128,"
+            f"lut=y='abs(val-128)',gblur=sigma={d['sigma']},lut=y='255*(1-({share}))'")
 
 
 def nvenc_args(a):
@@ -742,33 +1389,153 @@ def compact_model(a):
     return any(m in a.model for m in ("animevideov3", "general"))
 
 
-TRAINED_MODEL = "upscale-training-x2"   # the model training/upscale_training.py makes (--trained)
+# what the GPU is given at once without --gpu-threads/--tile, first choice first: (frames at
+# once, tile size). A chunk the upscaler fails on is tried again one step down, and the rest of
+# the run keeps that (see Chunk.upscale; a movie of --all/--queue starts where the one before it
+# ended, see gpu_step_file).
+# - Frames at once: each frame is upscaled on its own, the same picture with any count. Lowered
+#   first.
+# - Tiles: the upscaler cuts each frame into tiles with a 10-pixel overlap, and the model sees
+#   only its tile, so the tile size changes the picture a little all over (no visible grid):
+#   x2plus on a DVD frame against the frame in one piece: 200 pixels 49 dB, 100 44 dB, 64 42 dB,
+#   32 40 dB (faces a touch crisper or softer). Smaller tiles only when fewer frames didn't
+#   help: the alternative is no movie at all.
+# - the small (compact) anime/VHS-camcorder models: 8 frames, each in one piece (None: whole
+#   frames; 21.5 frames/s on an RTX 3060 laptop)
+# - the big x2plus/x4plus: 2 frames, the upscaler's own default, in its own tiles (None: 200
+#   pixels on most GPUs). Windows resets a GPU whose piece of work takes over 2 seconds, and a
+#   GPU can fault on a large piece ("vkQueueSubmit failed -4"). That laptop: x2plus reset it after
+#   10-18 frames at 2 frames at once, 40-63 frames at 1, and in 100-pixel tiles after 163 frames
+#   once and not in 1440 frames another time. A tile is one piece of work: smaller tiles, shorter
+#   pieces, rarer resets; but each step down is slower too (64-pixel tiles: 20% more work than
+#   100, 32: 80%), so a reset after a good stretch of frames doesn't step down (Chunk.upscale)
+GPU_STEPS = {True: ((8, None), (6, None), (4, None), (2, None), (1, None), (1, 100), (1, 64)),
+             False: ((2, None), (1, None), (1, 100), (1, 64), (1, 32))}  # compact?: steps
 
-AUTO_THREADS = [8]      # frames on the GPU at once without --gpu-threads (lowered, see Chunk)
-MIN_THREADS = 2         # ...down to this (2: the upscaler's own default, the least memory)
+
+# the current ncnn (see ncnn_upscaler_main) does one frame at a time anyway
+def ncnn_steps():
+    """What the current ncnn is lowered to after a GPU reset, one step at a time: first the
+    tile it started with (the saved one: whole frames on a big GPU, else 200), then ever
+    smaller ones. Each step halves the piece of work, and costs a little speed and nothing a
+    viewer can see until the very small ones: from whole frames to 100 in one go gave up much
+    more than needed. Only tiles below the one it started with."""
+    cap = int(ncnn_saved().get("tile") or 200)
+    return ((1, None),) + tuple((1, t) for t in (512, 256, 128, 64, 32) if t < cap)
 
 
-def gpu_threads(a):
-    """frames the GPU upscales at once: --gpu-threads, else 8, lowered to 6, 4, then 2 when a
-    chunk fails (a GPU short of memory: see Chunk.upscale). Each frame is upscaled on its own:
-    the same picture with any count."""
-    return a.gpu_threads if a.gpu_threads is not None else AUTO_THREADS[0]
+GPU_STEP = [0]          # how many steps down this run has gone
+
+
+def gpu_steps(a):
+    return ncnn_steps() if getattr(a, "engine", "exe") == "ncnn" else GPU_STEPS[compact_model(a)]
+
+
+def gpu_load(a, step=None):
+    """(frames at once, tile size or None) at a step (default: the current one); --gpu-threads
+    and --tile, when given, are kept at every step"""
+    steps = gpu_steps(a)
+    threads, tile = steps[min(GPU_STEP[0] if step is None else step, len(steps) - 1)]
+    return (a.gpu_threads if a.gpu_threads is not None else threads,
+            a.tile or tile)
+
+
+def gpu_load_text(a):
+    threads, tile = gpu_load(a)
+    return (f"{threads} frame{'s' if threads > 1 else ''} at once on the GPU"
+            + (f", in {tile}-pixel tiles" if tile and str(tile) != "0" else ""))
+
+
+def lower_gpu_load(a):
+    """One step less on the GPU at once for the rest of the run (steps that don't change
+    anything next to --gpu-threads/--tile are passed over); False if there is none left."""
+    if getattr(a, "no_step_down", False):
+        return False            # (--no-step-down: the settings stay as they are)
+    steps = gpu_steps(a)
+    now = gpu_load(a)
+    for k in range(GPU_STEP[0] + 1, len(steps)):
+        if gpu_load(a, k) != now:
+            GPU_STEP[0] = k
+            save_gpu_step(a)
+            return True
+    return False
+
+
+def gpu_step_file():
+    """Where a run leaves how far down the GPU needed to go: gpu_steps.json next to the script,
+    so the next run (and the next movie of --all/--queue) starts there instead of resetting the
+    GPU again on the way down. Delete it to start from the top again (after a driver update,
+    say). DVD_UPSCALE_GPU_STEPS: another file (the tests)."""
+    return Path(os.environ.get("DVD_UPSCALE_GPU_STEPS")
+                or Path(__file__).resolve().parent / "gpu_steps.json")
+
+
+def gpu_step_key(a):
+    # (per model, x4plus being 4x the work; per engine; per --gpu)
+    return (a.model + ("/ncnn" if getattr(a, "engine", "exe") == "ncnn" else "")
+            + (f"@{a.gpu}" if a.gpu else ""))
+
+
+FRAMES_OK = [0]         # frames upscaled since the last GPU reset (this model and engine)
+
+
+def load_gpu_step(a):
+    """The first step no bigger than the one saved: (frames, tile) is kept, not the step number,
+    so a changed list of steps still reads it right. Also the frames since the last reset."""
+    if getattr(a, "no_step_down", False):
+        return False            # (--no-step-down: what an earlier run went down to is ignored)
+    try:
+        saved = json.loads(gpu_step_file().read_text(encoding="utf-8"))
+        FRAMES_OK[0] = int(saved.get(gpu_step_key(a) + "#ok", 0))
+        threads, tile = saved[gpu_step_key(a)]
+        for k, (t2, p2) in enumerate(gpu_steps(a)):
+            # (no tile: whole frames for the compact models, 200 for the big ones)
+            if t2 <= int(threads) and (p2 or 10 ** 4) <= (int(tile) if tile else 10 ** 4):
+                GPU_STEP[0] = k
+                return True
+    except (OSError, ValueError, TypeError, KeyError, AttributeError):
+        pass
+    return False
+
+
+def save_gpu_step(a, frames_only=False):
+    """frames_only: just the frames since the last reset (after each chunk, once the file
+    exists: a run with no reset ever leaves no file)"""
+    path = gpu_step_file()
+    try:
+        try:
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            saved = saved if isinstance(saved, dict) else {}
+        except (OSError, ValueError):
+            if frames_only:
+                return
+            saved = {}
+        if not frames_only:
+            saved[gpu_step_key(a)] = list(gpu_steps(a)[GPU_STEP[0]])
+        saved[gpu_step_key(a) + "#ok"] = FRAMES_OK[0]
+        path.write_text(json.dumps(saved, indent=1), encoding="utf-8")
+    except OSError:
+        pass
 
 
 def esrgan_cmd(a, src, dst, size=None, gpu=None):
     compact = compact_model(a)
     gpu = gpu if gpu is not None else gpu_list(a)[0]
+    threads, tile = gpu_load(a)
+    # (the current ncnn: this script as the upscaler, with the same command line)
+    exe = ([sys.executable, Path(__file__).resolve(), "--ncnn-upscaler"]
+           if getattr(a, "engine", "exe") == "ncnn" else [a.esrgan_path])
     # threads to load:upscale:save frames (default 1:2:2): reading and writing the PNGs is CPU
     # work that otherwise leaves the GPU waiting
-    cmd = [a.esrgan_path, "-i", src, "-o", dst, "-n", a.model, "-s", a.scale, "-f", "png",
-           "-j", f"2:{gpu_threads(a)}:4"]
+    cmd = [*exe, "-i", src, "-o", dst, "-n", a.model, "-s", a.scale, "-f", "png",
+           "-j", f"2:{threads}:4"]
     models = models_dir(a)
     if models.is_dir():
         cmd += ["-m", models]
     if gpu is not None:
         cmd += ["-g", gpu]
-    if a.tile:
-        cmd += ["-t", a.tile]
+    if tile:
+        cmd += ["-t", tile]
     elif size and compact:
         # the small (compact) models need little GPU memory: a whole frame in one piece instead
         # of the default 200-pixel tiles, whose overlaps cost ~20% extra work (and leave no
@@ -781,7 +1548,26 @@ def esrgan_cmd(a, src, dst, size=None, gpu=None):
 # reset, out of video memory) or a frame can't be read or written: its frames are then black,
 # garbled or missing
 GPU_ERRORS = re.compile(r"vk(QueueSubmit|WaitForFences|AllocateMemory|MapMemory)\w* failed|"
-                        r"VK_ERROR_DEVICE_LOST|device lost|(en|de)code image .* failed", re.I)
+                        r"VK_ERROR_DEVICE_LOST|device lost|(en|de)code image .* failed|"
+                        r"ncnn: GPU error", re.I)
+
+
+def upscaler_log_tail(path, limit=8):
+    """A short diagnostic excerpt for silent/incomplete upscaler runs (exit code 0)."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            f.seek(max(0, size - 65536))
+            text = f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    lines = [line.strip() for line in text.splitlines()
+             if line.strip() and not line.strip().endswith("%")]
+    if not lines:
+        return ""
+    return "\nUpscaler output (end):\n  " + "\n  ".join(
+        line[-240:] for line in lines[-limit:])
 
 
 def _read_log_updates(path, offset, pending=""):
@@ -806,6 +1592,72 @@ UPSCALER_FRAMES = {}
 # the chunks being upscaled right now (on any GPU): chunk -> (bytes of frames it writes, frames)
 UPSCALING = {}
 DISK_LOCK = threading.Lock()
+
+
+class GPUError(RuntimeError):
+    """The upscaler reported a GPU failure (a reset, out of video memory). good: the frames it
+    had finished before the first error (their names in the output folder)."""
+    good = ()
+
+
+GPU_REPORTS = []        # GPU errors written to gpu_errors.log this run
+RESET_TIMES = []        # when the GPU was reset (time.time())
+
+
+def gpu_report(a, work, label, err, tried, log_path):
+    """After a GPU error: what happened, appended to <work folder>/gpu_errors.log (to send with a
+    bug report), with what Windows recorded about its graphics drivers in the last 15 minutes and
+    the NVIDIA GPU's state. Windows' records tell the causes apart: "Display" event 4101 or
+    nvlddmkm 153 (the driver restarted the GPU after a timeout: a piece of work took over 2 s);
+    nvlddmkm 13/14 or an "Xid" (the GPU hit a fault). Returns a one-line summary of those
+    records ("" if none)."""
+    GPU_REPORTS.append(time.time())
+    out = [f"=== {time.strftime('%Y-%m-%d %H:%M:%S')}  {label}  {a.model} x{a.scale}, {tried}",
+           str(err)]
+    try:
+        text = log_path.read_bytes().decode("utf-8", "replace")
+    except OSError:
+        text = ""
+    out += ["upscaler: " + x.strip() for x in text.splitlines()
+            if re.match(r"\[\d+ ", x.strip()) or "fp16-" in x or "subgroup" in x][:12]
+
+    def tool(cmd):
+        try:
+            p = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                               stdin=subprocess.DEVNULL, timeout=30)
+            return p.stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    summary = ""
+    if len(GPU_REPORTS) <= 5:           # (the first few are what tell)
+        smi = tool(["nvidia-smi", "--query-gpu=name,driver_version,pstate,temperature.gpu,"
+                    "power.draw,power.limit,clocks.sm,clocks.max.sm,memory.used,memory.total,"
+                    "utilization.gpu,clocks_throttle_reasons.active", "--format=csv"])
+        if smi:
+            out += ["nvidia-smi: " + x for x in smi.splitlines()]
+        if sys.platform == "win32":
+            ev = tool(["wevtutil", "qe", "System", "/c:12", "/rd:true", "/f:text",
+                       "/q:*[System[(Provider[@Name='nvlddmkm'] or Provider[@Name='Display'] or "
+                       "Provider[@Name='amdkmdag'] or Provider[@Name='igfx']) and "
+                       "TimeCreated[timediff(@SystemTime) <= 900000]]]"])
+            found = []
+            for block in re.split(r"(?m)^Event\[\d+\]:", ev)[1:]:
+                src = re.search(r"Source:\s*(.+)", block)
+                eid = re.search(r"Event ID:\s*(\d+)", block)
+                desc = block.split("Description:", 1)[-1].strip().splitlines()
+                if src and eid:
+                    found.append(f"{src.group(1).strip()} {eid.group(1)}"
+                                 + (f" ({desc[0].strip()[:90]})" if desc and desc[0].strip()
+                                    else ""))
+            out += ["Windows: " + x for x in found] or ["Windows: no display driver events "
+                                                         "in the last 15 minutes"]
+            summary = "; ".join(found[:2])
+    try:
+        with open(work / "gpu_errors.log", "a", encoding="utf-8") as f:
+            f.write("\n".join(out) + "\n\n")
+    except OSError:
+        pass
+    return summary
 
 
 class HandBack(Exception):
@@ -833,7 +1685,10 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
     lane: a helper GPU (--gpu 0,1): its progress goes into LANE_STATUS instead, and it stops
     when a.stop_lanes is set."""
     log_path = Path(dst).parent / "upscaler_log.txt"
-    hung = False
+    hung = stopped = False
+    # frames there at the last look at the log without a GPU error (at first: the ones a try
+    # before this one finished, kept by Chunk.upscale)
+    good = [e.name for e in os.scandir(dst)]
     with open(log_path, "wb") as log:
         p = subprocess.Popen([str(c) for c in esrgan_cmd(a, src, dst, size, gpu)],
                              stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
@@ -843,30 +1698,39 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
             last, same, all_there, tick = -1, 0, 0, 0
             log_offset, pending_log = 0, ""
             while True:
-                n = sum(1 for _ in os.scandir(dst))
+                names = [e.name for e in os.scandir(dst)]
+                n = len(names)
                 if n:           # (for the check of two upscalers on one GPU, see main)
                     UPSCALER_FRAMES[lane or ""] = (gpu if gpu is not None else gpu_list(a)[0], n)
+                tick += 1
                 if lane:
                     LANE_STATUS[lane] = f"{lane}: {label} {n}/{n_in}"
-                    now, tick = time.time(), tick + 1
+                    now = time.time()
                     prog = LANE_PROGRESS.setdefault(lane, [0, n_in, now, now])
                     if n > prog[0]:
                         prog[0], prog[3] = n, now
                     if lane_stopped(a, lane):
                         raise RuntimeError("stopped")
-                    # a GPU error: the chunk goes back now, not once the upscaler gives up (or
-                    # hangs), and the main GPU does it
-                    if tick % 5 == 0:
-                        log_offset, pending_log, log_lines = _read_log_updates(
-                            log_path, log_offset, pending_log)
-                        bad = [line for line in (*log_lines, pending_log)
-                               if GPU_ERRORS.search(line)]
-                        if bad:
-                            raise RuntimeError(f"the upscaler reported errors: "
-                                               f"{bad[0].strip()[:100]}")
                 else:
                     status_line(f"  {label}: upscaling frame {n} of {n_in}"
                                 + "".join(f" | {x}" for x in list(LANE_STATUS.values())))
+                # a GPU error: the upscaler would go on to the last frame (black or garbled
+                # frames, a few seconds each after a GPU reset): stopped now instead. A helper
+                # GPU's chunk goes back to the main GPU; the main GPU's chunk is tried again
+                if tick % 5 == 0:
+                    log_offset, pending_log, log_lines = _read_log_updates(
+                        log_path, log_offset, pending_log)
+                    bad = [line for line in (*log_lines, pending_log) if GPU_ERRORS.search(line)]
+                    if not bad:
+                        # (listed before this look at the log, so written before any error:
+                        # the upscaler prints a GPU error before it saves the frame it spoils)
+                        good = names
+                    if bad and lane:
+                        raise RuntimeError(f"the upscaler reported errors: "
+                                           f"{bad[0].strip()[:100]}")
+                    if bad:
+                        stopped = True
+                        break
                 try:
                     p.wait(timeout=1)
                     break
@@ -907,6 +1771,18 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
     if (p.returncode and not hung) or errors:
         lines = errors or [x for x in text.splitlines()
                            if x.strip() and not x.strip().endswith("%")]
+        # (two threads writing at once can run two error messages into one line)
+        lines = [y for x in lines for y in re.split(r"(?<=\S)(?=vk[A-Z]\w* failed)", x)]
+        # (a GPU reset gives one line per piece of work left: shown once, with a count)
+        same = []
+        for x in lines:
+            if same and same[-1][0] == x:
+                same[-1][1] += 1
+            else:
+                same.append([x, 1])
+        lines = [x if k == 1 else f"{x}   (x{k})" for x, k in same]
+        reset = re.search(r"(QueueSubmit|WaitForFences) failed -4\b|DEVICE_LOST|device lost|"
+                          r"ncnn: GPU error \(extract returned -[14]\)", text, re.I)
         if lane:        # a helper GPU: one line, in the note that it stopped helping
             raise RuntimeError(("the upscaler reported errors" if errors else
                                 f"the upscaler failed (exit code {p.returncode})")
@@ -920,14 +1796,77 @@ def run_upscaler(a, src, dst, n_in, label, size=None, gpu=None, lane=None):
         elif re.search(r"vkCreateInstance|vkEnumeratePhysicalDevices|no vulkan", text, re.I):
             print("(no usable Vulkan graphics driver: install or update the GPU's driver)",
                   flush=True)
+        elif reset:
+            print("(the GPU was reset: Windows resets a graphics card whose piece of work takes "
+                  "over 2 seconds, or that faults on it; smaller tiles are smaller pieces of "
+                  "work)", flush=True)
         elif re.search(r"memory|vkAllocate", text, re.I):
             print("(the GPU may have run out of memory: try adding --tile 128, or --gpu-jobs 1)",
                   flush=True)
         elif re.search(r"encode image", text):
             print("(it couldn't write the frames: is the work folder's drive full?)", flush=True)
+        how = "stopped at the first one" if stopped else f"exit code {p.returncode}"
+        err = None
+        if reset:
+            err = GPUError(f"the GPU was reset ({(errors or lines)[0].strip()[:60]}, "
+                           f"{len(good)} of {n_in} frames done)")
+        elif any(not re.search(r"(en|de)code image", x) for x in errors):
+            err = GPUError(f"the upscaler reported GPU errors ({how})")
+        if err:
+            err.good = tuple(good)
+            raise err
         if errors:
-            raise RuntimeError(f"the upscaler reported errors (exit code {p.returncode})")
+            raise RuntimeError(f"the upscaler reported errors ({how})")
         raise subprocess.CalledProcessError(p.returncode, f"{a.esrgan} (upscaler)")
+
+
+def png_is_black(path):
+    """A frame that is black through and through: every pixel 0. Exact: a PNG whose filtered
+    rows are all zeros is all zeros whatever the filters (each pixel is built from zero
+    neighbours), so decoding it is just one decompression. Only small files are looked at (a
+    black 852x480 frame is a few KB); 8-bit RGB(A) only. Anything else: False (it is upscaled)."""
+    import zlib
+    try:
+        if os.path.getsize(path) > 65536:
+            return False
+        data = Path(path).read_bytes()
+        if data[:8] != b"\x89PNG\r\n\x1a\n":
+            return False
+        pos, idat, w, bpp = 8, [], 0, 0
+        while pos + 8 <= len(data):
+            n, kind = int.from_bytes(data[pos:pos + 4], "big"), data[pos + 4:pos + 8]
+            body = data[pos + 8:pos + 8 + n]
+            if kind == b"IHDR":
+                w, depth, ctype, interlace = (int.from_bytes(body[0:4], "big"), body[8], body[9],
+                                              body[12])
+                if depth != 8 or ctype not in (2, 6) or interlace:
+                    return False
+                bpp = 3 if ctype == 2 else 4
+            elif kind == b"IDAT":
+                idat.append(body)
+            pos += 12 + n
+        if not idat or not w:
+            return False
+        raw, row = zlib.decompress(b"".join(idat)), 1 + w * bpp
+        if len(raw) % row:
+            return False
+        # (the first byte of each row is its filter type, not a pixel)
+        return all(not any(raw[i + 1:i + row]) for i in range(0, len(raw), row))
+    except (OSError, ValueError, IndexError):
+        return False
+
+
+def write_black_png(path, w, h):
+    """An all-black 8-bit RGB PNG of w x h pixels."""
+    import zlib
+    raw = bytes(1 + w * 3) * h
+
+    def chunk(kind, body):
+        return (len(body).to_bytes(4, "big") + kind + body
+                + (zlib.crc32(kind + body) & 0xFFFFFFFF).to_bytes(4, "big"))
+    Path(path).write_bytes(b"\x89PNG\r\n\x1a\n"
+                          + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+                          + chunk(b"IDAT", zlib.compress(raw, 1)) + chunk(b"IEND", b""))
 
 
 def png_size(path):
@@ -978,6 +1917,9 @@ def check_frames(a, tmp, n_in, strict=False):
                                    f"of about {x:.0f}: black or garbled - a GPU fault?)")
 
 
+TRAINED_MODEL = "upscale-training-x2"   # the model training/upscale_training.py makes (--trained)
+
+
 def models_dir(a):
     return Path(a.esrgan_path).resolve().parent / "models"     # resolve() follows symlinks
 
@@ -988,6 +1930,101 @@ def model_installed(a):
         return True     # unusual install layout: let the upscaler find its own models
     names = [a.model, f"{a.model}-x{a.scale}"]       # animevideov3 files carry the scale
     return any((d / f"{n}.param").exists() and (d / f"{n}.bin").exists() for n in names)
+
+
+def check_upscaler(a):
+    """Before the movie, a few seconds: the upscaler and its model on two small test pictures.
+    Model files that are damaged, or a .param and a .bin that don't belong together (from two
+    different downloads), give a GPU error or a smeared, garbled picture on every chunk: this
+    says so at once, instead of after every chunk has failed (or a whole movie came out wrong).
+    The test: each picture shrunk by the model's scale, then upscaled by the model, comes out
+    nearly as close to the original as a plain resize does (measured on the anime, live and x4
+    models: 0.3 better to 3.7 dB worse; a .bin from another conversion of realesrgan-x2plus:
+    7.6 dB worse, another model's .bin: far worse). One frame at a time: the frames-at-once
+    setting doesn't come into it."""
+    with tempfile.TemporaryDirectory(prefix="upscaler_check_") as d:
+        d = Path(d)
+        for sub in ("big", "in", "out"):
+            (d / sub).mkdir()
+        k = a.scale
+        for n, pattern in enumerate(("testsrc", "smptehdbars"), 1):
+            run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"{pattern}=s=480x288:d=1",
+                 "-frames:v", "1", str(d / "big" / f"{n:06d}.png")])
+            run(["ffmpeg", "-y", "-v", "error", "-i", str(d / "big" / f"{n:06d}.png"), "-vf",
+                 f"scale=iw/{k}:ih/{k}:flags=area", str(d / "in" / f"{n:06d}.png")])
+        cmd = [str(c) for c in esrgan_cmd(a, d / "in", d / "out", (480 // k, 288 // k))]
+        cmd[cmd.index("-j") + 1] = "1:1:1"
+        try:
+            p = subprocess.run(cmd, capture_output=True, stdin=subprocess.DEVNULL, timeout=600)
+            text, rc = (p.stdout + p.stderr).decode("utf-8", "replace"), p.returncode
+        except subprocess.TimeoutExpired:
+            text, rc = "no result after 10 minutes", "a hang"
+        errors = [x.strip() for x in text.splitlines() if GPU_ERRORS.search(x)]
+        files = (f"{models_dir(a)}: {a.model}.param and {a.model}.bin must come from the same "
+                 "download (for realesrgan-x2plus: unzip both from realesrgan-x2plus.zip again, "
+                 "replacing the old ones)")
+        outs = [d / "out" / f"{n:06d}.png" for n in (1, 2)]
+        if rc or errors or not all(o.exists() for o in outs):
+            status_line()
+            lines = errors or [x.strip() for x in text.splitlines()
+                               if x.strip() and not x.strip().endswith("%")]
+            if getattr(a, "engine", "exe") == "ncnn":
+                # (stdout is read before stderr, and ncnn's list of GPUs is on stderr: the last
+                # line is then always the last GPU, never the reason. The reason is the
+                # worker's own "ncnn: ..." line, or none at all: it crashed)
+                own = [x for x in lines if x.startswith("ncnn")]
+                why = (own[-1][:160] if own else "no message from the upscaler") + \
+                    f"; it ended with exit code {rc}" + \
+                    (" (a crash inside ncnn or the graphics driver)" if isinstance(rc, int)
+                     and (rc < 0 or rc > 255) else "")
+                print("  the current ncnn's output:", flush=True)
+                for x in lines[-12:]:
+                    print("    " + x[:160], flush=True)
+                return ncnn_fallback(a, why)
+            reset = re.search(r"QueueSubmit failed -4\b|DEVICE_LOST|device lost", text, re.I)
+            sys.exit(f"The upscaler failed on a small test picture, before the movie started "
+                     f"({lines[-1][:120] if lines else f'exit code {rc}'}).\n"
+                     + ("The GPU was reset. " if reset else "")
+                     + "If other movies work (anime, say) and only this kind fails, the model's "
+                     f"files are the likely cause: {files}. Otherwise update the graphics "
+                     "driver, and try the upscaler's own test in its folder: "
+                     "realesrgan-ncnn-vulkan -i input.jpg -o test.png")
+
+        def psnr(x, ref, scale_up=""):
+            rc2, report = capture(["ffmpeg", "-v", "info", "-i", str(x), "-i", str(ref),
+                                   "-lavfi", f"[0:v]{scale_up or 'null'}[x];[x][1:v]psnr",
+                                   "-f", "null", "-"])
+            m = re.search(r"PSNR .*?average:([0-9.]+)", report)
+            return float(m.group(1)) if m else None
+        diffs = []
+        for n, o in enumerate(outs, 1):
+            big = d / "big" / f"{n:06d}.png"
+            model = psnr(o, big)
+            plain = psnr(d / "in" / f"{n:06d}.png", big, f"scale=iw*{k}:ih*{k}:flags=lanczos")
+            if model is not None and plain is not None:
+                diffs.append(model - plain)
+        if len(diffs) == 2 and sum(diffs) / 2 < -5.5:
+            status_line()
+            if getattr(a, "engine", "exe") == "ncnn":
+                return ncnn_fallback(a, f"a smeared picture, {-sum(diffs) / 2:.1f} dB worse "
+                                        "than a plain resize")
+            sys.exit(f"The upscaler's model {a.model} gives a smeared or garbled picture: two "
+                     f"small test pictures came out {-sum(diffs) / 2:.1f} dB worse than a plain "
+                     "resize (a working model: within 4). Its files are damaged or don't belong "
+                     f"together. {files}.")
+
+
+def ncnn_fallback(a, why):
+    """The current ncnn failed the start-up test: realesrgan-ncnn-vulkan instead (tested too)."""
+    print(f"NOTE: the current ncnn didn't work here ({why}): using realesrgan-ncnn-vulkan's own "
+          "engine instead (--engine exe). On NVIDIA drivers from 570 on that engine resets the "
+          "GPU now and then and is much slower: send the lines above if you want this fixed",
+          flush=True)
+    a.engine, GPU_STEP[0], FRAMES_OK[0] = "exe", 0, 0
+    load_gpu_step(a)
+    print(f"GPU settings: {gpu_load_text(a)}; "
+          + (f"up to {a.gpu_jobs} upscalers per GPU" if a.gpu_jobs > 1 else "one upscaler per GPU"))
+    return check_upscaler(a)
 
 
 def check_ffmpeg():
@@ -1042,6 +2079,15 @@ def keep_awake():
     if os.name == "nt":
         import ctypes
         ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)
+        try:
+            # (above-normal priority, inherited by the upscaler and ffmpeg processes: Windows
+            # gives a busy browser or antivirus scan the processor first otherwise, and the GPU
+            # then waits for the upscaler's next frame)
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            k32.SetPriorityClass(ctypes.c_void_p(k32.GetCurrentProcess()), 0x00008000)
+        except (OSError, AttributeError):
+            pass
         return
     # macOS: caffeinate, Linux with systemd: an inhibitor; each lasts until this run exits
     pid = str(os.getpid())
@@ -1222,7 +2268,6 @@ class FaceRestorer:
 
     def __init__(self, models, model=FACE_MODEL, fidelity=FACE_FIDELITY, providers=None):
         import numpy as np
-        import cv2
         import onnxruntime as ort
         avail = ort.get_available_providers()
         # the GPU if onnxruntime has a way to it (onnxruntime-gpu: CUDA, onnxruntime-directml:
@@ -1490,6 +2535,910 @@ CV_DISTS = ("opencv-python-headless", "opencv-python", "opencv-contrib-python",
             "opencv-contrib-python-headless")
 
 
+NCNN_INSTALL = "python -m pip install --no-deps ncnn numpy"
+NCNN_VERSION = "1.0.20260526"           # (the one tested)
+
+
+def ncnn_install_hint():
+    """How to install the current ncnn for the Python running this script: setup.bat for the
+    one-folder install (its private Python isn't on the PATH), else pip for this Python. --no-deps:
+    ncnn itself needs only numpy; its other listed packages include opencv-python, which can
+    clash with the opencv-python-headless that --faces uses."""
+    here = Path(__file__).resolve().parent
+    if Path(sys.executable).resolve().parent == here / "python":
+        return "run setup.bat again"
+    return f"{pip_cmd()} install --no-deps ncnn=={NCNN_VERSION} numpy"
+
+
+ESRGAN_DEFAULT = "realesrgan-ncnn-vulkan"
+HELPER_MIN = 0.2        # a second GPU this fraction as fast as the first is kept as a helper
+DEFAULT_GPU = "0"       # the GPU used without --gpu, until --ncnn-bench-gpu saves a faster one
+
+
+def ncnn_available():
+    """The current ncnn from pip is installed (it isn't loaded here: the GPU is used by the
+    upscaler processes only)"""
+    import importlib.util
+    return all(importlib.util.find_spec(m) for m in ("ncnn", "numpy"))
+
+
+def write_png(path, rgb):
+    """An 8-bit RGB PNG (rows "Up"-filtered, zlib level 1), written to a temporary name next to
+    the folder and then renamed: a frame in the folder is always whole."""
+    import numpy as np
+    h, w, _ = rgb.shape
+    rows = rgb.reshape(h, w * 3)
+    raw = np.empty((h, w * 3 + 1), np.uint8)
+    raw[:, 0] = 2                                           # (filter type Up)
+    raw[0, 1:] = rows[0]
+    np.subtract(rows[1:], rows[:-1], out=raw[1:, 1:])       # (uint8: modulo 256, as PNG wants)
+
+    import zlib
+
+    def chunk(kind, data):
+        return (struct.pack(">I", len(data)) + kind + data
+                + struct.pack(">I", zlib.crc32(kind + data) & 0xFFFFFFFF))
+    data = (b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0))
+            + chunk(b"IDAT", zlib.compress(raw.tobytes(), 1)) + chunk(b"IEND", b""))
+    tmp = Path(path).parent.parent / f".{Path(path).name}.{os.getpid()}.part"
+    try:
+        tmp.write_bytes(data)
+        replace_file(tmp, path)         # (retried: a virus scanner may hold the new file)
+    except OSError as e:
+        raise OSError(f"encode image {Path(path).name} failed ({e})") from e
+
+
+# ncnn options that can be switched off when the GPU faults with the current ncnn, mildest first
+# (see ncnn_stress_main, which tries them and saves the first that survives in ncnn_opts.json)
+NCNN_OPT_SETS = {
+    "base": {},
+    "nosubgroup": {"use_subgroup_ops": False},
+    "notensor": {"use_tensor_storage": False},
+    "nowinograd": {"use_winograd_convolution": False, "use_winograd23_convolution": False,
+                   "use_winograd43_convolution": False, "use_winograd63_convolution": False},
+    "fp32": {"use_fp16_packed": False, "use_fp16_storage": False, "use_int8_storage": False,
+             "use_bf16_packed": False, "use_bf16_storage": False},
+}
+NCNN_OPT_SETS["safe"] = {k: v for d in NCNN_OPT_SETS.values() for k, v in d.items()}
+# one winograd variant at a time (the three of ncnn's 3x3 convolution shaders; all off is
+# "nowinograd", the set that survives): winograd is the fast way to do 3x3 convolutions, and
+# the GPU fault may come from only one of them (see ncnn_winograd_main)
+NCNN_OPT_SETS["w23"] = {"use_winograd43_convolution": False, "use_winograd63_convolution": False}
+NCNN_OPT_SETS["w43"] = {"use_winograd23_convolution": False, "use_winograd63_convolution": False}
+NCNN_OPT_SETS["w63"] = {"use_winograd23_convolution": False, "use_winograd43_convolution": False}
+NCNN_OPT_SETS["nowinograd_fp16"] = {**NCNN_OPT_SETS["nowinograd"], "use_fp16_arithmetic": True}
+
+
+def ncnn_opts_file():
+    return Path(os.environ.get("DVD_UPSCALE_NCNN_OPTS_FILE")
+                or Path(__file__).resolve().parent / "ncnn_opts.json")
+
+
+def ncnn_saved():
+    try:
+        d = json.loads(ncnn_opts_file().read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def ncnn_opt_set_name():
+    """The option set the upscaler worker uses: DVD_UPSCALE_NCNN_OPTS, else what the self-test
+    saved (ncnn_opts.json next to the script), else "base"."""
+    name = os.environ.get("DVD_UPSCALE_NCNN_OPTS")
+    if not name:
+        name = ncnn_saved().get("set")
+    return name if name in NCNN_OPT_SETS else "base"
+
+
+def ncnn_stress_main(argv):
+    """python dvd_upscale.py --ncnn-stress [--gpu N] [--frames 300]: the current ncnn upscaling
+    test frames with each option set of NCNN_OPT_SETS in turn (one process each, the real
+    worker). The GPU of NVIDIA drivers that fault on some ncnn code paths is reset within a few
+    hundred frames: the first set that gets through them all is saved in ncnn_opts.json, and
+    every later run uses it."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-stress")
+    p.add_argument("--gpu")
+    p.add_argument("--frames", type=int, default=300)
+    w = p.parse_args(argv)
+    here = Path(__file__).resolve().parent
+    exe = shutil.which(ESRGAN_DEFAULT) or next((str(f) for f in here.glob(ESRGAN_DEFAULT + "*")), None)
+    models = Path(exe).resolve().parent / "models" if exe else here / "models"
+    with tempfile.TemporaryDirectory(prefix="ncnn_stress_") as d:
+        d = Path(d)
+        (d / "in").mkdir()
+        print(f"Making {w.frames} test frames (720x480)...", flush=True)
+        run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+             f"testsrc2=s=720x480:r=24:d={w.frames / 24:.3f}", "-frames:v", str(w.frames),
+             str(d / "in" / "%06d.png")])
+        results = []
+        for name in NCNN_OPT_SETS:
+            if name in ("nowinograd_fp16", "w23", "w43", "w63"):    # (speed trials, see ncnn_bench_main
+                continue                                        # and ncnn_winograd_main)
+            out = d / ("out_" + name)
+            out.mkdir()
+            cmd = [sys.executable, Path(__file__).resolve(), "--ncnn-upscaler", "-i", d / "in",
+                   "-o", out, "-n", "realesrgan-x2plus", "-s", "2", "-f", "png", "-j", "1:1:1",
+                   "-m", models]
+            if w.gpu is not None:
+                cmd += ["-g", w.gpu]
+            t0 = time.time()
+            r = subprocess.run([str(c) for c in cmd], capture_output=True,
+                               stdin=subprocess.DEVNULL, env={**os.environ,
+                                                              "DVD_UPSCALE_NCNN_OPTS": name})
+            text = (r.stdout + r.stderr).decode("utf-8", "replace")
+            n = len(list(out.glob("*.png")))
+            ok = r.returncode == 0 and n == w.frames and not GPU_ERRORS.search(text)
+            took = time.time() - t0
+            print(f"  {name:11s} {'OK    ' if ok else 'FAILED'} {n}/{w.frames} frames, "
+                  f"{n / took:.1f} frames/s" + ("" if ok else f" (exit code {r.returncode})"),
+                  flush=True)
+            if not ok:
+                bad = [x.strip() for x in text.splitlines() if x.startswith("ncnn")
+                       or GPU_ERRORS.search(x)]
+                for x in bad[-3:]:
+                    print("      " + x[:150], flush=True)
+            results.append((name, ok, n / took))
+            shutil.rmtree(out, ignore_errors=True)
+            if ok:
+                break
+            time.sleep(15)      # (the driver recovers from the reset)
+    good = [x for x in results if x[1]]
+    if not good:
+        print("No option set got through (see the lines above). If they say the GPU was reset: "
+              "this driver faults on the current ncnn too, try an older one (before 570).")
+        return 1
+    ncnn_opts_file().write_text(json.dumps({**ncnn_saved(), "set": good[0][0]}),
+                                  encoding="utf-8")
+    print(f"Saved '{good[0][0]}' in {ncnn_opts_file().name}: the upscaler uses it from now on.")
+    return 0
+
+
+def ncnn_bench_main(argv):
+    """python dvd_upscale.py --ncnn-bench [MOVIE] [--gpu N] [--frames 90]: the speed-ups that
+    leave the picture as it is, tried on frames of the movie: whole frames instead of 200-pixel
+    tiles (a fifth of the work is the tiles' overlaps; and no seams) and fp16 arithmetic (the
+    GPU's fast path). Each is run through the real worker, its speed taken from the times its
+    frames were written, and its frames compared with the reference (the current settings): a
+    set must be 45 dB or closer (40+ is invisible; fp16 against fp32 rounding is about 55) and
+    free of GPU errors. The fastest that passes is saved in ncnn_opts.json (set and tile)."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-bench")
+    p.add_argument("movie", nargs="?")
+    p.add_argument("--gpu")
+    p.add_argument("--frames", type=int, default=90)
+    p.add_argument("--min-db", type=float, default=45.0)
+    w = p.parse_args(argv)
+    here = Path(__file__).resolve().parent
+    exe = shutil.which(ESRGAN_DEFAULT) or next((str(f) for f in here.glob(ESRGAN_DEFAULT + "*")), None)
+    models = Path(exe).resolve().parent / "models" if exe else here / "models"
+    base_set = ncnn_saved().get("set") or "nowinograd"
+    if base_set not in NCNN_OPT_SETS or base_set == "nowinograd_fp16":
+        base_set = "nowinograd"
+    trials = [(base_set, 200), (base_set, 1024), ("nowinograd_fp16", 200),
+              ("nowinograd_fp16", 1024)]
+    with tempfile.TemporaryDirectory(prefix="ncnn_bench_") as d:
+        d = Path(d)
+        (d / "in").mkdir()
+        if w.movie:
+            print(f"Taking {w.frames} frames from {w.movie}...", flush=True)
+            rc, txt = capture(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                               "-of", "csv=p=0", w.movie])
+            try:
+                at = max(0.0, float(txt.strip()) * 0.4)         # (somewhere inside the film)
+            except ValueError:
+                at = 0.0
+            run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.1f}", "-i", w.movie, "-map",
+                 "0:v:0", "-vf", "scale=iw*sar:ih,setsar=1,scale=720:480", "-frames:v",
+                 str(w.frames), str(d / "in" / "%06d.png")])
+        else:
+            run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                 f"testsrc2=s=720x480:r=24:d={w.frames / 24:.3f}", "-frames:v", str(w.frames),
+                 str(d / "in" / "%06d.png")])
+        n_in = len(list((d / "in").glob("*.png")))
+        ref, results = None, []
+        for k, (name, tile) in enumerate(trials):
+            out = d / f"out{k}"
+            out.mkdir()
+            cmd = [sys.executable, Path(__file__).resolve(), "--ncnn-upscaler", "-i", d / "in",
+                   "-o", out, "-n", "realesrgan-x2plus", "-s", "2", "-f", "png", "-j", "1:1:1",
+                   "-t", tile, "-m", models]
+            if w.gpu is not None:
+                cmd += ["-g", w.gpu]
+            r = subprocess.run([str(c) for c in cmd], capture_output=True,
+                               stdin=subprocess.DEVNULL,
+                               env={**os.environ, "DVD_UPSCALE_NCNN_OPTS": name})
+            text = (r.stdout + r.stderr).decode("utf-8", "replace")
+            files = sorted(out.glob("*.png"))
+            ok = r.returncode == 0 and len(files) == n_in and not GPU_ERRORS.search(text)
+            label = f"{name} / {'whole frame' if tile > 720 else str(tile) + '-pixel tiles'}"
+            fps = db = None
+            if ok and len(files) > 3:
+                times = [f.stat().st_mtime for f in files]
+                fps = (len(times) - 1) / max(1e-6, max(times) - min(times))
+                if ref is None:
+                    ref, db = out, float("inf")
+                else:
+                    rc, rep = capture(["ffmpeg", "-v", "info", "-i", str(out / "%06d.png"),
+                                       "-i", str(ref / "%06d.png"), "-lavfi", "psnr",
+                                       "-f", "null", "-"])
+                    m = re.search(r"PSNR .*?average:([0-9.]+|inf)", rep)
+                    db = float(m.group(1)) if m else 0.0
+            if ok and db is not None and db >= w.min_db:
+                print(f"  {label:42s} {fps:4.2f} frames/s  "
+                      + ("(reference)" if db == float("inf") else f"{db:.1f} dB from the reference"),
+                      flush=True)
+                results.append((fps, name, tile))
+            else:
+                why = ("GPU error" if GPU_ERRORS.search(text) or r.returncode else
+                       f"picture differs ({db:.1f} dB)" if db is not None else "no result")
+                print(f"  {label:42s} not used: {why}", flush=True)
+            if ref is not out:
+                shutil.rmtree(out, ignore_errors=True)
+            time.sleep(10 if ok else 15)
+    if not results:
+        print("Nothing ran cleanly: the saved settings are unchanged.")
+        return 1
+    fps, name, tile = max(results)
+    ncnn_opts_file().write_text(json.dumps({**ncnn_saved(), "set": name, "tile": tile}),
+                                  encoding="utf-8")
+    print(f"Saved the fastest ({name}, {'whole frames' if tile > 720 else str(tile) + '-pixel tiles'}, "
+          f"{fps:.2f} frames/s) in {ncnn_opts_file().name}.")
+    return 0
+
+
+def ncnn_bench_gpu_main(argv):
+    """python dvd_upscale.py --ncnn-bench-gpu [MOVIE] [--gpus 0,1,2] [--frames 40]: the same frames
+    through the real worker on each GPU (the saved settings); the faster one is saved in
+    ncnn_opts.json as the GPU used when --gpu isn't given (else DEFAULT_GPU). Also says what both together would
+    be (the movie's helper-GPU mode: --gpu 0,1) when the slower GPU is worth having."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-bench-gpu")
+    p.add_argument("movie", nargs="?")
+    p.add_argument("--gpus", default=None,
+                   help="the GPU numbers to time (default: every Vulkan GPU except integrated "
+                        "graphics, which can fail the test and bring up the driver's bug-report "
+                        "window)")
+    p.add_argument("--frames", type=int, default=40)
+    w = p.parse_args(argv)
+    here = Path(__file__).resolve().parent
+    exe = shutil.which(ESRGAN_DEFAULT) or next((str(f) for f in here.glob(ESRGAN_DEFAULT + "*")), None)
+    models = Path(exe).resolve().parent / "models" if exe else here / "models"
+    saved = ncnn_saved()
+    name = saved.get("set") if saved.get("set") in NCNN_OPT_SETS else "nowinograd"
+    tile = int(saved.get("tile") or 0)
+    if w.gpus is None:
+        found = probe_vulkan_gpus()
+        gpus = [str(i) for i, name in found if gpu_class(name) != "low"] \
+            or [str(i) for i, _ in found] or ["0", "1"]
+        print("Timing: " + ", ".join(f"GPU {i} ({dict(found).get(int(i), '?')})" for i in gpus))
+    else:
+        gpus = [g.strip() for g in w.gpus.split(",") if g.strip().isdigit()]
+    results = []
+    with tempfile.TemporaryDirectory(prefix="ncnn_gpu_") as d:
+        d = Path(d)
+        (d / "in").mkdir()
+        if w.movie:
+            rc, txt = capture(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                               "-of", "csv=p=0", w.movie])
+            try:
+                at = max(0.0, float(txt.strip()) * 0.4)
+            except ValueError:
+                at = 0.0
+            run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.1f}", "-i", w.movie, "-map",
+                 "0:v:0", "-vf", "scale=iw*sar:ih,setsar=1,scale=720:480", "-frames:v",
+                 str(w.frames), str(d / "in" / "%06d.png")])
+        else:
+            run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                 f"testsrc2=s=720x480:r=24:d={w.frames / 24:.3f}", "-frames:v", str(w.frames),
+                 str(d / "in" / "%06d.png")])
+        n_in = len(list((d / "in").glob("*.png")))
+        for g in gpus:
+            out = d / f"out{g}"
+            out.mkdir()
+            cmd = [sys.executable, Path(__file__).resolve(), "--ncnn-upscaler", "-i", d / "in",
+                   "-o", out, "-n", "realesrgan-x2plus", "-s", "2", "-f", "png", "-j", "1:1:1",
+                   "-g", g, "-m", models] + (["-t", tile] if tile else [])
+            r = subprocess.run([str(c) for c in cmd], capture_output=True,
+                               stdin=subprocess.DEVNULL,
+                               env={**os.environ, "DVD_UPSCALE_NCNN_OPTS": name})
+            text = (r.stdout + r.stderr).decode("utf-8", "replace")
+            files = sorted(out.glob("*.png"))
+            gname = re.search(r"GPU %s (.+?), realesrgan" % g, text)
+            gname = gname.group(1) if gname else "?"
+            if r.returncode == 0 and len(files) == n_in and n_in > 3 \
+                    and not GPU_ERRORS.search(text):
+                times = [f.stat().st_mtime for f in files]
+                fps = (len(times) - 1) / max(1e-6, max(times) - min(times))
+                print(f"  GPU {g} ({gname}): {fps:.2f} frames/s", flush=True)
+                results.append((fps, g))
+            else:
+                print(f"  GPU {g} ({gname}): didn't run cleanly (exit code {r.returncode})",
+                      flush=True)
+            time.sleep(10)
+    if not results:
+        print("No GPU ran cleanly: nothing saved.")
+        return 1
+    results.sort(reverse=True)
+    fps, g = results[0]
+    saved["gpu"] = int(g)
+    saved.pop("helper", None)
+    msg = (f"GPU {g} is the faster one: it is now the default (saved in {ncnn_opts_file().name}; "
+           "--gpu N picks another, --gpu 0,1 uses both).")
+    if len(results) > 1:
+        slow, h = results[1]        # (the next fastest: the one worth having as the helper)
+        if slow / fps >= HELPER_MIN:
+            saved["helper"] = int(h)
+            msg += (f"\nGPU {h} is {slow / fps * 100:.0f}% as fast: worth having as a helper, so "
+                    f"it works alongside it from now on (whole chunks; --gpu {g} alone turns "
+                    "that off).")
+        else:
+            msg += (f"\nThe other GPU is {slow / fps * 100:.0f}% as fast: not worth adding as a "
+                    "helper (it would only add heat).")
+    ncnn_opts_file().write_text(json.dumps(saved), encoding="utf-8")
+    print(msg)
+    return 0
+
+
+def ncnn_auto_main(argv):
+    """python dvd_upscale.py --ncnn-auto [MOVIE] [--gpu N] [--skip-gpu-test] [--no-test-run]:
+    everything to set the GPU up and see how fast it is, in one go: the old saved settings
+    (gpu_steps.json, ncnn_opts.json) cleared; --ncnn-stress (the options the GPU survives);
+    --ncnn-bench (whole frames / fp16, the fastest with the same picture); --ncnn-bench-gpu
+    (which GPU is faster, saved as the default); --ncnn-models (every model's picture, against
+    the original); then a --test 60 run of the movie while the
+    GPU is watched (nvidia-smi), and a summary with the time the whole movie will take."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-auto")
+    p.add_argument("movie", nargs="?")
+    p.add_argument("--gpu", default=DEFAULT_GPU)
+    p.add_argument("--skip-gpu-test", action="store_true")
+    p.add_argument("--no-test-run", action="store_true")
+    p.add_argument("--skip-model-test", action="store_true")
+    p.add_argument("--winograd", action="store_true",
+                   help="also try the winograd variants (on an RTX 3060 laptop none was faster)")
+    w = p.parse_args(argv)
+    movie = [w.movie] if w.movie else []
+    summary = []
+
+    def step(n, text):
+        print(f"\n=== {n}/6  {text} ===", flush=True)
+
+    step(1, "clearing the old saved settings")
+    for f in (gpu_step_file(), ncnn_opts_file()):
+        try:
+            f.unlink()
+            print(f"  deleted {f.name}")
+        except OSError:
+            print(f"  no {f.name} (fine)")
+    step(2, "which GPU is faster (--ncnn-bench-gpu)")
+    if w.skip_gpu_test:
+        print("  skipped")
+    elif ncnn_bench_gpu_main(movie) == 0:
+        summary.append(f"default GPU: {ncnn_saved().get('gpu')}")
+    else:
+        summary.append(f"default GPU: {w.gpu} (the GPU test didn't finish)")
+    # (the options are then found on the GPU the movie will run on)
+    gpu = str(ncnn_saved().get("gpu", w.gpu))
+    step(3, f"finding the options GPU {gpu} survives (--ncnn-stress)")
+    if ncnn_stress_main(["--gpu", gpu]) != 0:
+        print("\nStopped: no setting survived (see above). Nothing more was tried.")
+        return 1
+    summary.append(f"settings the GPU survives: {ncnn_saved().get('set')}")
+    step(4, "the fastest settings with the same picture (--ncnn-bench)")
+    if ncnn_bench_main([*movie, "--gpu", gpu]) == 0:
+        saved = ncnn_saved()
+        tile = int(saved.get("tile") or 0)
+        summary.append(f"fastest safe: {saved.get('set')}, "
+                       + ("whole frames" if tile > 720 else f"{tile or 200}-pixel tiles"))
+    else:
+        summary.append("the speed-up test didn't finish: the settings of step 3 are kept")
+    if w.winograd and ncnn_winograd_main([*movie, "--gpu", gpu]) == 0:
+        summary.append(f"winograd: set '{ncnn_saved().get('set')}'")
+    step(5, "every model on the same frames (--ncnn-models)")
+    if w.skip_model_test or not w.movie:
+        print("  skipped" + ("" if w.skip_model_test else " (give a movie to test the models)"))
+    elif ncnn_models_main([w.movie, "--gpu", str(ncnn_saved().get("gpu", w.gpu)),
+                           "--save"]) == 0:
+        summary.append("models compared: see the table above and model_compare.png")
+    else:
+        summary.append("the model comparison didn't finish")
+    step(6, "timing a 60-second test run, GPU watched")
+    if w.no_test_run or not w.movie:
+        print("  skipped" + ("" if w.no_test_run else " (give a movie to time it)"))
+    else:
+        # (a finished test run of this movie would be resumed, not timed)
+        shutil.rmtree(Path(w.movie).with_name(Path(w.movie).stem + "_work_test"),
+                      ignore_errors=True)
+        util, temps, watts, clocks = [], [], [], []
+        stop = threading.Event()
+
+        def watch():
+            while not stop.wait(2):
+                try:
+                    r = subprocess.run(
+                        ["nvidia-smi",
+                         "--query-gpu=utilization.gpu,temperature.gpu,power.draw,clocks.sm",
+                         "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                        timeout=10)
+                    v = [float(x) for x in r.stdout.strip().splitlines()[0].split(",")]
+                    util.append(v[0]), temps.append(v[1]), watts.append(v[2]), clocks.append(v[3])
+                except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+                    pass
+        threading.Thread(target=watch, daemon=True).start()
+        proc = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), w.movie,
+                                 "--test", "60"], stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT)
+        out = b""
+        while True:
+            chunk = os.read(proc.stdout.fileno(), 4096)
+            if not chunk:
+                break
+            out += chunk
+            sys.stdout.buffer.write(chunk)
+            sys.stdout.buffer.flush()
+        proc.wait()
+        stop.set()
+        text = out.decode("utf-8", "replace")
+        secs = re.findall(r"(\d+)s/chunk", text)
+        bad = len(GPU_ERRORS.findall(text))
+        if proc.returncode or not secs:
+            summary.append(f"test run: didn't finish (exit code {proc.returncode})")
+        else:
+            spc = max(1, int(secs[-1]))
+            rc, dur = capture(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                               "-of", "csv=p=0", w.movie])
+            # (the run's own frames/s; a chunk is 480 frames for live action, 1440 for anime)
+            rate = re.findall(r"Upscaled \d+ frames in .*?\(([\d.]+) frames/s\)", text)
+            fps = float(rate[-1]) if rate else 480 / spc
+            line = f"test run: {spc} s per chunk ({fps:.1f} frames/s)"
+            try:
+                line += (f"; this movie: about "
+                         f"{float(dur.strip()) * 24000 / 1001 / fps / 3600:.1f} hours")
+            except (ValueError, ZeroDivisionError):
+                pass
+            summary.append(line)
+        summary.append(f"GPU errors in the test run: {bad}" if bad else "no GPU errors in the test run")
+        if util:
+            summary.append(f"GPU while upscaling: {sum(util) / len(util):.0f}% busy, "
+                           f"up to {max(temps):.0f} C, {sum(watts) / len(watts):.0f} W, "
+                           f"{sum(clocks) / len(clocks):.0f} MHz"
+                           + ("  (well under 90% busy: something else is the limit)"
+                              if sum(util) / len(util) < 80 else ""))
+    print("\n=== Summary ===")
+    for x in summary:
+        print("  " + x)
+    print("Run the movie with: python dvd_upscale.py <movie> <output>   (these settings are used "
+          "automatically)")
+    return 0
+
+
+def ncnn_models_main(argv):
+    """python dvd_upscale.py --ncnn-models MOVIE [--gpu N] [--frames 6]: every model in the
+    upscaler's models folder, tried on the same frames of the movie, against the truth.
+    The test: each frame is shrunk to half size, every model upscales it back, and the result is
+    compared with the original frame (SSIM and PSNR; a plain Lanczos resize is the baseline: a
+    model has to beat it). The score is fidelity to the original: it rewards a faithful picture
+    and punishes invented detail, so it ranks models by how true they are, not how sharp, and
+    smooth models can score well. So a picture is written too, model_compare.png (next to the
+    script): the original and each model's result, the same part of the frame side by side, to
+    judge with your own eyes. Speed is relative to realesrgan-x2plus."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-models")
+    p.add_argument("movie")
+    p.add_argument("--gpu", default=None)
+    p.add_argument("--frames", type=int, default=6)
+    p.add_argument("--save", action="store_true",
+                   help="save the best model for live action / 3D animation in ncnn_opts.json "
+                        "(used only by an upscale run with --best-quality; 10 frames at least)")
+    w = p.parse_args(argv)
+    if w.save:
+        w.frames = max(w.frames, 10)
+    here = Path(__file__).resolve().parent
+    exe = shutil.which(ESRGAN_DEFAULT) or next((str(f) for f in here.glob(ESRGAN_DEFAULT + "*")), None)
+    models = Path(exe).resolve().parent / "models" if exe else here / "models"
+    found = {}
+    for f in sorted(models.glob("*.param")):
+        m = re.fullmatch(r"(realesr-animevideov3)-x([234])", f.stem)
+        if m:
+            if m[2] == "2":                     # (its x3 and x4 files: other scales of the same net)
+                found[m[1]] = 2
+        elif (models / (f.stem + ".bin")).exists():
+            m = re.search(r"x([24])", f.stem)
+            if m:
+                found[f.stem] = int(m[1])
+    if not found:
+        print(f"No models found in {models}")
+        return 1
+    saved = ncnn_saved()
+    name = saved.get("set") if saved.get("set") in NCNN_OPT_SETS else "nowinograd"
+    tile = int(saved.get("tile") or 0)
+    rc, dur = capture(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
+                       "csv=p=0", w.movie])
+    try:
+        total = float(dur.strip())
+    except ValueError:
+        print(f"Can't read {w.movie}")
+        return 1
+    with tempfile.TemporaryDirectory(prefix="ncnn_models_") as d:
+        d = Path(d)
+        for sub in ("hr", "lr"):
+            (d / sub).mkdir()
+        print(f"Taking {w.frames} frames from {w.movie}...", flush=True)
+        for i in range(w.frames):
+            at = total * (0.15 + 0.7 * i / max(1, w.frames - 1))
+            run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.1f}", "-i", w.movie, "-map",
+                 "0:v:0", "-vf", "scale=iw*sar:ih,setsar=1,scale=720:480", "-frames:v", "1",
+                 str(d / "hr" / f"{i + 1:06d}.png")])
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(d / "hr" / "%06d.png"), "-vf",
+             "scale=360:240:flags=area", str(d / "lr" / "%06d.png")])
+        n_in = len(list((d / "lr").glob("*.png")))
+
+        def score(folder):
+            rc, rep = capture(["ffmpeg", "-v", "info", "-i", str(folder / "%06d.png"), "-i",
+                               str(d / "hr" / "%06d.png"), "-lavfi", "ssim", "-f", "null", "-"])
+            ssim = re.search(r"All:([0-9.]+)", rep)
+            rc, rep = capture(["ffmpeg", "-v", "info", "-i", str(folder / "%06d.png"), "-i",
+                               str(d / "hr" / "%06d.png"), "-lavfi", "psnr", "-f", "null", "-"])
+            psnr = re.search(r"average:([0-9.]+)", rep)
+            return (float(ssim[1]) if ssim else 0.0), (float(psnr[1]) if psnr else 0.0)
+        plain = d / "plain"
+        plain.mkdir()
+        run(["ffmpeg", "-y", "-v", "error", "-i", str(d / "lr" / "%06d.png"), "-vf",
+             "scale=720:480:flags=lanczos", str(plain / "%06d.png")])
+        rows = [("plain resize (baseline)", *score(plain), None, plain)]
+        by_model = {}
+        for mname, k in found.items():
+            out, fit = d / f"out_{mname}", d / f"fit_{mname}"
+            out.mkdir()
+            fit.mkdir()
+            cmd = [sys.executable, Path(__file__).resolve(), "--ncnn-upscaler", "-i", d / "lr",
+                   "-o", out, "-n", mname, "-s", k, "-f", "png", "-j", "1:1:1", "-m", models]
+            if tile:
+                cmd += ["-t", tile]
+            if w.gpu is not None:
+                cmd += ["-g", w.gpu]
+            r = subprocess.run([str(c) for c in cmd], capture_output=True,
+                               stdin=subprocess.DEVNULL, env={**os.environ,
+                                                              "DVD_UPSCALE_NCNN_OPTS": name})
+            text = (r.stdout + r.stderr).decode("utf-8", "replace")
+            files = sorted(out.glob("*.png"))
+            if r.returncode or len(files) != n_in or GPU_ERRORS.search(text):
+                print(f"  {mname:28s} didn't run cleanly (exit code {r.returncode})", flush=True)
+                time.sleep(15)
+                continue
+            times = [f.stat().st_mtime for f in files]
+            fps = (len(times) - 1) / max(1e-6, max(times) - min(times)) if len(times) > 2 else 0
+            run(["ffmpeg", "-y", "-v", "error", "-i", str(out / "%06d.png"), "-vf",
+                 "scale=720:480:flags=lanczos", str(fit / "%06d.png")])
+            rows.append((f"{mname} (x{k})", *score(fit), fps, fit))
+            by_model[mname] = rows[-1]
+            time.sleep(5)
+        ref_speed = next((r[3] for r in rows if r[0].startswith("realesrgan-x2plus")), None)
+        print(f"\n  {'model':32s} {'SSIM':>7s} {'PSNR':>7s}   speed (x2plus = 1.0)")
+        for label, ssim, psnr, fps, _ in sorted(rows, key=lambda r: -r[1]):
+            sp = "" if fps is None or not ref_speed else f"{fps / ref_speed:.1f}"
+            print(f"  {label:32s} {ssim:7.4f} {psnr:6.1f}   {sp}")
+        # a picture to judge by eye: the same part of frame 3 (original, then each model)
+        pick = d / "hr" / f"{min(n_in, 3):06d}.png"
+        ins = [("original", pick)] + [(r[0], r[4] / pick.name) for r in rows]
+        cmd = ["ffmpeg", "-y", "-v", "error"]
+        for _, f in ins:
+            cmd += ["-i", str(f)]
+        filt = "".join(f"[{i}:v]crop=240:160:240:160,scale=480:320:flags=neighbor[c{i}];"
+                       for i in range(len(ins)))
+        filt += "".join(f"[c{i}]" for i in range(len(ins))) + f"hstack=inputs={len(ins)}"
+        cmd += ["-filter_complex", filt, "-frames:v", "1", str(here / "model_compare.png")]
+        rc, _ = capture(cmd)
+        if rc == 0:
+            print("\n  model_compare.png (next to the script), left to right: "
+                  + ", ".join(x[0] for x in ins))
+    best = max(rows[1:], key=lambda r: r[1], default=None)
+    if best:
+        print(f"\n  Closest to the original: {best[0]} (SSIM {best[1]:.4f}). Look at "
+              "model_compare.png before choosing: a higher score is a truer picture, not always "
+              "a nicer one.")
+    if w.save:
+        return save_best_model(by_model)
+    return 0
+
+
+QUALITY_MARGIN = 0.002      # SSIM a model must beat realesrgan-x2plus by to replace it
+QUALITY_MIN_SPEED = 0.3     # ...and it must run at least this fast against it
+
+
+def save_best_model(by_model):
+    """From --ncnn-models --save: the model for live action and 3D animation. Only the ones
+    made for photographs (x2plus, x4plus, the general video model): the anime ones are trained
+    on drawings. realesrgan-x2plus is what those types use already, so another model takes
+    over only when it is clearly truer to the original (SSIM better by QUALITY_MARGIN) and not
+    much slower (at least QUALITY_MIN_SPEED of its speed: x4plus does 4x the work). The choice
+    is saved as best_model in ncnn_opts.json and used only by a run with --best-quality."""
+    photo = {m: r for m, r in by_model.items()
+             if "anime" not in m and re.search(r"x2plus|x4plus|general", m)}
+    if not photo:
+        print("  No model for live action in the models folder: nothing saved.")
+        return 1
+    base = photo.get("realesrgan-x2plus")
+    pick, why = base and "realesrgan-x2plus", "the default for live action and 3D animation"
+    if base is None:
+        pick = max(photo, key=lambda m: photo[m][1])
+        why = "the only choice it could test is the closest to the original"
+    else:
+        for m, r in sorted(photo.items(), key=lambda kv: -kv[1][1]):
+            if m == "realesrgan-x2plus":
+                break
+            slow = (r[3] or 0) / max(1e-6, base[3] or 1e-6)
+            if r[1] - base[1] >= QUALITY_MARGIN and slow >= QUALITY_MIN_SPEED:
+                pick, why = m, (f"truer than realesrgan-x2plus by {r[1] - base[1]:.4f} SSIM, "
+                                f"at {slow:.1f}x its speed")
+                break
+    saved = ncnn_saved()
+    saved["best_model"] = pick
+    ncnn_opts_file().write_text(json.dumps(saved), encoding="utf-8")
+    print(f"  Saved best_model = {pick} ({why}). Nothing changes by itself: add --best-quality "
+          "to an upscale of live action or 3D animation to use it (a movie already started "
+          "keeps its model).")
+    return 0
+
+
+def ncnn_winograd_main(argv):
+    """python dvd_upscale.py --ncnn-winograd [MOVIE] [--gpu N] [--frames 300]: each of ncnn's
+    three winograd convolution variants on its own, on 300 frames of the movie (whole frames,
+    the saved tile), against "nowinograd" (the safe set the stress test found). Winograd is the
+    fast way to do 3x3 convolutions (nearly all of realesrgan-x2plus) and was switched off
+    whole because the GPU got reset with it on; if only one variant faults, the others can come
+    back. A variant must get through all the frames without a GPU error and give the same
+    picture (48 dB or closer: only fp16 rounding differs). The fastest is saved as the set."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-winograd")
+    p.add_argument("movie", nargs="?")
+    p.add_argument("--gpu")
+    p.add_argument("--frames", type=int, default=300)
+    w = p.parse_args(argv)
+    here = Path(__file__).resolve().parent
+    exe = shutil.which(ESRGAN_DEFAULT) or next((str(f) for f in here.glob(ESRGAN_DEFAULT + "*")), None)
+    models = Path(exe).resolve().parent / "models" if exe else here / "models"
+    saved = ncnn_saved()
+    tile = int(saved.get("tile") or 1024)
+    trials = ["nowinograd", "w23", "w43", "w63"]
+    names = {"nowinograd": "no winograd (the safe set)", "w23": "winograd 2x2", "w43": "winograd 4x4",
+             "w63": "winograd 6x6"}
+    with tempfile.TemporaryDirectory(prefix="ncnn_wino_") as d:
+        d = Path(d)
+        (d / "in").mkdir()
+        if w.movie:
+            rc, txt = capture(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                               "-of", "csv=p=0", w.movie])
+            try:
+                at = max(0.0, float(txt.strip()) * 0.4)
+            except ValueError:
+                at = 0.0
+            print(f"Taking {w.frames} frames from {w.movie}...", flush=True)
+            run(["ffmpeg", "-y", "-v", "error", "-ss", f"{at:.1f}", "-i", w.movie, "-map",
+                 "0:v:0", "-vf", "scale=iw*sar:ih,setsar=1,scale=720:480", "-frames:v",
+                 str(w.frames), str(d / "in" / "%06d.png")])
+        else:
+            run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i",
+                 f"testsrc2=s=720x480:r=24:d={w.frames / 24:.3f}", "-frames:v", str(w.frames),
+                 str(d / "in" / "%06d.png")])
+        n_in = len(list((d / "in").glob("*.png")))
+        ref, results, trial_secs = None, [], []
+        est = len(trials) * (n_in / 3.0 + 25)
+        print(f"{len(trials)} runs of {n_in} frames: about {est / 60:.0f} minutes ("
+              f"{eta_text(est)})", flush=True)
+        for k, name in enumerate(trials):
+            out = d / f"out{k}"
+            out.mkdir()
+            cmd = [sys.executable, Path(__file__).resolve(), "--ncnn-upscaler", "-i", d / "in",
+                   "-o", out, "-n", "realesrgan-x2plus", "-s", "2", "-f", "png", "-j", "1:1:1",
+                   "-t", tile, "-m", models]
+            if w.gpu is not None:
+                cmd += ["-g", w.gpu]
+            proc = subprocess.Popen([str(c) for c in cmd], stdout=subprocess.PIPE,
+                                    stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                                    env={**os.environ, "DVD_UPSCALE_NCNN_OPTS": name})
+            captured = []
+            reader = threading.Thread(target=lambda pr=proc, box=captured: box.append(pr.stdout.read()),
+                                      daemon=True)
+            reader.start()
+            t_trial = time.time()
+            while proc.poll() is None:
+                time.sleep(2)
+                try:
+                    n_now = len(os.listdir(out))
+                except OSError:
+                    n_now = 0
+                spent = time.time() - t_trial
+                rate = n_now / spent if n_now >= 10 and spent > 0 else 3.0
+                this_left = max(0.0, (n_in - n_now) / rate)
+                each = (sum(trial_secs) / len(trial_secs)) if trial_secs else n_in / rate + 10
+                left = this_left + (len(trials) - k - 1) * (each + 15)
+                status_line(f"  {names[name]}: frame {n_now} of {n_in} | run {k + 1} of "
+                            f"{len(trials)} | {eta_text(left)}")
+            status_line()
+            proc.wait()
+            reader.join(10)         # (all of its output, so no error line is missed)
+            trial_secs.append(time.time() - t_trial)
+            text = b"".join(captured).decode("utf-8", "replace")
+            r = proc
+            files = sorted(out.glob("*.png"))
+            ok = r.returncode == 0 and len(files) == n_in and not GPU_ERRORS.search(text)
+            if not ok:
+                print(f"  {names[name]:28s} GPU error after {len(files)} of {n_in} frames", flush=True)
+                shutil.rmtree(out, ignore_errors=True)
+                time.sleep(15)          # (the driver recovers)
+                continue
+            times = [f.stat().st_mtime for f in files]
+            fps = (len(times) - 1) / max(1e-6, max(times) - min(times))
+            db = float("inf")
+            if ref is None:
+                ref = out
+            else:
+                rc, rep = capture(["ffmpeg", "-v", "info", "-i", str(out / "%06d.png"), "-i",
+                                   str(ref / "%06d.png"), "-lavfi", "psnr", "-f", "null", "-"])
+                m = re.search(r"PSNR .*?average:([0-9.]+|inf)", rep)
+                db = float(m.group(1)) if m else 0.0
+                shutil.rmtree(out, ignore_errors=True)
+            if db >= 48:
+                print(f"  {names[name]:28s} {fps:.2f} frames/s, got through all {n_in} frames"
+                      + ("" if db == float("inf") else f", {db:.0f} dB from the reference"),
+                      flush=True)
+                results.append((fps, name))
+            else:
+                print(f"  {names[name]:28s} {fps:.2f} frames/s but the picture differs "
+                      f"({db:.0f} dB): not used", flush=True)
+            time.sleep(5)
+    if not results:
+        print("Nothing ran cleanly: the saved settings are unchanged.")
+        return 1
+    fps, name = max(results)
+    base = next((f for f, n in results if n == "nowinograd"), None)
+    ncnn_opts_file().write_text(json.dumps({**ncnn_saved(), "set": name, "tile": tile}),
+                                encoding="utf-8")
+    print(f"Saved '{name}' ({fps:.2f} frames/s"
+          + (f", {fps / base * 100 - 100:+.0f}% against no winograd" if base and name != "nowinograd" else "")
+          + f") in {ncnn_opts_file().name}.")
+    return 0
+
+
+def ncnn_upscaler_main(argv):
+    """python dvd_upscale.py --ncnn-upscaler -i IN -o OUT -n MODEL -s SCALE [-m MODELS] [-t TILE]
+    [-g GPU] [-j L:P:S] [-f png]: realesrgan-ncnn-vulkan's job done with the current ncnn from
+    pip (NCNN_INSTALL) instead of the April 2022 ncnn built into it.
+    Why: NVIDIA drivers from 570 on give a program robust buffer access only when it asks, and
+    the 2022 ncnn doesn't ask (fixed in ncnn 20250916, "fix hangs with NVIDIA >565 drivers").
+    Big networks (x2plus, x4plus) then hang the GPU now and then and Windows resets it
+    ("vkWaitForFences/vkQueueSubmit failed -4"; seen on an RTX 3060 laptop, driver 610, after
+    10-200 frames, while the small anime model ran for hours).
+    The same command line (so run_upscaler and all around it work unchanged) and the same
+    picture: realesrgan.cpp's tiling ported as is. Tiles of -t pixels (0: by the GPU's memory,
+    200 above 1.9 GB) overlap by 10 pixels, mirrored at the frame edges; in RGB / 255, out x 255
+    rounded; fp16 storage, fp32 arithmetic. Only fp16 rounding differs (55 dB). One frame at a
+    time (ncnn's Python module holds the interpreter while the GPU works); frames are read in
+    one ffmpeg stream and written by 3 threads. A GPU error ends it at once, with a line
+    run_upscaler knows (GPU_ERRORS)."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --ncnn-upscaler")
+    for opt in ("-i", "-o", "-n", "-s", "-m", "-t", "-g", "-j", "-f"):
+        p.add_argument(opt)
+    w = p.parse_args(argv)
+    import faulthandler
+    faulthandler.enable()       # (a crash inside ncnn or the driver then prints where, on stderr)
+    try:
+        import numpy as np
+        import ncnn
+    except ImportError as e:
+        print(f"ncnn: can't load the current ncnn ({e}): {ncnn_install_hint()}", flush=True)
+        return 1
+    from concurrent.futures import ThreadPoolExecutor
+    scale, tile, pad = int(w.s), int(w.t or ncnn_saved().get("tile") or 0), 10
+    models = Path(w.m or "models")
+    for name in (w.n, f"{w.n}-x{scale}"):           # (the anime models carry the scale)
+        if (models / f"{name}.param").exists():
+            break
+    else:
+        print(f"ncnn: {w.n}.param not found in {models}", flush=True)
+        return 1
+    if ncnn.get_gpu_count() == 0:       # (ncnn has printed the Vulkan problem)
+        print("ncnn: no Vulkan GPU found (no vulkan)", flush=True)
+        return 1
+    gpu = int(w.g) if w.g not in (None, "") else ncnn.get_default_gpu_index()
+    net = ncnn.Net()
+    o = net.opt
+    o.use_vulkan_compute = True
+    o.use_fp16_packed = o.use_fp16_storage = True
+    o.use_fp16_arithmetic = o.use_bf16_storage = o.use_bf16_packed = False
+    o.use_int8_storage = True
+    for opt_name, opt_value in NCNN_OPT_SETS[ncnn_opt_set_name()].items():
+        if hasattr(o, opt_name):
+            setattr(o, opt_name, opt_value)
+    net.set_vulkan_device(gpu)
+    # (loaded from inside the models folder, by bare file names: ncnn's fopen takes a path in
+    # Windows' ANSI code page, so a folder like "Vidéos" in it would fail; the folder itself the
+    # system finds by its real name)
+    here = os.getcwd()
+    try:
+        os.chdir(models)
+        bad = net.load_param(f"{name}.param") or net.load_model(f"{name}.bin")
+    except OSError:
+        bad = True
+    finally:
+        os.chdir(here)
+    if bad:
+        print(f"ncnn: can't load {models / name}.param/.bin", flush=True)
+        return 1
+    if not tile:        # (realesrgan-ncnn-vulkan's own rule, main.cpp)
+        budget = ncnn.get_gpu_device(gpu).get_heap_budget()
+        tile = 200 if budget > 1900 else 100 if budget > 550 else 64 if budget > 190 else 32
+    src_dir, dst_dir = Path(w.i), Path(w.o)
+    files = sorted(f for f in os.listdir(src_dir) if f.lower().endswith(".png"))
+    print(f"ncnn {ncnn.__version__}: GPU {gpu} {ncnn.get_gpu_info(gpu).device_name()}, "
+          f"{name}, x{scale}, {tile}-pixel tiles, {len(files)} frames", flush=True)
+    if not files:
+        return 0
+    iw, ih = png_size(src_dir / files[0])
+    # (the PNGs fed in one stream, not named in a list: image2 would read a "%20d" in a movie's
+    # name as a frame-number pattern)
+    reader = subprocess.Popen(["ffmpeg", "-v", "error", "-f", "image2pipe", "-c:v", "png",
+                               "-i", "-", "-fps_mode", "passthrough", "-f", "rawvideo",
+                               "-pix_fmt", "rgb24", "-"],
+                              stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+
+    def feed():
+        try:
+            for f in files:
+                reader.stdin.write((src_dir / f).read_bytes())
+            reader.stdin.close()
+        except (OSError, ValueError):
+            pass
+    threading.Thread(target=feed, daemon=True).start()
+    saver = ThreadPoolExecutor(3)
+    pending = []
+    # (the tests: a GPU error after this many frames, in a process started with a tile size
+    # above 100; see dvd_upscale_dev)
+    fail_at = int(os.environ.get("DVD_UPSCALE_TEST_NCNN_FAIL", "-1")) if tile > 100 else -1
+    try:
+        for k, f in enumerate(files):
+            buf = reader.stdout.read(iw * ih * 3)
+            if len(buf) < iw * ih * 3:
+                print(f"ncnn: decode image {f} failed", flush=True)
+                return 1
+            img = np.frombuffer(buf, np.uint8).reshape(ih, iw, 3)
+            src = np.pad(img, ((pad, pad), (pad, pad), (0, 0)), mode="reflect")
+            src = np.ascontiguousarray(src.transpose(2, 0, 1), dtype=np.float32) * (1 / 255)
+            out = np.empty((ih * scale, iw * scale, 3), np.uint8)
+            for y0 in range(0, ih, tile):
+                th = min(tile, ih - y0)
+                for x0 in range(0, iw, tile):
+                    tw = min(tile, iw - x0)
+                    part = np.ascontiguousarray(src[:, y0:y0 + th + 2 * pad, x0:x0 + tw + 2 * pad])
+                    ex = net.create_extractor()
+                    # (a copy: ncnn.Mat(array) keeps numpy's channel stride, h*w, but the GPU
+                    # upload wants each channel to start at a multiple of 4 values: a tile of
+                    # odd size, padding included, would get its green and blue shifted)
+                    mat = ncnn.Mat(part).clone()
+                    ex.input("data", mat)
+                    ret, res = ex.extract("output")
+                    if k == fail_at:
+                        ret = -4
+                    if ret:
+                        print(f"ncnn: GPU error (extract returned {ret}) on {f}", flush=True)
+                        return 1
+                    res = np.array(res)[:, pad * scale:(pad + th) * scale,
+                                        pad * scale:(pad + tw) * scale]
+                    out[y0 * scale:(y0 + th) * scale, x0 * scale:(x0 + tw) * scale] = \
+                        np.clip(np.floor(res * 255 + 0.5), 0, 255).astype(np.uint8).transpose(1, 2, 0)
+                    del ex, mat, part
+            pending.append(saver.submit(write_png, dst_dir / f"{Path(f).stem}.png", out))
+            while len(pending) > 6:     # (frames waiting to be written: a few)
+                pending.pop(0).result()
+        for fut in pending:
+            fut.result()
+        return 0
+    except OSError as e:
+        print(f"ncnn: {e}", flush=True)
+        return 1
+    finally:
+        saver.shutdown()        # (the frames finished before an error are good: written)
+        reader.kill()
+        reader.wait()
+
+
 def faces_worker_main(argv):
     """python dvd_upscale.py --faces-worker ...: the face restoration of one chunk's frames, in
     a process of its own (started by Chunk.restore_faces, never by hand). It only reads the
@@ -1660,10 +3609,19 @@ def face_reinstall_hint():
             else face_install_hint())
 
 
+class FacesUnavailable(Exception):
+    """The automatic face restoration can't run here (packages or model files missing)."""
+
+
 def faces_check(a):
     """--faces, before anything long: the packages and model files are there and the models
-    load (in a worker, as for the chunks). Exits with what to install or download if not;
+    load (in a worker, as for the chunks). Exits with what to install or download if not (when
+    it was turned on by itself, raises FacesUnavailable instead: the movie goes on without);
     prints what it will use."""
+    def stop(msg):
+        if getattr(a, "faces_auto", False):
+            raise FacesUnavailable(msg)
+        sys.exit(msg)
     models = face_models_dir(a)
     a.face_models_path = str(models)
     status_line("  checking the face restoration (loading its models)...")
@@ -1674,7 +3632,7 @@ def faces_check(a):
                            capture_output=True, stdin=subprocess.DEVNULL, timeout=600)
     except subprocess.TimeoutExpired:
         status_line()
-        sys.exit("--faces: the face restoration's check didn't finish (its models didn't load "
+        stop("--faces: the face restoration's check didn't finish (its models didn't load "
                  "in 10 minutes). Reinstalling its packages may help:\n  "
                  + face_reinstall_hint())
     rc, text = p.returncode, (p.stdout + p.stderr).decode("utf-8", "replace")
@@ -1692,7 +3650,7 @@ def faces_check(a):
         # only the ones missing, and the OpenCV package installed if it is too old: a second
         # onnxruntime (or OpenCV) package next to a working one shares its folder and breaks it
         need = miss + ((face_dists(*CV_DISTS) or ["opencv-python-headless"]) if old_cv else [])
-        sys.exit("--faces needs a few Python packages (" + "; ".join(why) + ")"
+        stop("--faces needs a few Python packages (" + "; ".join(why) + ")"
                  + "".join(f"\n  {x.strip()}" for x in lines if x.startswith("("))
                  + (f"\n{'Install them' if miss else 'Update it'} with:\n  "
                     + face_install_hint(need) if need else "")
@@ -1703,7 +3661,7 @@ def faces_check(a):
                  + "\nThen run the same command again.")
     if rc == 4:
         files = found.get("MISSING-MODELS", "").split()
-        sys.exit(f"--faces needs its model files in '{models}'"
+        stop(f"--faces needs its model files in '{models}'"
                  + ("" if a.face_models else " (a face_models folder next to dvd_upscale.py; "
                     "--face-models DIR for another folder)")
                  + ". Missing:\n" + "".join(f"  {f}  from  {FACE_URLS.get(f, '?')}\n"
@@ -1711,13 +3669,13 @@ def faces_check(a):
                  + "Download them into that folder, then run the same command again.")
     if rc == 5:
         files = found.get("BAD-MODEL", "").split()
-        sys.exit(f"--faces: a model file in '{models}' is damaged or not fully downloaded:\n"
+        stop(f"--faces: a model file in '{models}' is damaged or not fully downloaded:\n"
                  + "".join(f"  {f}  from  {FACE_URLS.get(f, '?')}\n" for f in files)
                  + "Delete it and download it again into that folder, then run the same command "
                    "again.")
     provider = found.get("PROVIDER")
     if rc or not provider:
-        sys.exit("--faces: the face restoration couldn't start. Its output (end):\n  "
+        stop("--faces: the face restoration couldn't start. Its output (end):\n  "
                  + "\n  ".join(lines[-15:])
                  + "\nReinstalling its packages may help:\n  " + face_reinstall_hint())
     a.face_provider = provider.strip()
@@ -1755,6 +3713,47 @@ def faces_check(a):
             how = " There is no GPU version of onnxruntime set up for this computer."
         print("NOTE: the face restoration runs on the processor: very slow (seconds per face, "
               "so a chunk with many faces can take many minutes)." + how)
+
+
+THROTTLE_BITS = ((0x4, "power cap"), (0x8, "hardware slowdown"), (0x20, "thermal"),
+                 (0x40, "hardware thermal"), (0x80, "power brake"))
+
+
+class GpuWatch:
+    """While a chunk is upscaled: the NVIDIA GPU's clock, temperature, power and throttle
+    reasons (nvidia-smi, every 4 s), to tell a GPU that slows itself down (heat, power) from
+    one that waits for the processor. summary() is one short line, "" if there is no nvidia-smi."""
+
+    def __init__(self):
+        self.rows, self.stop = [], threading.Event()
+        if shutil.which("nvidia-smi"):
+            threading.Thread(target=self.loop, daemon=True).start()
+
+    def loop(self):
+        while not self.stop.is_set():
+            try:
+                r = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=clocks.sm,clocks.max.sm,temperature.gpu,"
+                     "power.draw,utilization.gpu,clocks_throttle_reasons.active",
+                     "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                    timeout=10, stdin=subprocess.DEVNULL)
+                v = [x.strip() for x in r.stdout.splitlines()[0].split(",")]
+                self.rows.append((float(v[0]), float(v[1]), float(v[2]), float(v[3]),
+                                  float(v[4]), int(v[5], 16)))
+            except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+                pass
+            self.stop.wait(4)
+
+    def summary(self):
+        self.stop.set()
+        rows = self.rows[2:] or self.rows         # (the first samples are the upscaler starting)
+        if not rows:
+            return ""
+        med = lambda i: statistics.median(r[i] for r in rows)
+        why = [name for bit, name in THROTTLE_BITS
+               if sum(1 for r in rows if r[5] & bit) > len(rows) / 4]
+        return (f"GPU {med(0):.0f} of {med(1):.0f} MHz, {med(2):.0f} C, {med(3):.0f} W, "
+                f"{med(4):.0f}% busy" + (f", slowed by: {', '.join(why)}" if why else ""))
 
 
 class Chunk:
@@ -1818,6 +3817,7 @@ class Chunk:
             self.pre += (f",vidstabtransform=input=stab.trf:{a.stab_tf}"
                          + (f",trim=start_frame={stab[2]},setpts=PTS-STARTPTS" if stab[2] else ""))
         self.encode = None
+        self.up_info = self.gpu_info = ""
         # --faces: what finish is doing while the main GPU waits for it (None: not restoring
         # faces), and the face restoration's time on the first chunk, shown once
         self.stage = self.face_msg = None
@@ -1825,7 +3825,7 @@ class Chunk:
     def clear_frames(self):
         # GBs of frames that a retry makes again anyway: don't leave them filling the drive
         # (upscaler_log.txt stays, for a look at what went wrong)
-        for d in ("in", "out", "faces"):
+        for d in ("in", "in_rest", "in_black", "out", "faces"):
             shutil.rmtree(self.tmp / d, ignore_errors=True)
 
     def no_video(self):
@@ -1894,56 +3894,176 @@ class Chunk:
                     f"the drive with the work folder needs about {need / 1e9:.0f} GB free for "
                     f"this chunk's upscaled frames and has {free / 1e9:.1f} GB: make room (or "
                     "use --work on another drive)")
+            watch, t_up0, blacks = None, time.time(), set()
             try:
-                attempt = 0
+                watch = GpuWatch() if not self.lane else None
+                # black frames upscale to black frames: not sent to the upscaler. Their inputs
+                # are moved out of in/ (back after the upscale, for the checks and the blend)
+                # and their outputs written only after it, so out/ holds exactly what the GPU
+                # made (the retry, the frame counts and the progress all read it that way)
+                if not getattr(a, "no_skip_black", False):
+                    found = [f.name for f in sorted((tmp / "in").glob("*.png"))
+                             if png_is_black(f)]
+                    if len(found) == n_in:
+                        found = found[:-1]      # (the upscaler is given at least one frame)
+                    if found:
+                        (tmp / "in_black").mkdir(exist_ok=True)
+                        for name in found:
+                            os.replace(tmp / "in" / name, tmp / "in_black" / name)
+                        blacks = set(found)
+                n_ai = n_in - len(blacks)       # (frames the upscaler is to make)
+                attempt, src, kept = 0, tmp / "in", 0
                 while True:
                     attempt += 1
                     try:
-                        run_upscaler(a, tmp / "in", tmp / "out", n_in, label, (w, h),
-                                     self.gpu, self.lane)
+                        run_upscaler(a, src, tmp / "out", n_ai, label, (w, h), self.gpu,
+                                     self.lane)
                         n_out = len(list((tmp / "out").glob("*.png")))
-                        if n_out != n_in:
-                            raise RuntimeError(f"upscaler produced {n_out} of {n_in} frames "
-                                               "(GPU out of memory? try --tile 128)")
+                        if n_out != n_ai:
+                            # (the upscaler's last lines: a helper GPU's note stays one line)
+                            raise RuntimeError(f"upscaler produced {n_out} of {n_ai} frames "
+                                               "(GPU out of memory? try --tile 128)"
+                                               + ("" if self.lane else upscaler_log_tail(
+                                                   tmp / "upscaler_log.txt")))
+                        if blacks:
+                            # the black frames' outputs, and their inputs back where the checks
+                            # and the blend look for them
+                            write_black_png(tmp / "black.png", w * a.scale, h * a.scale)
+                            for name in sorted(blacks):
+                                shutil.copyfile(tmp / "black.png", tmp / "out" / name)
+                                os.replace(tmp / "in_black" / name, tmp / "in" / name)
+                            (tmp / "black.png").unlink()
                         check_frames(a, tmp, n_in, strict=bool(self.lane))
+                        if not self.lane:
+                            FRAMES_OK[0] += n_ai - kept
+                            save_gpu_step(a, frames_only=True)
                         break
                     except (RuntimeError, subprocess.CalledProcessError) as e:
                         # (no second try on a helper GPU: the main GPU redoes its chunk)
                         if self.lane:
                             raise
-                        # fewer frames on the GPU at once need less of its memory: 8, 6, 4,
-                        # then 2, one step per failed try, for the rest of the run (only the
-                        # automatic count: one given with --gpu-threads is kept). Tried again
+                        # less on the GPU at once needs less of its memory and gives shorter
+                        # pieces of GPU work: one step down per failed try, for the rest of the
+                        # run (see GPU_STEPS; --gpu-threads and --tile are kept). Tried again
                         # once in any case, and as long as there is a step left
-                        lower = a.gpu_threads is None and AUTO_THREADS[0] > MIN_THREADS
-                        if attempt >= 2 and not lower:
+                        tried = gpu_load_text(a)
+                        # the frames finished before a GPU error are kept, and the next try
+                        # does only the rest: so a GPU that is reset now and then still gets
+                        # through, and at the last step a try that got further goes on
+                        good = set(getattr(e, "good", ()))
+                        new, further = len(good) - kept, len(good) > kept
+                        kept = len(good)
+                        # only a GPU error lowers the load (not a full disk, say: smaller tiles
+                        # change the picture a little), and only when it came soon: after 120
+                        # new frames or more, a reset costs less (~25 s) than a step down would
+                        # for the rest of the run
+                        gpu_err = isinstance(e, GPUError)
+                        # (counted across chunks and runs: one reset early in a chunk after
+                        # hours without one doesn't step down for good)
+                        since = FRAMES_OK[0] + max(0, new)
+                        if gpu_err:
+                            FRAMES_OK[0] = 0
+                            save_gpu_step(a, frames_only=True)
+                        lower = gpu_err and since < 120 and lower_gpu_load(a)
+                        if attempt >= 2 and not lower and not (further and attempt < 12):
+                            if GPU_STEP[0] and isinstance(e, GPUError):
+                                raise RuntimeError(
+                                    f"{str(e).rstrip('.')}, also with {gpu_load_text(a)} (the "
+                                    "least this script tries). Update the graphics driver, plug "
+                                    "the laptop in, and close other programs that use the GPU"
+                                    + ("; or try --model realesrgan-x4plus" if "x2plus" in a.model
+                                       else "")) from e
                             raise
                         # a new upscaler process gets a fresh GPU device (after a driver
                         # reset, say). Another upscaler on the same GPU (--gpu-jobs) may have
                         # taken the memory this one needed: it stops, and this one goes alone
                         if self.make_room:
                             self.make_room("retry")
-                        retry_note = ""
-                        if lower:
-                            AUTO_THREADS[0] = max(MIN_THREADS, AUTO_THREADS[0] - 2)
-                            retry_note = f"lowering the GPU thread count to {AUTO_THREADS[0]} and "
+                        retry_note = f"going down to {gpu_load_text(a)} and " if lower else ""
+                        windows = (gpu_report(a, self.tmp.parent, label, e, tried,
+                                              tmp / "upscaler_log.txt") if gpu_err else "")
                         status_line()
-                        print(f"  {label}: {str(e).rstrip('.')} - {retry_note}"
-                              "trying this chunk once more.",
-                              flush=True)
-                        shutil.rmtree(tmp / "out", ignore_errors=True)
-                        (tmp / "out").mkdir()
+                        # (the retry on the first line, any upscaler output below it)
+                        first, _, rest = str(e).partition("\n")
+                        print(f"  {label}: {first.rstrip('.')} - "
+                              + (f"keeping those {kept}; " if kept else "") + retry_note
+                              + (f"trying the other {n_ai - kept} once more." if kept else
+                                 "trying this chunk once more.")
+                              + (f"\n{rest}" if rest else ""), flush=True)
+                        if windows:
+                            print(f"  (Windows recorded: {windows})", flush=True)
+                        if gpu_err and len(GPU_REPORTS) == 1:
+                            print(f"  (details for a bug report: "
+                                  f"{self.tmp.parent.resolve() / 'gpu_errors.log'})", flush=True)
+                        for f in list((tmp / "out").iterdir()):
+                            if f.name not in good:
+                                f.unlink(missing_ok=True)
+                        # (a failed check after the black frames were put in: their inputs
+                        # go aside again, else the upscaler gets them and makes too many)
+                        for name in blacks:
+                            if (tmp / "in" / name).exists():
+                                (tmp / "in_black").mkdir(exist_ok=True)
+                                os.replace(tmp / "in" / name, tmp / "in_black" / name)
+                        shutil.rmtree(tmp / "in_rest", ignore_errors=True)
+                        src = tmp / "in"
+                        if good:
+                            src = tmp / "in_rest"
+                            src.mkdir()
+                            for f in (tmp / "in").glob("*.png"):
+                                if f.name not in good:
+                                    try:
+                                        os.link(f, src / f.name)
+                                    except OSError:
+                                        shutil.copyfile(f, src / f.name)
+                        if "reset" in first:
+                            # Windows takes a few seconds to restart the graphics driver, and
+                            # crashes for good when it has to 6 times within a minute: 15 s, and
+                            # never more than 3 resets in 60 s
+                            now = time.time()
+                            RESET_TIMES.append(now)
+                            recent = [t for t in RESET_TIMES if now - t < 60]
+                            wait = max(15, 60 - (now - recent[-3]) if len(recent) >= 3 else 0)
+                            status_line(f"  {label}: waiting {wait:.0f} s for the graphics "
+                                        "driver to recover")
+                            time.sleep(wait)
             finally:
+                if watch:
+                    watch.stop.set()        # (also when the chunk failed or was stopped)
                 with DISK_LOCK:
                     UPSCALING.pop(self, None)
+            # where the upscale's seconds went: the upscaler starting (to its first frame), the
+            # frames at full speed, and what came after the last one (checks)
+            try:
+                times = sorted(f.stat().st_mtime for f in (tmp / "out").glob("*.png")
+                               if f.name not in blacks)
+                if len(times) > 10 and not self.lane:
+                    self.up_info = (f"start {times[0] - t_up0:.0f}s, "
+                                    f"{(len(times) - 1) / max(1e-6, times[-1] - times[0]):.2f} "
+                                    f"frames/s, after {time.time() - times[-1]:.0f}s")
+                    self.gpu_info = watch.summary() if watch else ""
+                if blacks and not self.lane:
+                    self.up_info += f"{', ' if self.up_info else ''}{len(blacks)} black frames not upscaled"
+            except OSError:
+                pass
+            if watch:
+                watch.stop.set()
             ins = ["-framerate", a.fps, "-i", pngs(tmp / "out")]
             if a.ai_blend < 1:
                 # mix the AI frames with a plain upscale of the same input frames, so frames
                 # where the model adds detail and frames where it doesn't look less different
                 ins += ["-framerate", a.fps, "-i", pngs(tmp / "in")]
-                graph = (f"[1:v]scale=iw*{a.scale}:ih*{a.scale}:flags=lanczos,format=gbrp[plain];"
-                         f"[0:v]format=gbrp[ai];"
-                         f"[ai][plain]blend=all_mode=normal:all_opacity={a.ai_blend}")
+                if getattr(a, "detail_blend", False):
+                    # crowds, grass, gravel (dense small detail): less of the AI there, which
+                    # paints it flat and makes it shimmer; the rest keeps --ai-blend (see
+                    # detail_blend_mask)
+                    graph = (f"[1:v]split=2[p1][p2];[p1]scale=iw*{a.scale}:ih*{a.scale}:"
+                             f"flags=lanczos,format=gbrp[plain];[p2]{detail_blend_mask(a)},"
+                             f"scale=iw*{a.scale}:ih*{a.scale}:flags=bilinear,format=gbrp[mask];"
+                             f"[0:v]format=gbrp[ai];[ai][plain][mask]maskedmerge")
+                else:
+                    graph = (f"[1:v]scale=iw*{a.scale}:ih*{a.scale}:flags=lanczos,"
+                             f"format=gbrp[plain];[0:v]format=gbrp[ai];"
+                             f"[ai][plain]blend=all_mode=normal:all_opacity={a.ai_blend}")
             else:
                 graph = "[0:v]null"
             k = min(12, n_in - 1)
@@ -1995,6 +4115,7 @@ class Chunk:
     def finish(self):
         """Restore the faces (--faces), encode (unless --fast did already) and keep the chunk.
         Returns (path, warning)."""
+        t_enc = time.time()
         if self.encode:
             try:
                 if self.a.faces:
@@ -2003,6 +4124,7 @@ class Chunk:
             except BaseException:
                 self.clear_frames()
                 raise
+        self.enc_secs = time.time() - t_enc
         n = count_frames(self.part)
         flush_to_disk(self.part)
         replace_file(self.part, self.out)
@@ -2065,7 +4187,8 @@ class Chunk:
                         raise RuntimeError(
                             f"the face restoration failed twice on {label} ({why}). Its output "
                             "(end):\n  " + "\n  ".join(tail[-20:]) + "\n(" + gpu_hint
-                            + f"--faces can be left out to upscale without it: {fresh})")
+                            + f"--no-faces upscales without it (for a movie already started: delete its "
+                            f"work folder first): {fresh})")
                     status_line()
                     print(f"  {label}: the face restoration failed ({why}) - trying it once "
                           + ("more on the processor (slower; the GPU may be short of memory "
@@ -2267,8 +4390,6 @@ TYPE_NAMES = {"anime": "anime / drawn animation", "live": "live action",
               "cgi": "3D animation (CGI)", "vhs": "VHS tape"}
 
 # ---- auto-detection, content, look at single pictures: flat colour areas and ink outlines (drawn) vs soft shading
-_cs_all__ = ["detect_content"]
-
 # ---- model (fitted on the training split, see REPORT.md) ---------------------------------------
 _cs_W_ANIME = (3.2616312366286953, 2.795601085467864, 0.07764657454479618)   # logit(eshare), logit(eshare2x), noise
 _cs_B_ANIME = 9.154252224821379
@@ -2278,7 +4399,6 @@ _cs_B_CGI = -5.499787115874285
 _cs_N_SAMPLES = 32
 _cs_BW_INK, _cs_BW_INK_HIGH = 1.2, 1.5               # dark-line ratio; non-anime training clips: max 1.19 (Caminandes 2)
 _cs_NPL = 7                                  # planes per sample: Y, median(Y), Laplacian, black/white top-hat, U, V
-_cs_ABS = {}
 
 
 def _cs_logit(x):
@@ -3123,8 +5243,6 @@ def _ct_detect_content(path, ffmpeg="ffmpeg", ffprobe="ffprobe", info=None):
                 seconds=round(time.time() - t0, 2))
 
 # ---- auto-detection, source: VHS tape (head-switching band at the bottom, ragged noisy side edges) vs DVD
-_src_all__ = ["detect_source"]
-
 _src_LOSSLESS = {"huffyuv", "ffvhuff", "ffv1", "utvideo", "lagarith", "rawvideo", "v210", "v410",
             "yuv4", "r210", "magicyuv", "y41p", "ayuv", "zlib", "mszh", "cllc", "vble"}
 _src_CAPTURE_EXT = (".avi", ".mpg", ".mpeg", ".dv")
@@ -3763,8 +5881,199 @@ def default_output(src, base=None, height=1080):
         return src.parent / f"{height}p Upscale" / name
 
 
+GPU_VRAM_MB = {}        # Vulkan GPU index -> the memory ncnn may use there (MB), from the last probe
+
+
+def probe_vulkan_gpus():
+    """[(index, name)] of the Vulkan GPUs, as ncnn numbers them (the numbers -g takes). Asked
+    in a process of its own: ncnn loaded into this one would crash it when it exits (the
+    0xC0000005 the upscaler worker has to dodge, see the end of the file). [] if unknown."""
+    if not ncnn_available():
+        return []
+    code = ("import ncnn\n"
+            "for i in range(ncnn.get_gpu_count()):\n"
+            "    try:\n"
+            "        mb = int(ncnn.get_gpu_device(i).get_heap_budget())\n"
+            "    except Exception:\n"
+            "        mb = 0\n"
+            "    print(i, ncnn.get_gpu_info(i).device_name(), '|', mb)\n")
+    try:
+        r = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=60,
+                           stdin=subprocess.DEVNULL, text=True, errors="replace")
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for x in r.stdout.splitlines():
+        m = re.fullmatch(r"(\d+) (.+?) \| (\d+)", x.strip())
+        if m:
+            found.append((int(m[1]), m[2].strip()))
+            GPU_VRAM_MB[int(m[1])] = int(m[3])
+    return found
+
+
+def nvidia_driver_major():
+    """The NVIDIA driver's major version (610 for 610.88), None if there is no nvidia-smi."""
+    if not shutil.which("nvidia-smi"):
+        return None
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=driver_version",
+                            "--format=csv,noheader,nounits"], capture_output=True, text=True,
+                           timeout=10, stdin=subprocess.DEVNULL)
+        return int(r.stdout.strip().splitlines()[0].split(".")[0])
+    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        return None
+
+
+def gpu_class(name):
+    """high / mid / low from a GPU's name: what tile size and settings suit it."""
+    n = name.lower()
+    if re.search(r"\b(graphics|uhd|iris|vega|basic|microsoft)\b", n) and "rtx" not in n:
+        return "low"            # integrated graphics, a software adapter
+    if re.search(r"rtx\s*(30|40|50)\d\d|rtx\s*a\d|\brx\s*[679]\d{3}", n):
+        return "high"
+    if re.search(r"gtx|rtx|radeon|\brx\b|arc", n):
+        return "mid"
+    return "low"
+
+
+def print_gpu_recommendations(kind, drv):
+    """What suits a GPU of this class: models, tile, and what to do when Windows resets it."""
+    print("\nRecommendations for a " + {"high": "high-performance dedicated GPU",
+                                        "mid": "mid-range or older dedicated GPU",
+                                        "low": "integrated or low-power GPU"}[kind] + ":")
+    if kind == "high":
+        print("  Anime and cartoons: realesr-animevideov3 (the small model: very fast).")
+        print("  Live action and 3D CGI: realesrgan-x2plus (the sharpest and most natural; the")
+        print("    default for those types). Whole frames (--tile 1024) are quicker than tiles.")
+        print("  One upscaler at a time: on an RTX 3060 laptop two were slower, not faster.")
+    elif kind == "mid":
+        print("  Anime and cartoons: realesr-animevideov3.")
+        print("  Live action and CGI: realesrgan-x2plus works; watch for GPU resets at first.")
+        print("  If Windows resets the driver during chunks: --tile 200, then --tile 100.")
+    else:
+        print("  Anime and cartoons: realesr-animevideov3 (compact, light on the GPU).")
+        print("  VHS camcorder tapes: realesr-general-dn50-x4v3 (much faster here).")
+        print("  Live action and CGI: realesrgan-x2plus is heavy for this GPU: expect days for a")
+        print("    movie. Use --tile 64 (or 32), or --fast for a quick draft without the AI.")
+    if drv and drv >= 570:
+        print(f"  NVIDIA driver {drv}: drivers from 570 on can reset the GPU with ncnn's default")
+        print("    options: the profile's stress test finds the ones that survive (once).")
+    if not ncnn_available():
+        print(f"  The current ncnn isn't installed: {ncnn_install_hint()}")
+
+
+def gpu_detect_main(argv):
+    """python dvd_upscale.py --gpu-detect [--redo]: the GPUs found, how each is classed, the
+    driver, and the saved profile; on a computer with no profile yet, the profile is made now
+    (as the first run would). --redo: forget the saved profile (not the files of the
+    movies) and profile again, including the stress test."""
+    p = argparse.ArgumentParser(prog="dvd_upscale.py --gpu-detect")
+    p.add_argument("--redo", action="store_true")
+    w = p.parse_args(argv)
+    if w.redo:
+        try:
+            ncnn_opts_file().unlink()
+            print(f"Forgot the saved profile ({ncnn_opts_file().name}).")
+        except OSError:
+            pass
+    drv = nvidia_driver_major()
+    print(f"NVIDIA driver: {drv if drv else 'none found (no nvidia-smi)'}"
+          + (" (570 or newer: the stress test is needed)" if drv and drv >= 570 else ""))
+    for idx, name in probe_vulkan_gpus():
+        mb = GPU_VRAM_MB.get(idx, 0)
+        print(f"  Vulkan GPU {idx}: {name} -> {gpu_class(name)}"
+              + (f", {mb / 1024:.1f} GB for the upscaler" if mb else ""))
+    inject_gpu_hardware_profile(types.SimpleNamespace(gpu=None, gpu_given=False))
+    print("Saved profile: " + (json.dumps(ncnn_saved()) if ncnn_saved() else "none"))
+    gpus = probe_vulkan_gpus()
+    main = ncnn_saved().get("gpu")
+    name = dict(gpus).get(main if isinstance(main, int) else (gpus[0][0] if gpus else -1), "")
+    if name:
+        print_gpu_recommendations(gpu_class(name), drv)
+    return 0
+
+
+def inject_gpu_hardware_profile(a):
+    """First run on a computer: find the GPUs, pick the settings that suit the main one, test
+    that it survives the upscaler, and save it all in ncnn_opts.json (one profile for every
+    later run: nothing is asked again, and an old profile is never overwritten). The same file
+    --ncnn-stress / --ncnn-bench / --ncnn-bench-gpu write, and the upscaler reads."""
+    saved = ncnn_saved()
+    if "gpu" in saved and "tile" in saved:
+        say(f"Hardware profile: GPU {saved['gpu']}"
+            + (f" + helper {saved['helper']}" if saved.get("helper") is not None else "")
+            + f", tile {saved['tile'] or 'automatic'}, set '{saved.get('set', 'base')}' "
+            f"(saved in {ncnn_opts_file().name}; delete it to profile again)")
+        return
+    gpus = probe_vulkan_gpus()
+    if not gpus:
+        return                  # (nothing learned: nothing saved, the defaults stay)
+    say("Hardware profile (first run on this computer):")
+    for idx, name in gpus:
+        mb = GPU_VRAM_MB.get(idx, 0)
+        say(f"  GPU {idx}: {name} ({gpu_class(name)}"
+            + (f", {mb / 1024:.1f} GB for the upscaler" if mb else "") + ")")
+    # the GPU the movie runs on: the one given, else the first that isn't integrated, else 0
+    if a.gpu_given:
+        main_gpu = int(str(a.gpu).split(",")[0])
+    else:
+        main_gpu = next((i for i, n in gpus if gpu_class(n) != "low"), gpus[0][0])
+    name = dict(gpus).get(main_gpu, "")
+    kind = gpu_class(name)
+    tile = {"high": 1024, "mid": 200, "low": 64}[kind]
+    mb = GPU_VRAM_MB.get(main_gpu, 0)
+    if kind == "high" and 0 < mb < 3000:
+        tile = 200          # (a whole frame of the big models needs about 1.5 GB: too little here)
+        say(f"  -> only {mb / 1024:.1f} GB of video memory: 200-pixel tiles instead of whole frames")
+    else:
+        say(f"  -> GPU {main_gpu} ({kind}): "
+            + {1024: "whole frames", 200: "200-pixel tiles", 64: "64-pixel tiles"}[tile])
+    new = {**saved, "gpu": main_gpu, "tile": tile}
+    # (no helper GPU: a weak second GPU is slower than none and some drivers fault on it;
+    # --ncnn-bench-gpu measures it and saves one if it is worth having)
+    new.pop("helper", None)
+    write_durably(ncnn_opts_file(), json.dumps(new, indent=1))
+    a.gpu = str(main_gpu) if not a.gpu_given else a.gpu
+    # an NVIDIA GPU on a driver from 570 on gets reset by ncnn's default options (they need
+    # robust buffer access that its code doesn't ask for): the ones that survive are found
+    # once, here. Older drivers don't need it (and the test is skipped: minutes saved)
+    drv = nvidia_driver_major()
+    if "nvidia" in name.lower() and "set" not in saved and (drv is None or drv >= 570):
+        say(f"  NVIDIA driver {drv if drv else '(unknown version)'}: drivers from 570 on can reset "
+            "the GPU with ncnn's default options.")
+        say("  Testing which ncnn settings this GPU survives (a few minutes, once)...")
+        try:
+            if ncnn_stress_main(["--gpu", str(main_gpu)]) != 0:
+                say("  (no setting survived: see above; the run goes on with the defaults)")
+        except (OSError, subprocess.SubprocessError, ValueError) as e:
+            say(f"  (the test couldn't run: {e})")
+    say(f"  Saved in {ncnn_opts_file().name}.")
+
+
 def check_values(a):
     """Option values that would only fail later (after detection, or on every movie of a batch)."""
+    if a.tile is not None:
+        try:
+            tile = int(a.tile)
+        except (TypeError, ValueError):
+            sys.exit("--tile must be 0 (automatic) or a positive number of pixels")
+        if tile < 0:
+            sys.exit("--tile must be 0 (automatic) or a positive number of pixels")
+        a.tile = str(tile)
+    a.gpu_given = a.gpu is not None
+    if a.gpu is None:
+        # (the faster GPU found by --ncnn-bench-gpu, else 0; --gpu on the command line wins)
+        saved_gpu, helper = ncnn_saved().get("gpu"), ncnn_saved().get("helper")
+        a.gpu = str(saved_gpu) if isinstance(saved_gpu, int) and saved_gpu >= 0 else DEFAULT_GPU
+        if isinstance(helper, int) and helper >= 0 and str(helper) != a.gpu:
+            a.gpu += f",{helper}"       # (the slower GPU worth having: it takes whole chunks)
+    if a.gpu is not None:
+        devices = re.sub(r"\s+", "", str(a.gpu)).split(",")
+        if not devices or any(not re.fullmatch(r"[0-9]+", device) for device in devices):
+            sys.exit("--gpu must be a GPU index or comma-separated indices, e.g. 0 or 0,1")
+        if len(set(devices)) != len(devices):
+            sys.exit("--gpu cannot list the same GPU more than once")
+        a.gpu = ",".join(str(int(device)) for device in devices)
     if a.ai_blend is not None and (
             not math.isfinite(a.ai_blend) or not 0 <= a.ai_blend <= 1):
         sys.exit("--ai-blend must be between 0 and 1")
@@ -3786,8 +6095,17 @@ def check_values(a):
         sys.exit("--test must be a number of seconds (0 = the whole movie)")
     if a.gpu_threads is not None and not 1 <= a.gpu_threads <= 16:
         sys.exit("--gpu-threads must be between 1 and 16")
-    if not 1 <= a.gpu_jobs <= 4:
+    if a.encode_jobs is None:
+        # (a small processor: the encode of one chunk competes with the upscaler's own Python
+        # thread; more cores don't need more: on a 3060 laptop the encode takes 7 s of 176)
+        a.encode_jobs = 1 if (os.cpu_count() or 4) <= 4 else 2
+    if not 1 <= a.encode_jobs <= 4:
+        sys.exit("--encode-jobs must be between 1 and 4")
+    if a.gpu_jobs is not None and not 1 <= a.gpu_jobs <= 4:
         sys.exit("--gpu-jobs must be between 1 and 4")
+    if a.busy_blend is not None and (not math.isfinite(a.busy_blend)
+                                     or not 0 <= a.busy_blend <= 1):
+        sys.exit("--busy-blend must be between 0 and 1")
     if a.faces is not None and (not math.isfinite(a.faces) or not 0 < a.faces <= 1):
         sys.exit("--faces must be more than 0 and at most 1 (e.g. --faces 0.6)")
 
@@ -3835,23 +6153,77 @@ def build_parser():
     p.add_argument("--fps", default=None, help="override output fps, e.g. 24000/1001")
     p.add_argument("--chunk-frames", type=int, default=None)
     p.add_argument("--test", type=int, default=0, help="only process first N seconds")
-    p.add_argument("--esrgan", default="realesrgan-ncnn-vulkan")
+    p.add_argument("--phone", nargs="?", type=int, const=PHONE_PORT, metavar="PORT",
+                   help="the progress page for a phone is on by itself: open the address the run "
+                        "prints in the phone's browser on the same Wi-Fi. --phone also asks "
+                        "Windows (an admin prompt) to open the firewall for it for this run, for "
+                        "Tailscale and the home network; --phone PORT: another port (default "
+                        f"{PHONE_PORT})")
+    p.add_argument("--no-phone", action="store_true", help="don't serve the phone page")
+    p.add_argument("--esrgan", default=ESRGAN_DEFAULT)
+    p.add_argument("--engine", choices=("auto", "exe", "ncnn"), default="auto", dest="engine_choice",
+                   help="what runs the big models (x2plus, x4plus): ncnn, the current ncnn from "
+                        f"pip ({NCNN_INSTALL}; fixes the GPU resets of current NVIDIA drivers), "
+                        "or exe, realesrgan-ncnn-vulkan's own (ncnn from 2022). auto (default): "
+                        "ncnn when it is installed (and --esrgan names no upscaler of its own)")
     p.add_argument("--gpu", default=None,
-                   help="Vulkan GPU index for the upscaler (-g). Several, e.g. 0,1 (a laptop's "
+                   help="Vulkan GPU index for the upscaler (-g; default 0, or the faster one found by --ncnn-bench-gpu). Several, e.g. 0,1 (a laptop's "
                         "NVIDIA plus the processor's built-in graphics): the first works through "
                         "the movie, the others upscale whole chunks alongside it")
-    p.add_argument("--tile", default=None, help="tile size if GPU runs out of memory (-t)")
+    p.add_argument("--tile", default=None,
+                   help="tile size in pixels (-t; default: whole frames for anime, the "
+                        "upscaler's own 200 for live action). Smaller tiles need less GPU memory "
+                        "and are shorter pieces of GPU work; they change the picture a little. "
+                        "Without --tile, a chunk the GPU fails on is tried again with fewer "
+                        "frames at once and then with 100-, 64- and 32-pixel tiles")
     p.add_argument("--gpu-threads", type=int, default=None,
-                   help="frames the GPU upscales at once (default 8): more can keep a GPU "
-                        "busier, fewer need less GPU memory. The picture is the same either "
-                        "way. When a chunk fails with the default, it is tried again with 6, "
-                        "then 4, then 2 (and the rest of the run keeps the lower count)")
-    p.add_argument("--gpu-jobs", type=int, default=2,
-                   help="upscalers running at once on each GPU (default 2): the second keeps "
-                        "the GPU busy while the other starts up, checks its frames or waits for "
-                        "the next ones. The picture is the same either way; if two turn out "
-                        "slower than one (not enough video memory), it goes back to one by "
-                        "itself. 1 = one at a time")
+                   help="frames the GPU upscales at once (default 8 for anime, 2 for live "
+                        "action): more can keep a GPU busier, fewer need less GPU memory. The "
+                        "picture is the same either way. When a chunk fails with the default, it "
+                        "is tried again one step lower (anime 6, 4, 2, 1; live action 1), and "
+                        "the rest of the run keeps that")
+    p.add_argument("--no-profile", action="store_true",
+                   help="don't profile the GPUs on the first run (the profile is saved in "
+                        "ncnn_opts.json, and an existing one is never overwritten)")
+    p.add_argument("--no-step-down", action="store_true",
+                   help="after a GPU reset, don't lower the GPU's load (fewer frames at once, "
+                        "smaller tiles) for the rest of the run: the chunk is tried again with "
+                        "the same settings. Keeps full speed if resets are rare; a GPU that keeps "
+                        "resetting then stops the run")
+    p.add_argument("--best-quality", action="store_true",
+                   help="upscale live action / 3D animation with the model that "
+                        "--ncnn-models MOVIE --save found truest to the original (not used "
+                        "otherwise: the usual model stays the default)")
+    p.add_argument("--no-skip-black", dest="no_skip_black", action="store_true",
+                   help="upscale black frames too (by default a frame that is black through and "
+                        "through is not sent to the upscaler: its upscale is black as well)")
+    p.add_argument("--no-detail-blend", action="store_true",
+                   help="use --ai-blend everywhere (by default crowds of small people, grass and "
+                        "other dense small detail get less of the AI, about 0.4: it paints them "
+                        "flat and makes them shimmer; smooth areas keep --ai-blend)")
+    p.add_argument("--busy-blend", type=float, default=None, metavar="SHARE",
+                   help="the AI's share in crowds, grass and other busy detail, 0-1 (default "
+                        f"{DETAIL_BLEND['low_blend']:g}; at most --ai-blend). Higher: crisper "
+                        "but invented detail that shimmers; lower: truer and steadier, softer. "
+                        "E.g. 0.55 for CGI films whose grass and fur look too soft")
+    p.add_argument("--no-crop", action="store_true",
+                   help="don't cut the black bars of a widescreen movie off before the upscale "
+                        "(they are looked for by default: the upscaler then does only the "
+                        "picture, about a quarter less work for 2.39:1)")
+    p.add_argument("--encode-jobs", type=int, default=None, metavar="N",
+                   help="chunks encoded at once while the next is upscaled (default 2, 1 on a "
+                        "processor with 4 threads or fewer): the CPU "
+                        "filters and encode of a chunk can take longer than its upscale, and the "
+                        "GPU then waits")
+    p.add_argument("--gpu-jobs", type=int, default=None,
+                   help="upscalers running at once on each GPU (default 1: the anime and "
+                        "camcorder models' 8 frames at once keep the GPU busy already, two of "
+                        "those were 5.5x slower on a 6 GB laptop GPU, and on a GPU that the big "
+                        "models get reset, more work at once makes a reset likelier: 2 frames "
+                        "at once failed several times sooner than 1). A second one keeps the "
+                        "GPU busy while the other starts up, checks its frames or waits for the "
+                        "next ones. The picture is the same either way; if two turn out slower "
+                        "than one, it goes back to one by itself")
     p.add_argument("--ai-blend", type=float, default=None,
                    help="share of the AI result mixed with a plain upscale, 0-1 "
                         "(lower = less flicker, less detail; default 1 anime, 0.75 live/vhs)")
@@ -3871,14 +6243,18 @@ def build_parser():
     p.add_argument("--faces", nargs="?", type=float, const=FACE_STRENGTH, default=None,
                    metavar="STRENGTH",
                    help="restore faces after the upscale (GFPGAN or CodeFormer redraws each "
-                        "face with real detail: eyes, teeth, skin), for live action and home "
-                        f"video; not used for anime or 3D animation. STRENGTH 0-1 (default "
+                        "face with real detail: eyes, teeth, skin). On by itself for live action "
+                        "and home video when installed; give it for 3D animation to use it there "
+                        f"(never for anime). STRENGTH 0-1 (default "
                         f"{FACE_STRENGTH:g}): the redrawn face's share of the final picture, at "
                         "most the AI frames' share (--ai-blend: 0.75 live and VHS). Needs "
                         "pip install -U onnxruntime-directml (Windows; onnxruntime-gpu for NVIDIA "
                         "with CUDA and cuDNN) opencv-python-headless numpy, and its model files "
                         "in a face_models folder next to this script (the run says where to get "
                         "them)")
+    p.add_argument("--no-faces", action="store_true",
+                   help="no face restoration (it is on by itself for live action and VHS when its "
+                        "packages and model files are installed)")
     p.add_argument("--face-model", choices=sorted(FACE_MODEL_FILES), default=FACE_MODEL,
                    help=f"--faces: gfpgan (GFPGAN 1.4, the default) or codeformer (CodeFormer, "
                         f"fidelity {FACE_FIDELITY:g}; its licence, S-Lab 1.0, allows "
@@ -3959,6 +6335,27 @@ TEST ONE SPOT OF A MOVIE (see what the full run will make of it, in a few minute
     -map 0:v:0  picture only; -map 0:v:0 -map 0:a gives picture and sound
     -c copy     no re-encoding: the clip starts at the nearest keyframe (up to ~1 s early)
 
+WATCH IT ON YOUR PHONE (iPhone or Android, any browser, same Wi-Fi as the PC)
+  It's ON BY ITSELF for every run (one movie, --all, --queue); --no-phone turns it off
+    1. At the start the run prints an address, e.g.  Phone: ... open  http://192.168.1.20:8642
+    2. Type that address into Safari / Chrome on the phone (Share > Add to Home Screen keeps it
+       one tap away)
+    3. The page shows the movie, % done, time left for this movie and for all of them, the step
+       it's on, the latest output, and the NVIDIA GPU's load, temperature, power, memory and
+       clock (a warning when heat or the power cap slows it down); it refreshes every 3 s
+  The first time, Windows asks whether Python may use the network: Allow (private networks).
+  Page won't load? Settings > Network > your Wi-Fi > Network profile type = Private, and the
+  phone on the same Wi-Fi (not mobile data). Port taken? --phone 8650
+  --phone: also asks Windows for admin rights (the "allow changes" prompt) to open the page's
+  port in the firewall for this run only (home network and Tailscale), and closes it again
+  when the run ends. Use it when the page won't load, e.g. through Tailscale.
+  TAILSCALE: if Tailscale runs on the PC, the run also prints its Tailscale address
+  (e.g. http://laptop.tail1234.ts.net:8642): with the Tailscale app on the phone, that one works
+  from anywhere (mobile data, work, a trip), not only at home. It never changes.
+  The Wi-Fi address stays the same from run to run (unless the router gives the PC a new one), so a
+  home-screen shortcut keeps working.
+  "offline" on the page: the run finished or was stopped, or the PC is asleep.
+
 STOP / RESUME
   Ctrl+C                       stop (finished chunks are kept)
   run the same command again   continue where it stopped (with the same type as before)
@@ -3968,17 +6365,124 @@ USEFUL EXTRAS (add to any command above)
   --hevc             smaller files, but needs a newer TV/player (H.264 is the default)
   --height 720       720p instead of 1080p
   --dar 16:9         fix a squeezed/stretched picture (or --dar 4:3)
-  --ai-blend 0.5     gentler AI (less "painted" look; default 0.75 live, 1 anime)
+  --ai-blend 0.5     gentler AI (less "painted" look; default 0.75 live, 1 anime). Crowds,
+                     grass and other busy detail get less AI by themselves (about 0.4): the AI
+                     smears small people together there; --no-detail-blend turns that off
+  --busy-blend 0.55  a little more AI in that busy detail (crisper grass and fur in CGI films,
+                     but more shimmer; 0.4 default, at most --ai-blend)
   --fast             no AI: much quicker, ordinary resize
-  --faces            restore faces (live action and home video; --faces 0.8 for more, at most
-                     the --ai-blend share, 0.75); needs extra installs and model files: the run
-                     says which
+  --faces            face restoration: ON BY ITSELF for live action and VHS once its extras are
+                     installed (the run says which, and goes on without them until then);
+                     --faces 0.8 for more (at most the --ai-blend share, 0.75); add --faces to
+                     a 3D-animation (CGI) movie to use it there too (check a clip: its model
+                     knows photos, faces can turn photographic); never for anime
+  --no-faces         no face restoration
   --cpu              encode without an NVIDIA GPU (slow)
-  --tile 128         if the GPU runs out of memory
-  --gpu-threads 4    frames the GPU works on at once (default 8, lowered to 6, 4, then 2 by
-                     itself if a chunk fails); same picture either way
-  --gpu-jobs 1       one upscaler at a time (default 2: the GPU waits less between chunks;
-                     same picture, and it goes back to one by itself if two are slower)
+  --tile 128         smaller pieces of GPU work, if the GPU runs out of memory or is reset
+                     (lowered by itself to 100, 64, 32 if fewer frames at once didn't help)
+  --gpu 1 / 0,1      another GPU, or both (the default is GPU 0; see GPU SET-UP AND SPEED)
+  --gpu-threads 4    frames the GPU works on at once (anime/camcorder default 8, lowered to
+                     6, 4, 2, 1 by itself if a chunk fails; live action 2, then 1); same picture
+  --no-profile       don't profile the GPUs on the first run on a computer (the profile, the
+                     settings the GPU survives and the tile, is saved in ncnn_opts.json once)
+  --no-skip-black    upscale black frames too (by default a frame that is exactly all black is
+                     not sent to the upscaler: black in, black out; fades are still upscaled)
+  --no-crop          don't cut the black bars of a widescreen movie off before the upscale (by
+                     default they are found, cut, upscaled without and put back: 2.39:1 movies
+                     take about a quarter less GPU work, the same picture; a movie already
+                     started keeps what it started with)
+  --encode-jobs 2    chunks encoded at once while the next is upscaled (default 2; 1 = the old
+                     way). The CPU part of a chunk (filters, encode) can take longer than its
+                     upscale: the progress line then shows "(upscale 140s, encode 175s)" and the
+                     GPU waits. Up to 4 if the encode is still the longer one.
+  --gpu-jobs 2       two upscalers at once (default 1): can fill a GPU that waits between
+                     chunks, but on an RTX 3060 laptop with the current ncnn it was SLOWER (204
+                     against 179 s a chunk): time a --test 60 before using it. Up to 4
+  --engine exe       live action/CGI on realesrgan-ncnn-vulkan's own engine (2022) even when
+                     the current one is installed (python -m pip install --no-deps ncnn numpy)
+
+SPEED CHECKLIST (what holds a laptop GPU back; the script can't change these, you can)
+  1. Plug in the charger (the GPU's power limit drops a lot on battery).
+  2. Windows 11: Settings > System > Power > Power mode = "Best performance".
+  3. The laptop maker's app (Armoury Crate, Legion Vantage, MSI Center, OMEN ...): Turbo /
+     Performance mode and the fans on max: this raises the GPU's power and heat limits.
+  4. NVIDIA Control Panel > Manage 3D settings > Power management mode = "Prefer maximum
+     performance" (Windows: Settings > System > Display > Graphics: python.exe = High performance).
+  5. Cooling: hard flat surface, raised at the back, vents clear, a cooling pad. The run shows
+     "slowed by: power cap, thermal" while the GPU is held back by power or heat.
+  6. Close what uses the GPU (browser video, games, overlays, AMD software), and pause
+     antivirus scans while a movie runs.
+  The script already keeps the PC awake and runs above-normal priority. Thermal and power
+  limits protect the GPU and can't (or shouldn't) be switched off.
+
+  python dvd_upscale.py --gpu-detect          the GPUs, their class, the driver and the saved profile
+                                              (made now if there is none; --redo profiles again)
+
+THE GPU STEP-DOWN (what happens when Windows resets the graphics card: "failed -4")
+  The chunk is tried again, and the GPU is given less to do at once for the rest of the run:
+  each step is a smaller tile (512, 256, 128, 64, 32 pixels; less for the old engine: fewer
+  frames at once, then tiles). Smaller tiles are slower: the overlap between them is done twice.
+  Extra work on a DVD frame against whole frames: 512 +2%, 256 +11%, 128 +27%, 64 +66%, 32 +149%.
+  The picture changes very slightly, so a reset after
+  a long good stretch (120+ frames) doesn't step down. Where it went is kept in gpu_steps.json
+  next to the script, so the next run starts there. It costs speed ONLY after a reset: with
+  settings the GPU survives (--ncnn-stress) it never happens.
+  --no-step-down          never lower the load: a reset retries the chunk with the same settings
+                          (and ignores gpu_steps.json). Full speed if resets are rare; a GPU that
+                          keeps resetting then stops the run instead of going on slower
+  gpu_steps.json          delete it to go back to the full load (after a driver update, say)
+
+GPU SET-UP AND SPEED (run these once from the script's folder; each saves what it finds in
+ncnn_opts.json next to dvd_upscale.py, and every later run uses it)
+  python dvd_upscale.py --ncnn-auto "CGI\Movie.mkv"
+        ALL OF THE BELOW IN ONE GO (about 15-25 minutes, then nothing more to do): clears the old
+        saved settings, runs --ncnn-stress, --ncnn-bench, --ncnn-bench-gpu and --ncnn-models, times a 60-second
+        test run while watching the GPU, and prints a summary with the hours the movie will take.
+        Add --gpu N to set up another GPU, --skip-gpu-test, --skip-model-test or --no-test-run. Use it after a
+        driver update, or when GPU resets ("failed -4") come back. The pieces, one by one:
+  python dvd_upscale.py --ncnn-models "CGI\Movie.mkv" --save
+        FIND THE BEST-QUALITY MODEL: the same test, and the model that is clearly truer to the
+        original than realesrgan-x2plus (and not much slower) is saved as best_model for live
+        action and 3D animation; else x2plus stays. It changes nothing by itself: upscale with
+        --best-quality to use it (python dvd_upscale.py "Movie.mkv" --best-quality). Also
+        run by --ncnn-auto. A movie already started keeps its model.
+  python dvd_upscale.py --ncnn-models "CGI\Movie.mkv"
+        tests EVERY model in the models folder on the same frames of the movie (shrunk to half,
+        upscaled back, compared with the original: SSIM/PSNR against a plain resize), prints a
+        table with the speed of each, and writes model_compare.png next to the script (the same
+        part of the frame from each model side by side, to judge by eye). A higher score means a
+        truer picture, not always a nicer one. It changes nothing.
+  python dvd_upscale.py --ncnn-stress --gpu 0
+        finds the ncnn options your GPU survives (the GPU resets with "vkWaitForFences failed -4"
+        or "vkQueueSubmit failed -4" mean it doesn't). Saves e.g. {"set": "nowinograd"}.
+        Takes a few minutes; run it again after a driver update or if resets come back.
+  python dvd_upscale.py --ncnn-bench "CGI\Movie.mkv" --gpu 0
+        the fastest settings that keep the same picture: whole frames instead of 200-pixel tiles
+        (about 50% faster, no tile seams) and fp16 (kept only if the picture matches). Saved as
+        "set" and "tile". Takes a few minutes.
+  python dvd_upscale.py --ncnn-winograd "CGI\Movie.mkv"
+        the faster way to run the 3x3 convolutions (winograd, three variants) was switched off
+        by --ncnn-stress because the GPU got reset with all three on. This tries each one on its
+        own on 300 frames, and saves the fastest that gets through all of them with the same
+        picture. About 8 minutes; --ncnn-stress first. (Part of --ncnn-auto.)
+  python dvd_upscale.py --ncnn-bench-gpu "CGI\Movie.mkv"
+        times every GPU except integrated graphics (--gpus 0,1,2 to choose), saves the fastest
+        as the default GPU and, if
+        the other is at least 20% as fast, as its helper (it then upscales whole chunks too,
+        like --gpu 0,1; "--gpu 0" on its own runs without it)
+  --gpu N / --gpu 0,1     one GPU (default 0, or the one --ncnn-bench-gpu saved), or both: the
+                          first works through the movie, the second upscales whole chunks too
+  --tile 384              a tile size by hand (overrides the saved one; 0 = automatic)
+  gpu_steps.json          next to the script: the slower settings (fewer frames at once, small
+                          tiles) the script went down to after GPU resets, so the next run
+                          starts there. DELETE it after fixing the GPU (stress test, new driver).
+  ncnn_opts.json          the saved set/tile/gpu. Delete it to go back to the defaults; it can be
+                          edited: {"set": "nowinograd", "tile": 1024, "gpu": 0}
+  Time a run first:  python dvd_upscale.py "Movie.mkv" --test 60   (note the "NNNs/chunk" line)
+  Watch the GPU:     nvidia-smi -l 2   (utilization well under 90% = something else is slowing it)
+  Troubleshooting:   "NOTE: the current ncnn didn't work here" = it fell back to the old engine
+                     (slow, resets); the lines above it say why. A resumed movie keeps its
+                     settings; gpu_errors.log in the movie's _work folder has the GPU details.
 
 MORE
   python dvd_upscale.py --help          every option, briefly
@@ -3987,8 +6491,66 @@ MORE
 """
 
 
+QUICK_START = r"""
+QUICK START: the ones to remember (everything else below is the detail)
+  python dvd_upscale.py "Movie.mkv"                  upscale one movie: everything is automatic
+  python dvd_upscale.py --all                        every movie in this folder (each detected)
+  python dvd_upscale.py --ncnn-auto "Movie.mkv"      set the GPU up and test it (once, ~20 min):
+                                                     the settings it survives, the fastest, the
+                                                     best model; saved and used from then on
+  python dvd_upscale.py "Movie.mkv" --best-quality   upscale with the model --ncnn-models --save found
+  (every run)                                        watch it on your phone: open the address it
+                                                     prints at the start (same Wi-Fi)
+  python dvd_upscale.py --gpu-detect                 the GPUs, the driver, the saved profile
+  python dvd_upscale.py --commands                   this list
+
+ALL THE SPECIAL COMMANDS, ONE LINE EACH (details below)
+  --ncnn-auto MOVIE        everything below in one go, with a summary at the end
+  --ncnn-stress            the ncnn options the GPU survives (no "failed -4" resets)
+  --ncnn-bench MOVIE       the fastest settings with the same picture (whole frames, fp16)
+  --ncnn-bench-gpu MOVIE   which GPU is faster (saved as the default)
+  --ncnn-models MOVIE      every model on your frames, with a picture to judge by eye
+      --save               ...and save the best one (an upscale uses it only with --best-quality)
+  --ncnn-winograd MOVIE    the winograd variants (none was faster on an RTX 3060 laptop)
+  --gpu-detect [--redo]    GPUs, class, driver, memory, saved profile, recommendations
+  --clip MOVIE START SECS  cut a sample (add --upscale to upscale just that piece)
+  --queue / --all          several movies (a list of lines / every movie in a folder)
+  --analyze                only show what it detects      --test 60   a 60-second preview
+  Turn a built-in automatic step off: --no-crop (black bars) --no-skip-black (black frames)
+  --no-detail-blend (less AI in crowds/busy detail)
+  --no-phone (don't serve the progress page for a phone)  --no-faces (no face restoration)
+  --no-profile (first-run GPU profile) --encode-jobs 1 --gpu-jobs 1 --engine exe
+  --no-step-down (don't slow the GPU settings down after a reset)  --best-quality (use the saved model)
+"""
+
+
+def commands_text():
+    """The cheat sheet: the quick start first, then the detail (COMMANDS), then every option of
+    the parser with its first sentence, made from the parser itself so it can't fall behind."""
+    p = build_parser()
+    rows = []
+    for act in p._actions:
+        names = [o for o in act.option_strings if o.startswith("--") and o != "--help"]
+        if not names or not act.help or act.help == argparse.SUPPRESS:
+            continue
+        text = " ".join(str(act.help).split()).replace("e.g.", "e.g.,").replace("i.e.", "i.e.,")
+        first = re.split(r"(?<=[a-z0-9)]\.)\s", text, maxsplit=1)[0]
+        if len(first) > 110:
+            first = first[:110].rsplit(" ", 1)[0] + " ..."
+        rows.append((", ".join(names) + (f" {act.metavar or act.dest.upper()}"
+                                         if act.nargs != 0 and act.const is None
+                                         and not isinstance(act, argparse._StoreTrueAction)
+                                         else ""), first))
+    width = max((len(n) for n, _ in rows), default=0) + 2
+    lines = ["", "EVERY OPTION (from --help; add to any command above)"]
+    lines += [f"  {n:<{width}}{h[:150]}" for n, h in sorted(rows)]
+    lines += ["", "(--faces-worker and --ncnn-upscaler are used by the script itself: not for typing)"]
+    return QUICK_START + COMMANDS + "\n".join(lines) + "\n"
+
+
 def main():
     a = build_parser().parse_args()
+    phone_movie(Path(a.input).name)
     check_values(a)
     a.combed = a.fix_combed     # (--clip --upscale: as detected for the whole movie)
     if a.work is None:
@@ -4011,6 +6573,8 @@ def main():
     if a.trained:
         a.model = a.model or TRAINED_MODEL
         a.scale = a.scale or 2
+    if not a.fast and not a.analyze and a.type != "vhs" and not a.no_profile:
+        inject_gpu_hardware_profile(a)
     # model, scale, chunk frames, pre-denoise (hqdn3d), ai blend, post smoothing, sharpen
     presets = {"anime": ("realesr-animevideov3", 2, 1440, "2:1.5:3:2.5", 1.0, 0, 0.6),
                # x2plus: on small DVD faces x4plus draws eyes as black outlined almonds and
@@ -4031,10 +6595,6 @@ def main():
     a.ai_blend = pb if a.ai_blend is None else a.ai_blend
     a.smooth = psm if a.smooth is None else a.smooth
     a.sharpen = psh if a.sharpen is None else a.sharpen
-    if not 0 <= a.ai_blend <= 1:
-        sys.exit("--ai-blend must be between 0 and 1")
-    if a.smooth < 0 or not 0 <= a.sharpen <= 2:
-        sys.exit("--smooth must be 0 or more, --sharpen between 0 and 2")
     a.model = a.model or pm
     a.scale = a.scale or (4 if "x4plus" in a.model or "x4v3" in a.model else
                           2 if "x2plus" in a.model else ps)
@@ -4046,16 +6606,7 @@ def main():
     if a.telecine:
         a.mode = "telecine"
     if a.dar:
-        a.dar = a.dar.replace(":", "/")
-        if frac(a.dar) <= 0:
-            sys.exit(f"Invalid --dar '{a.dar}', use e.g. 16:9 or 4:3")
-    if a.fps:
-        if frac(a.fps) <= 0:
-            sys.exit(f"Invalid --fps '{a.fps}', use e.g. 24000/1001 or 25")
-    if a.height < 2 or a.height % 2:
-        sys.exit("--height must be an even number")
-    if a.chunk_frames < 1:
-        sys.exit("--chunk-frames must be at least 1")
+        a.dar = a.dar.replace(":", "/")     # (checked in check_values)
     if a.output is None:
         out = default_output(a.input, height=a.height)
         # a preview gets its own name: it must never replace the finished movie
@@ -4077,10 +6628,34 @@ def main():
                      "one another output name (or delete that file first if it should be "
                      "replaced).")
     if not a.analyze:
+        out_dir = Path(a.output).resolve().parent
         try:
-            Path(a.output).resolve().parent.mkdir(parents=True, exist_ok=True)
+            out_dir.mkdir(parents=True, exist_ok=True)
         except OSError as e:
             sys.exit(f"Can't create the output folder '{Path(a.output).parent}': {e}")
+        # the output file is only written at the very end, after the chunks are joined: a
+        # folder that can't be written to would fail after hours of upscaling. A small file made
+        # and removed now shows it (read-only folder, a drive that went away, a locked share)
+        probe_file = out_dir / f".write_test_{os.getpid()}.tmp"
+        try:
+            probe_file.write_text("test", encoding="utf-8")
+        except OSError as e:
+            sys.exit(f"Can't write to the output folder '{out_dir}': {e}\n"
+                     "Give the output a name in another folder (the second argument, "
+                     'for example "D:\\Movies\\Movie 1080p.mkv").')
+        finally:
+            probe_file.unlink(missing_ok=True)
+        # the finished movie is about 10 Mbit/s (more for --hevc 10-bit: less): its size is
+        # a guess, a warning only
+        try:
+            secs = a.test if a.test else (media_duration(Path(a.input)) or 0)
+            need = max(1e9, secs * 1.25e6 * 1.3)
+            free = shutil.disk_usage(out_dir).free
+            if free < need:
+                print(f"WARNING: the drive of the output folder has {free / 1e9:.1f} GB free; "
+                      f"this movie needs about {need / 1e9:.1f} GB there at the end.")
+        except (OSError, TypeError, ValueError):
+            pass            # (a share that can't say how much is free)
         print(f"Saving to: {a.output}")
 
     tools = ["ffmpeg", "ffprobe"] + ([] if a.fast or a.analyze else [a.esrgan])
@@ -4089,6 +6664,25 @@ def main():
             sys.exit(f"Missing tool: {t}")
     if not a.fast and not a.analyze:
         a.esrgan_path = find(a.esrgan)
+        best = ncnn_saved().get("best_model")
+        if a.best_quality and not best:
+            print("NOTE: --best-quality: no best model is saved yet: run "
+                  "python dvd_upscale.py --ncnn-models \"Movie.mkv\" --save first. "
+                  "Using the usual model.")
+        if a.best_quality and best and user_model is None and a.type in ("cgi", "live") \
+                and best != a.model and previous_settings(a) is None:
+            # (--ncnn-models --save found a model truer to the original for these types)
+            keep = (a.model, a.scale)
+            a.model, a.scale = best, 2 if "x2plus" in best else 4
+            if model_installed(a):
+                print(f"Best-quality model for {TYPE_NAMES[a.type]}: {best} "
+                      f"(found by --ncnn-models --save, used because of --best-quality)")
+                if "x4plus" in best:           # tame its face artifacts, as for the fallback
+                    a.ai_blend = 0.5 if user_blend is None else user_blend
+                    a.sharpen = 0.2 if user_sharpen is None else user_sharpen
+                    a.chunk_frames = user_chunk or 480
+            else:
+                a.model, a.scale = keep
         if a.model == "realesr-animevideov3" and user_model is None and not model_installed(a):
             # a folder set up for live action only: the next best model that is there
             for m in ("realesrgan-x2plus", "realesrgan-x4plus"):
@@ -4154,24 +6748,65 @@ def main():
         if "x2plus" in a.model and a.scale != 2:
             sys.exit("realesrgan-x2plus needs --scale 2")
 
+    if not a.fast and not a.analyze:
+        # the big models: the current ncnn if it is there (see ncnn_upscaler_main); the small
+        # anime/camcorder ones stay on realesrgan-ncnn-vulkan, which runs them fine
+        a.engine = "exe"
+        if not compact_model(a) and a.engine_choice != "exe":
+            if ncnn_available() and (a.engine_choice == "ncnn"
+                                     or a.esrgan == ESRGAN_DEFAULT):
+                a.engine = "ncnn"
+            elif a.engine_choice == "ncnn":
+                sys.exit("--engine ncnn: the ncnn Python module isn't installed: "
+                         + ncnn_install_hint())
+            elif a.esrgan == ESRGAN_DEFAULT:
+                print(f"NOTE: for {a.model}, '{ncnn_install_hint()}' gives the upscaler a current "
+                      "GPU engine: the one built into realesrgan-ncnn-vulkan (2022) makes NVIDIA "
+                      "drivers from 570 on reset the GPU now and then (\"vkQueueSubmit failed -4\")")
     if not a.fast:
         kind = (a.type if a.type != "vhs" else
                 f"vhs {'movie tape' if a.mode == 'telecine' else 'camcorder tape'}")
-        print(f"Upscaler: {a.model} x{a.scale} ({kind} preset)")
+        print(f"Upscaler: {a.model} x{a.scale} ({kind} preset)"
+              + (", run by the current ncnn (pip)" if getattr(a, "engine", "exe") == "ncnn"
+                 else ""))
+        load_gpu_step(a)        # (as far down as earlier runs had to go, see gpu_step_file)
+        if a.gpu_jobs is None:          # (see --gpu-jobs)
+            # one: the small models keep the GPU busy at 8 frames at once (two anime upscalers
+            # starved NVENC on a laptop), and where the big ones get the GPU reset, more work at
+            # once makes it likelier (2 frames at once failed several times sooner than 1)
+            # (measured on an RTX 3060 laptop with the current ncnn, whole frames: 179 s a chunk
+            # with one upscaler, 204 with two: --gpu-jobs 2 is slower there)
+            a.gpu_jobs = 1
         jobs_note = (f"up to {a.gpu_jobs} upscalers per GPU, a second kept only if faster"
                      if a.gpu_jobs > 1 else "one upscaler per GPU")
-        print(f"GPU settings: {gpu_threads(a)} frames at once on the GPU; {jobs_note}")
-    if a.faces is not None and (a.fast or a.type in ("anime", "cgi") or a.ai_blend == 0):
-        # (--all --faces on a folder of all kinds of movies: only the live-action ones and tapes
-        # get it)
+        print(f"GPU settings: {gpu_load_text(a)}; {jobs_note}"
+              + (f" (what this GPU needed before; to try more again, delete "
+                 f"{gpu_step_file().name} next to {Path(__file__).name})" if GPU_STEP[0] else ""))
+    # face restoration: on by itself for live action and tapes (when its packages and model
+    # files are installed: else the movie goes on without, see faces_check), only when asked
+    # for 3D animation (its model was trained on photos: animated faces can turn photographic),
+    # never for anime. A movie started without it keeps going without it (its chunks must match)
+    a.faces_auto = False
+    if a.no_faces:
+        a.faces = None
+    elif a.faces is None and a.type in ("live", "vhs") and not a.fast and not a.analyze \
+            and a.ai_blend > 0:
+        prev = previous_settings(a)
+        if prev is None or "faces" in prev:
+            a.faces, a.faces_auto = FACE_STRENGTH, True
+    if a.faces is not None and (a.fast or a.type == "anime" or a.ai_blend == 0):
+        # (--all --faces on a folder of all kinds of movies: anime gets none)
         if not a.analyze:
             print("NOTE: --faces isn't used " + (
                 "with --fast (it works on the AI-upscaled frames)" if a.fast else
-                f"for {TYPE_NAMES[a.type]}: it would turn drawn or 3D-animated faces into "
-                "photographic ones" if a.type in ("anime", "cgi") else
+                f"for {TYPE_NAMES[a.type]}: it would turn drawn faces into photographic ones"
+                if a.type == "anime" else
                 "with --ai-blend 0 (it works on the AI-upscaled frames, none of which are used "
                 "then)"))
         a.faces = None
+    elif a.faces is not None and a.type == "cgi" and not a.analyze:
+        print("NOTE: --faces on 3D animation: its model was trained on photos, so characters' "
+              "faces can come out photographic. Check a clip first (--clip ... --upscale)")
     info = vhs_info if a.type == "vhs" else probe_or_exit(a.input)
     sar_txt = f"{info['sar'].numerator}:{info['sar'].denominator}"
     print(f"Source: {info['w']}x{info['h']}, SAR {sar_txt}, "
@@ -4287,8 +6922,21 @@ def main():
             Path(report).write_text(json.dumps(dict(type=a.type, mode=a.mode,
                                                     combed=bool(getattr(a, "combed", False)))))
         return
+    if not a.fast:
+        check_upscaler(a)       # (exits if the model's files are broken or the GPU fails)
     if a.faces:
-        faces_check(a)          # (exits with what to install or download if something's missing)
+        try:
+            faces_check(a)      # (exits with what to install or download if something's missing)
+        except FacesUnavailable as e:
+            # (turned on by itself: the movie goes on without it, and says how to get it)
+            first, _, rest = str(e).partition("\n")
+            print("NOTE: face restoration is skipped for this movie: "
+                  + first.replace("--faces needs", "it needs").rstrip(".") + "."
+                  + (f"\n{rest}" if rest else "")
+                  + "\n  (This movie goes on without faces, and is saved that way: to add them "
+                    "later, install what is missing and start the movie over by deleting its "
+                    "_work folder. --no-faces hides this note.)", flush=True)
+            a.faces = a.faces_auto = None
 
     if a.fps is None and a.type == "vhs":
         if a.mode == "telecine":
@@ -4391,11 +7039,41 @@ def main():
     # started before that keeps its way, so its chunks match
     prev = previous_settings(a)
     a.rgb_interp = not a.fast and not (prev and "rgb" not in prev)
+    # less AI in crowds and other busy detail (see DETAIL_BLEND): not for drawn animation (its
+    # ink lines are dense detail the anime model is made for), and a movie started before keeps
+    # its way, so its chunks match
+    a.detail_blend = (not a.fast and a.type != "anime" and a.ai_blend < 1
+                      and not a.no_detail_blend and not (prev and "detail_blend" not in prev))
+    # black bars of a widescreen movie: cut off before the upscale, put back after it (see
+    # detect_bars). A movie started earlier keeps what it started with (its chunks must match)
+    a.crop_rows, a.crop_src_h = 0, info["h"]
+    if not a.fast and a.type != "vhs" and not a.no_crop and info["h"] <= 576:
+        if prev is not None:
+            a.crop_rows = int(prev.get("crop", 0))
+            if a.crop_rows and not bar_rows_valid(a, info["h"], a.crop_rows):
+                # (--height changed since: the settings then differ, and the run says so)
+                a.crop_rows = 0
+        else:
+            status_line("  looking for black bars...")
+            a.crop_rows = detect_bars(a, info)
+            status_line()
+            if a.crop_rows:
+                print(f"Black bars: {a.crop_rows} rows at the top and at the bottom are cut "
+                      f"before the upscale and put back after it ({info['h'] - 2 * a.crop_rows} "
+                      f"of {info['h']} rows upscaled: faster, the same picture; --no-crop turns "
+                      "it off)")
+            else:
+                print("Black bars: none found (the picture fills the frame)")
     fp = dict(input=str(Path(a.input).resolve()), size=st.st_size, mtime=int(st.st_mtime),
               mode=a.mode, fps=a.fps, model=a.model, scale=a.scale, height=a.height,
               chunk=a.chunk_frames, fast=a.fast, dar=a.dar, test=a.test, enc=" ".join(a.enc), w=a.out_w,
               denoise=a.denoise, ai_blend=a.ai_blend, smooth=a.smooth, sharpen=a.sharpen,
               **({"rgb": "interp"} if a.rgb_interp else {}),
+              **({"detail_blend": "{sigma}:{lo}:{hi}:{low}".format(
+                  **{**DETAIL_BLEND, "low": DETAIL_BLEND["low_blend"]
+                     if a.busy_blend is None else a.busy_blend})}
+                 if a.detail_blend else {}),
+              **({"crop": a.crop_rows} if a.crop_rows else {}),
               **({"stabilize": a.stab_tf} if a.stabilize else {}),
               # (CodeFormer's fidelity: GFPGAN has none)
               **({"faces": f"{a.face_model} {a.faces:g}" + (
@@ -4439,11 +7117,22 @@ def main():
             hint += f" (to continue it as it was started, add --mode {old['mode']})"
         if "faces" in changed:
             was_faces = str(old.get("faces") or "").split()
-            hint += (" (it was started without --faces)" if not was_faces else
-                     f" (it was started with --faces {was_faces[1]}"
+            hint += (" (it was started without face restoration: leave out --faces, or add "
+                     "--no-faces)" if not was_faces else
+                     f" (it was started with face restoration (--faces {was_faces[1]}"
                      + (f" --face-model {was_faces[0]}" if was_faces[0] != FACE_MODEL else "")
-                     + (f" and CodeFormer fidelity {was_faces[2]}" if len(was_faces) > 2
-                        and float(was_faces[2]) != FACE_FIDELITY else "") + ")")
+                     + (f", CodeFormer fidelity {was_faces[2]}" if len(was_faces) > 2
+                        and float(was_faces[2]) != FACE_FIDELITY else "")
+                     + "): to continue it, leave out --no-faces and any other --faces / "
+                       "--face-model, with its packages and model files working)")
+        if "detail_blend" in changed:
+            was_db = str(old.get("detail_blend") or "").split(":")
+            hint += (" (it was started without the crowd/busy-detail blend: add "
+                     "--no-detail-blend)" if len(was_db) < 4 else
+                     f" (it was started with --busy-blend {was_db[3]})"
+                     if fp.get("detail_blend") else
+                     " (it was started with the crowd/busy-detail blend: leave out "
+                     "--no-detail-blend)")
         sys.exit(f"Settings or input changed since the last run in '{work}': "
                  f"{', '.join(changed)}{hint}. "
                  + (f"Delete the folder '{work.resolve()}' to start this movie fresh." if queue
@@ -4547,7 +7236,10 @@ def main():
     main_secs, skipped, shown = [], set(), [0]  # main GPU's upscale times; chunks with no video
     progress = {"chunks": 0, "video": 0.0, "helped": 0, "frames": 0}
     t_start = time.time()
-    encoding = reading = current = None     # (Background, Chunk) / Chunk
+    encodings, reading, current = [], None, None    # [(Background, Chunk)] / (Background, Chunk) / Chunk
+    last_enc = [0.0]            # seconds the last finished chunk's encode took
+    enc_limit = max(1, getattr(a, "encode_jobs", None) or 1)    # encodes at once (--encode-jobs)
+    # (with faces, the face restorations of two chunks take turns: FACE_LOCK)
 
     def claim(keep=0):
         with lock:
@@ -4677,16 +7369,17 @@ def main():
                              + ("it stopped making progress)" if stuck else
                                 "it will be done with it sooner)"))
 
-    def done_encoding():
-        nonlocal encoding
-        if encoding:
-            bg, job = encoding
+    def done_encoding(keep=0):
+        """Wait for the oldest encodes until at most `keep` are still running."""
+        while len(encodings) > keep:
+            bg, job = encodings[0]
             while a.faces and not bg.done.wait(0.5):      # --faces: show what it is doing
                 if job.stage:
                     status_line(f"  {job.label}: {job.stage}")
             # (cleared only once it has ended: stopped meanwhile, it is waited for, see below)
             chunks[job.idx], warning = bg.wait()
-            encoding = None
+            encodings.pop(0)
+            last_enc[0] = getattr(job, "enc_secs", 0.0)
             for msg in (job.face_msg, warning):
                 if msg:
                     status_line()
@@ -4702,7 +7395,7 @@ def main():
     # the next ones; each frame is upscaled the same way either way), and the other GPUs of
     # --gpu 0,1. Each: (GPU, name, chunks it leaves to the main one, gated: waits until its
     # GPU's speed with one upscaler is known)
-    jobs = 1 if a.fast else a.gpu_jobs
+    jobs = 1 if a.fast else a.gpu_jobs or 1
 
     def lane_name(dev, k):
         return (f"GPU {dev}" if dev is not None else "upscaler") + (f" #{k + 1}" if k else "")
@@ -4812,8 +7505,9 @@ def main():
                 t_up = time.time()
                 job.upscale(n_in)
                 main_secs.append(time.time() - t_up)
-            done_encoding()                     # the previous chunk's encode
-            encoding, current = (Background(job.finish), job), None
+            done_encoding(enc_limit - 1)        # (the encodes that were running, up to --encode-jobs)
+            encodings.append((Background(job.finish), job))
+            current = None
             counted(job)
             show_notes()
             elapsed = time.time() - t_start
@@ -4824,16 +7518,21 @@ def main():
             helped = (f" ({progress['helped']} by the other upscaler{'s' * (len(helpers) > 1)})"
                       if helpers and progress["helped"] else "")
             shown[0] = len(plan) - remaining
-            say(f"[{len(plan) - remaining}/{len(plan)}] {per_chunk:.0f}s/chunk{helped}"
+            where = (f" (upscale {main_secs[-1]:.0f}s, encode {last_enc[0]:.0f}s)"
+                     if main_secs and last_enc[0] else "")
+            detail = [x for x in (job.up_info, job.gpu_info) if x]
+            say(f"[{len(plan) - remaining}/{len(plan)}] {per_chunk:.0f}s/chunk{where}{helped}"
                 + (f"{movie} {eta_text(left)}" if remaining else
                    ", all chunks done, finishing the file..."))
+            if detail and not helpers:
+                say("        upscale: " + "; ".join(detail))
             if later > 0 and remaining:
                 # the movies still to come, at this movie's speed (seconds of work per second
                 # of video): rough, a live-action movie takes longer than an anime one
                 rest = left + later * elapsed / progress["video"]
                 say(f"        all {queue['of']} movies: {eta_text(rest)} (rough)")
-        if encoding:
-            status_line(f"  {encoding[1].label}: encoding")
+        if encodings:
+            status_line(f"  {encodings[-1][1].label}: encoding")
         done_encoding()
         status_line()
         show_notes()
@@ -4851,7 +7550,7 @@ def main():
         # face restoration is stopped, and its chunk made again next time)
         a.stop_lanes.set()
         a.stopping.set()
-        for bg in [x[0] for x in (encoding, reading) if x] + helpers:
+        for bg in [x[0] for x in encodings] + [x[0] for x in (reading,) if x] + helpers:
             try:
                 bg.wait()
             except BaseException:
@@ -5017,8 +7716,8 @@ def main():
 
 VALUE_OPTS = ("--type", "--mode", "--model", "--scale", "--height", "--dar", "--fps",
               "--chunk-frames", "--test", "--esrgan", "--gpu", "--tile", "--gpu-threads",
-              "--gpu-jobs",
-              "--ai-blend", "--smooth",
+              "--gpu-jobs", "--encode-jobs", "--engine",
+              "--ai-blend", "--busy-blend", "--smooth",
               "--sharpen", "--work", "--chroma-delay", "--mask", "--face-model", "--face-models")
 STOPPED = (130, 3221225786)     # a run stopped by Ctrl+C; Windows "terminated by Ctrl+C"
 VIDEO_EXT = (".mkv", ".mp4", ".m4v")
@@ -5212,6 +7911,8 @@ def is_upscaled_output(path):
     except ValueError:
         return False
     return any(OUTPUT_TAG in str(v) for v in tags.values())
+
+
 TYPE_DIRS = {"live": "live", "live action": "live", "live-action": "live", "anime": "anime",
              "cgi": "cgi", "3d": "cgi", "vhs": "vhs"}
 
@@ -5483,10 +8184,22 @@ def queue_main(argv):
                       "one first (new movies / lines are picked up by the running one).")
     keep_awake()
 
+    # a marker in front of each kind of line on the screen (the log file keeps the plain text,
+    # so it can be searched for DONE / FAILED)
+    MARKERS = (("Started", "▶️ "), ("START", "▶️ "), ("DONE", "✅ "), ("Finished", "🏁 "), ("FAILED", "❌ "),
+               ("SKIPPED", "❌ "), ("STOPPED", "⏹️ "), ("KEPT", "⚠️ "), ("Waiting", "⏳ "))
+
     def note(msg):
-        print(msg, flush=True)
-        with open(log, "a", encoding="utf-8") as f:
-            f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+        marker = next((m for word, m in MARKERS if msg.startswith(word)), "")
+        if not marker and "WARNING" in msg.upper():
+            marker = "⚠️ "
+        status_line()           # (the progress line, finished, before a line that stays)
+        print(marker + msg, flush=True)
+        try:
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
+        except OSError as e:    # (a log file another program has open must not stop the queue)
+            print(f"Couldn't write to {log.name}: {e}", flush=True)
 
     tried, done, failed, told_waiting, written = set(), [], [], set(), set()
     analyzed = 0
@@ -5522,7 +8235,7 @@ def queue_main(argv):
         if gone:
             if work.is_dir():
                 clean_work_folder(work)
-            note(f"Original deleted (to the Recycle Bin, if its drive has one): {args[0]}"
+            note(f"Original deleted ({'to the Recycle Bin, if its drive has one' if os.name == 'nt' else 'permanently: there is no Recycle Bin here'}): {args[0]}"
                  + ("" if work.exists() else f" (work folder {work.name} deleted)"))
         else:
             note(f"KEPT the original {args[0]}: it couldn't be moved to the Recycle Bin")
@@ -5626,7 +8339,8 @@ def queue_main(argv):
     for line in failed:
         print(f"  failed: {line}")
     if a.shutdown:
-        note("Shutting down in 60 s (cancel with: shutdown /a)")
+        note("Shutting down in 60 s. To cancel, type:  "
+             + ("shutdown /a" if sys.platform == "win32" else "shutdown -c"))
         cmd = (["shutdown", "/s", "/t", "60"] if sys.platform == "win32"
                else ["shutdown", "-h", "+1"])
         subprocess.run(cmd)
@@ -5676,6 +8390,8 @@ def clip_main(argv):
         sys.exit("Missing tool: ffmpeg")
     m, sec = divmod(int(start), 60)
     tag = f"{m // 60}h{m % 60:02d}m{sec:02d}s" if m >= 60 else f"{m}m{sec:02d}s"
+    if start != int(start):
+        tag += f"{round((start - int(start)) * 10):d}"    # (a start of 1.5 s is not a start of 1 s)
     out = src.with_name(f"{src.stem} clip {tag}.mkv")
     dur = media_duration(src)
     if dur and start >= dur:
@@ -5709,6 +8425,7 @@ def clip_upscale(src, clip, extra):
     print(f"\nChecking the whole movie, as the full run would ({src.name})...", flush=True)
     fd, report = tempfile.mkstemp(suffix=".json")
     os.close(fd)
+    rc = 1
     try:
         rc = subprocess.run([sys.executable, script, str(src), "--analyze", *extra],
                             env=dict(os.environ, DVD_UPSCALE_REPORT=report)).returncode
@@ -5758,17 +8475,58 @@ if __name__ == "__main__":
         os.environ["PATH"] = _here + os.pathsep + os.environ.get("PATH", "")
     if sys.argv[1:2] == ["--faces-worker"]:          # (a chunk's face restoration: see Chunk)
         sys.exit(faces_worker_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-models"]:           # (every model on the same frames)
+        sys.exit(ncnn_models_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--gpu-detect"]:            # (the GPUs, the profile; made if there is none)
+        sys.exit(gpu_detect_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-auto"]:             # (all of the GPU set-up and a timed test)
+        sys.exit(ncnn_auto_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-winograd"]:         # (the winograd variants the GPU survives)
+        sys.exit(ncnn_winograd_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-bench-gpu"]:        # (which GPU is faster)
+        sys.exit(ncnn_bench_gpu_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-bench"]:            # (the fastest settings that keep the picture)
+        sys.exit(ncnn_bench_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-stress"]:           # (find the ncnn options the GPU survives)
+        sys.exit(ncnn_stress_main(sys.argv[2:]))
+    if sys.argv[1:2] == ["--ncnn-upscaler"]:         # (the current ncnn: see esrgan_cmd)
+        rc = ncnn_upscaler_main(sys.argv[2:])
+        # (leave at once, without Python's and ncnn's clean-up: on Windows with the NVIDIA
+        # driver the current ncnn can crash (0xC0000005) while it shuts down, after every frame
+        # was written, and the exit code then said the upscale had failed)
+        sys.stdout.flush()
+        sys.stderr.flush()
+        if sys.platform == "win32":
+            # (os._exit is ExitProcess, which still unloads every DLL, and the crash is there:
+            # TerminateProcess ends the process without that)
+            try:
+                import ctypes
+                k32 = ctypes.windll.kernel32
+                k32.GetCurrentProcess.restype = ctypes.c_void_p
+                k32.TerminateProcess(ctypes.c_void_p(k32.GetCurrentProcess()), int(rc or 0))
+            except (OSError, AttributeError, ValueError):
+                pass
+        os._exit(rc or 0)
     if sys.argv[1:2] == ["--clip"]:
         try:
             clip_main(sys.argv[2:])
         except KeyboardInterrupt:
             sys.exit(130)
         sys.exit(0)
-    if len(sys.argv) == 1 or sys.argv[1:] in (["--commands"], ["commands"]):
-        print(COMMANDS)             # plain "python dvd_upscale.py" shows the cheat sheet too
+    if sys.argv[1:] in (["--commands"], ["commands"]):
+        print(commands_text())      # the cheat sheet: only when asked for
         sys.exit(0)
+    if len(sys.argv) == 1:
+        print('Usage: python dvd_upscale.py "Movie.mkv"    (upscale one movie)\n'
+              '       python dvd_upscale.py --all          (every movie in this folder)\n'
+              '       python dvd_upscale.py --commands     (every command and option)')
+        sys.exit(0)
+    phone_port = phone_args(sys.argv)              # (the phone page: before anything parses argv)
     queue_mode = any(w in ("--queue", "--all") or w.startswith(("--queue=", "--all="))
                      for w in sys.argv[1:])
+    if phone_port:
+        phone_start(phone_port, queue_mode)
+    phone_setup(queue_mode)
     try:
         if queue_mode:
             queue_main(sys.argv[1:])
