@@ -680,7 +680,11 @@ def stage_pairs(a, out):
     t_start = time.time()
     if PROG:
         PROG.set(phase="making pairs", step=have, total=a.count, unit="pairs", eta=None, speed_text="")
-    work = lambda t: make_pair(a, t, dvd_crop, bd_crop, dvd_pre, lrw, lrh, anchors, bd_fps)
+    def work(t):
+        try:
+            return make_pair(a, t, dvd_crop, bd_crop, dvd_pre, lrw, lrh, anchors, bd_fps)
+        except (SystemExit, Exception) as e:          # (run() exits on an ffmpeg error: skip this frame, not the whole step)
+            return None, None, "error " + str(e).strip().splitlines()[0][:60] if str(e).strip() else "error"
     stopped = False
     with open(csv_path, "a" if have else "w", newline="") as fh, ThreadPoolExecutor(max(1, a.pair_workers)) as ex:
         wr = csv.writer(fh)
@@ -794,9 +798,14 @@ class Pairs(torch.utils.data.Dataset):
         return 10 ** 7
 
     def __getitem__(s, _):
-        name = random.choice(s.names)
-        lr = cv2.imread(str(s.root / "lr" / f"{name}.png"))
-        hr = cv2.imread(str(s.root / "hr" / f"{name}.png"))
+        for _ in range(10):
+            name = random.choice(s.names)
+            lr = cv2.imread(str(s.root / "lr" / f"{name}.png"))
+            hr = cv2.imread(str(s.root / "hr" / f"{name}.png"))
+            if lr is not None and hr is not None and hr.shape[0] == 2 * lr.shape[0] and hr.shape[1] == 2 * lr.shape[1]:
+                break
+        else:
+            raise RuntimeError(f"can't read a valid pair from {s.root} (10 tries)")
         h, w = lr.shape[:2]
         p, lrs, hrs = s.p, [], []
         for _ in range(s.n):
@@ -905,10 +914,14 @@ def stage_train(a, root, out):
     out.mkdir(parents=True, exist_ok=True)
     names = sorted(f.stem for f in (root / "lr").glob("*.png") if (root / "hr" / f.name).exists())
     val = names[::20]
-    train = [n for n in names if n not in set(val)]
+    held = set(val)
+    train = [n for n in names if n not in held]
     if len(train) < 8:
         raise SystemExit(f"only {len(names)} pairs in {root}: make more in the pairs step")
     say(f"{len(train)} training pairs, {len(val)} held out; device {dev}")
+    probe_img = cv2.imread(str(root / "lr" / f"{names[0]}.png"))
+    if probe_img is None or min(probe_img.shape[:2]) < a.patch:
+        raise SystemExit(f"the DVD pictures in {root / 'lr'} are smaller than --patch {a.patch}: lower --patch")
     if prog:
         prog.set(title=f"Training: {out.name}", total=a.iters, phase="starting")
 
@@ -936,6 +949,8 @@ def stage_train(a, root, out):
         if disc and "disc" in st:
             disc.load_state_dict(st["disc"]); d_opt.load_state_dict(st["d_opt"])
         step, best = st["step"], st["best"]
+        if "scaler" in st:
+            scaler.load_state_dict(st["scaler"])
         say(f"resuming at step {step}")
 
     # where we start from, on frames never trained on
@@ -956,7 +971,7 @@ def stage_train(a, root, out):
     def save_state():
         torch.save({"params_ema": ema.state_dict()}, out / "upscale_training_latest.pth")
         torch.save({"net": net.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
-                    "step": step, "best": best,
+                    "step": step, "best": best, "scaler": scaler.state_dict(),
                     **({"disc": disc.state_dict(), "d_opt": d_opt.state_dict()} if disc else {})}, state_path)
 
     it = iter(dl)
