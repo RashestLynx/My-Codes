@@ -36,8 +36,14 @@ THUMB = (64, 36)
 PROG = None                 # the live progress page (--web), when asked for
 
 
+LIVE = None                 # the status line in the console
+
+
 def say(msg):
-    print(msg, flush=True)
+    if LIVE:
+        LIVE.say(msg)
+    else:
+        print(msg, flush=True)
     if PROG:
         PROG.log(msg)
 
@@ -267,9 +273,10 @@ def main():
     p.add_argument("--web", type=int, default=0, metavar="PORT",
                    help="live progress page for a browser or phone, e.g. --web 8644 (see progress_web.py)")
     a = p.parse_args()
-    global PROG
+    global PROG, LIVE
+    import progress_web
+    LIVE = progress_web.LiveLine()
     if a.web:
-        import progress_web
         PROG = progress_web.Progress("Making pairs", a.web).start()
 
     out = Path(a.out)
@@ -328,15 +335,21 @@ def main():
                 fh.flush()
                 if done % 25 == 0:
                     say(f"  {done}/{a.count} pairs  (rejected: {dict(rejects)})")
+                el = time.time() - t_start
+                eta = el / done * (a.count - done)
+                LIVE.fields([f"{progress_web.bar(done / a.count, 20)} {100 * done / a.count:5.1f}%  {done}/{a.count}",
+                             f"ETA {progress_web.hms(eta)} (~{progress_web.clock_in(eta)})",
+                             f"{done / el * 60:.1f} pairs/min", f"elapsed {progress_web.hms(el)}",
+                             f"rejected {sum(rejects.values())}"])
                 if PROG:
-                    el = time.time() - t_start
-                    PROG.set(step=done, eta=el / done * (a.count - done), speed_text=f"{done / el * 60:.1f} pairs/min")
+                    PROG.set(step=done, eta=eta, speed_text=f"{done / el * 60:.1f} pairs/min")
                     PROG.metric(rejected=sum(rejects.values()))
                 if done >= a.count:
                     break
         finally:
             for f in futs:
                 f.cancel()
+    LIVE.clear()
     say(f"done: {done} pairs in {out}  (rejected: {dict(rejects)})")
     if PROG:
         PROG.set(phase="finished", step=done, eta=0, finished=True)

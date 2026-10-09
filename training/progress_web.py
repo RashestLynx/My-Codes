@@ -4,7 +4,7 @@ Open  http://<this PC's address>:PORT  in a browser on this PC or on a phone on 
 (or through Tailscale, if you use it). Read-only: it only shows numbers. No extra packages.
 If Windows asks whether to let Python through the firewall, allow it on private networks.
 """
-import http.server, json, socket, threading, time
+import datetime, http.server, json, socket, sys, threading, time
 
 PAGE = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Progress</title>
@@ -159,3 +159,62 @@ def addresses():
     except OSError:
         pass
     return found or ["localhost"]
+
+
+# ---- one live status line in the console (PowerShell) ----
+def hms(sec):
+    sec = max(int(sec), 0)
+    h, m = sec // 3600, sec % 3600 // 60
+    return f"{h} h {m:02d} min" if h else (f"{m} min {sec % 60:02d} s" if m else f"{sec} s")
+
+
+def clock_in(sec):
+    t = datetime.datetime.now() + datetime.timedelta(seconds=max(sec, 0))
+    return t.strftime("%I:%M %p").lstrip("0")
+
+
+def bar(frac, width=24):
+    n = int(round(max(0.0, min(1.0, frac)) * width))
+    return "[" + "#" * n + "-" * (width - n) + "]"
+
+
+class LiveLine:
+    """A status line that rewrites itself; ordinary lines are printed above it."""
+
+    def __init__(self):
+        self.n = 0
+        self.tty = sys.stdout.isatty()
+
+    def show(self, text):
+        if not self.tty:
+            return
+        text = text[:max(shutil_width() - 1, 20)]
+        print("\r" + text.ljust(self.n), end="", flush=True)
+        self.n = len(text)
+
+    def fields(self, parts):
+        """Show as many of the parts (most important first) as fit the window."""
+        width = shutil_width() - 1
+        text = parts[0]
+        for p in parts[1:]:
+            if len(text) + 2 + len(p) > width:
+                break
+            text += "  " + p
+        self.show(text)
+
+    def clear(self):
+        if self.tty and self.n:
+            print("\r" + " " * self.n + "\r", end="", flush=True)
+            self.n = 0
+
+    def say(self, text):
+        self.clear()
+        print(text, flush=True)
+
+
+def shutil_width():
+    try:
+        import shutil
+        return shutil.get_terminal_size((120, 20)).columns
+    except OSError:
+        return 120

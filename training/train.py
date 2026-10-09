@@ -203,13 +203,12 @@ def main():
     p.add_argument("--web", type=int, default=0, metavar="PORT",
                    help="live progress page for a browser or phone, e.g. --web 8643 (see progress_web.py)")
     a = p.parse_args()
-    prog = None
-    if a.web:
-        import progress_web
-        prog = progress_web.Progress("Training", a.web).start()
+    import progress_web
+    prog = progress_web.Progress("Training", a.web).start() if a.web else None
+    live = progress_web.LiveLine()
 
     def say(msg):
-        print(msg, flush=True)
+        live.say(msg)
         if prog:
             prog.log(msg)
 
@@ -270,6 +269,7 @@ def main():
                                      collate_fn=collate, persistent_workers=a.workers > 0)
     it = iter(dl)
     t0, run = time.time(), {}
+    run_t0, start_step, last_l1 = time.time(), step, float("nan")
     net.train()
     while step < a.iters:
         lr_img, hr_img = (x.to(dev, non_blocking=True) for x in next(it))
@@ -304,12 +304,22 @@ def main():
                 pe.mul_(decay).add_(pn.detach(), alpha=1 - decay)
         for k, v in logs.items():
             run[k] = run.get(k, 0) + v
+        last_l1 = logs["l1"]
+        if step % 10 == 0:
+            el = time.time() - run_t0
+            sps = el / max(step - start_step, 1)          # (average over this run, saves included)
+            eta = (a.iters - step) * sps
+            live.fields([f"{progress_web.bar(step / a.iters, 20)} {100 * step / a.iters:5.1f}%  {step}/{a.iters}",
+                         f"ETA {progress_web.hms(eta)} (~{progress_web.clock_in(eta)})",
+                         f"{sps:.2f} s/step", f"elapsed {progress_web.hms(el)}",
+                         f"l1 {last_l1:.4f}"] + ([f"best {best:.2f} dB"] if best > -1e8 else []))
+            if prog:
+                prog.set(step=step, eta=eta, speed_text=f"{sps:.2f} s/step")
         if step % 100 == 0:
             el = time.time() - t0
             say(f"step {step}/{a.iters}  " + "  ".join(f"{k} {v / 100:.4f}" for k, v in run.items())
                 + f"  lr {lr_now:.2e}  {el / 100:.2f} s/step")
             if prog:
-                prog.set(step=step, eta=(a.iters - step) * el / 100, speed_text=f"{el / 100:.2f} s/step")
                 prog.point("loss (L1)", step, run["l1"] / 100)
                 prog.metric(**{k: f"{v / 100:.4f}" for k, v in run.items()})
             run, t0 = {}, time.time()
@@ -331,7 +341,8 @@ def main():
                 prog.metric(**{"best PSNR": f"{best:.2f} dB"})
     if prog:
         prog.set(phase="finished", step=a.iters, eta=0, finished=True)
-    print(f"done. Convert with:  python export_ncnn.py {out / 'dvd2bd_latest.pth'} --name dvd2bd-x2")
+    live.clear()
+    print(f"done in {progress_web.hms(time.time() - run_t0)}. Convert with:  python export_ncnn.py {out / 'dvd2bd_latest.pth'} --name dvd2bd-x2")
     if prog:
         prog.hold()
 
