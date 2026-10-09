@@ -44,6 +44,9 @@ or phone starts by itself (port 8643); the address is printed. `--web 0` turns i
   `--pair-workers`), the GPU memory layout is tensor-core friendly, and `--batch auto` picks the biggest batch (by default it uses everything that fits; `--gpu-memory 0.9` leaves room for other programs) that
   fits in the graphics card's memory. Use it when the monitor shows the GPU under 90% busy; if it is already
   ~100% busy, the GPU is maxed out and only a smaller job (`--iters`, `--arch compact`) will finish sooner.
+- Several NVIDIA GPUs: `--gpus all` (the default) splits every step across all of them, `--gpus 0,1` picks which
+  (numbers as `nvidia-smi` lists them). Use matching cards: the slowest sets the pace. A laptop's integrated
+  AMD/Intel graphics can't train; only NVIDIA (CUDA) cards count.
 - `--lpips` (needs `pip install lpips`) adds LPIPS to the held-out scores next to PSNR and SSIM.
 - `--gan` uses Real-ESRGAN's U-Net discriminator (`--disc patch` for the old one). `--rotate` also turns patches
   by 90 degrees; it is off because a DVD's blur has a direction.

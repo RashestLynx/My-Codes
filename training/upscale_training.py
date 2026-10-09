@@ -36,6 +36,7 @@ needs: ffmpeg + ffprobe on the PATH, pip install numpy opencv-python torch torch
 """
 import argparse, copy, csv, datetime, http.server, json, math, random, re, socket, struct
 import os, shutil, subprocess, sys, threading, time
+os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")      # (--gpus numbers match nvidia-smi's; set before CUDA starts)
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from fractions import Fraction
@@ -279,6 +280,22 @@ GPU_FIELDS = ("name,power.draw,power.limit,utilization.gpu,temperature.gpu,clock
 REASON_FIELDS = ("clocks_throttle_reasons.active", "clocks_event_reasons.active", None)   # (renamed in newer drivers)
 
 
+def combine_gpus(rows):
+    """One reading for several GPUs, for the verdict: watts add up, the load is the average, and the
+    hottest / fullest / most throttled card counts (the slowest card sets the pace)."""
+    known = lambda k: [r[k] for r in rows if r[k] is not None]
+    avg = lambda k: sum(known(k)) / len(known(k)) if known(k) else None
+    full = max(rows, key=lambda r: (r["mem"] or 0) / (r["mem_max"] or 1))
+    bits = 0
+    for r in rows:
+        bits |= r["bits"]
+    return dict(name=f"{len(rows)} GPUs", watts=sum(known("watts")) if known("watts") else None,
+                watts_max=sum(known("watts_max")) if known("watts_max") else None, busy=avg("busy"),
+                temp=max(known("temp")) if known("temp") else None, clock=avg("clock"), clock_max=avg("clock_max"),
+                mem=full["mem"], mem_max=full["mem_max"], bits=bits,
+                slowed=[n for b, n in THROTTLE_BITS if bits & b])
+
+
 def cpu_times():
     """(busy, total) CPU time since boot, whole machine; None if it can't be read."""
     try:
@@ -306,6 +323,7 @@ class HwMonitor:
     def __init__(self, every=2.0):
         self.every, self.gpu, self.cpu, self.err = every, None, None, ""
         self.reason_field = 0                          # which of REASON_FIELDS this driver understands
+        self.focus, self.gpus = [0], []                # (nvidia-smi numbers of the GPUs in use, and their latest readings)
         self.smi = shutil.which("nvidia-smi")
         self.hist = []                                 # recent samples, for the verdict
         self.lock = threading.Lock()
@@ -335,18 +353,23 @@ class HwMonitor:
                 self.err = (r.stderr or "nvidia-smi failed").strip()[:80]
                 return
             self.reason_field += 1                                # (this driver doesn't know that field: try the next)
-        try:
-            v = [x.strip() for x in r.stdout.splitlines()[0].split(",")]
-            num = lambda x: float(x) if re.fullmatch(r"[\d.]+", x) else None      # ("[N/A]" -> None)
+        num = lambda x: float(x) if re.fullmatch(r"[\d.]+", x) else None          # ("[N/A]" -> None)
+        rows = []
+        for text in r.stdout.splitlines():
             try:
-                bits = int(v[9], 16) if len(v) > 9 else 0
-            except ValueError:
-                bits = 0
-            self.gpu = dict(name=v[0], watts=num(v[1]), watts_max=num(v[2]), busy=num(v[3]), temp=num(v[4]),
-                            clock=num(v[5]), clock_max=num(v[6]), mem=num(v[7]), mem_max=num(v[8]),
-                            slowed=[n for b, n in THROTTLE_BITS if bits & b], bits=bits)
-        except (IndexError, ValueError) as e:
-            self.err = str(e)
+                v = [x.strip() for x in text.split(",")]
+                try:
+                    bits = int(v[9], 16) if len(v) > 9 else 0
+                except ValueError:
+                    bits = 0
+                rows.append(dict(name=v[0], watts=num(v[1]), watts_max=num(v[2]), busy=num(v[3]), temp=num(v[4]),
+                                 clock=num(v[5]), clock_max=num(v[6]), mem=num(v[7]), mem_max=num(v[8]),
+                                 slowed=[n for b, n in THROTTLE_BITS if bits & b], bits=bits))
+            except (IndexError, ValueError) as e:
+                self.err = str(e)
+        sel = [rows[i] for i in self.focus if i < len(rows)] or rows[:1]       # (the GPUs the training uses)
+        self.gpus = sel
+        self.gpu = sel[0] if len(sel) == 1 else combine_gpus(sel) if sel else None
 
     def loop(self):
         while True:
@@ -365,6 +388,8 @@ class HwMonitor:
             if g["watts"] is not None:
                 out.append(f"GPU {g['watts']:.0f}/{g['watts_max'] or 0:.0f} W")
             out.append(f"{fv(g['busy'], '{:.0f}%')} busy {fv(g['temp'], '{:.0f}C')}")
+            if len(self.gpus) > 1:
+                out.append("(" + " ".join(f"{fv(r['busy'], '{:.0f}')}%" for r in self.gpus) + ")")
         if self.cpu is not None:
             out.append(f"CPU {self.cpu:.0f}%")
         return out
@@ -379,6 +404,9 @@ class HwMonitor:
             m["GPU clock"] = fv(g["clock"], "{:.0f}") + " / " + fv(g["clock_max"], "{:.0f} MHz")
             m["GPU memory"] = fv(g["mem"], "{:.0f}") + " / " + fv(g["mem_max"], "{:.0f} MiB")
             m["slowed by"] = ", ".join(g["slowed"]) or "nothing"
+            if len(self.gpus) > 1:
+                for i, r in zip(self.focus, self.gpus):
+                    m[f"GPU {i}"] = (f"{fv(r['busy'], '{:.0f}')}% {fv(r['watts'], '{:.0f}')} W {fv(r['temp'], '{:.0f}')} C")
         if self.cpu is not None:
             m["CPU"] = f"{self.cpu:.0f} %"
         return m
@@ -1035,10 +1063,11 @@ def fmt_scores(r):
     return f"{r['psnr']:.2f} dB, SSIM {r['ssim']:.4f}" + (f", LPIPS {r['lpips']:.4f}" if "lpips" in r else "")
 
 
-def auto_batch(net, dev, patch, per, frac):
+def auto_batch(net, dev, patch, per, frac, ids=None):
     """The largest batch (a multiple of --crops, up to 256) whose forward + backward pass stays within `frac`
     of the graphics card's memory (less when --gan / --perceptual need room for a second network)."""
-    total = torch.cuda.get_device_properties(dev).total_memory
+    ids = ids or [dev.index or 0]
+    total = min(torch.cuda.get_device_properties(i).total_memory for i in ids)       # (the smallest card decides)
     fixed = 3 * 4 * sum(q.numel() for q in net.parameters())     # (the averaged copy and Adam's two states; the pass counts the rest)
     best = max(per, 8 - 8 % per)
     net.train()
@@ -1063,7 +1092,7 @@ def auto_batch(net, dev, patch, per, frac):
         if peak + fixed > frac * total:
             break
         best = b
-    return best
+    return best * len(ids)                                        # (each card takes a full batch of its own)
 
 
 def stage_train(a, root, out):
@@ -1074,7 +1103,15 @@ def stage_train(a, root, out):
         raise SystemExit(f"starting model not found: {a.pretrained}\nDownload RealESRGAN_x2plus.pth from\n"
                          "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth\n"
                          "and put it in the training folder (or pass its path with --pretrained).")
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    ids = pick_gpus(a.gpus)
+    dev = torch.device(f"cuda:{ids[0]}") if ids else torch.device("cpu")
+    if ids:
+        torch.cuda.set_device(dev)
+        HW.focus = ids
+        names_ = [torch.cuda.get_device_name(i) for i in ids]
+        say(f"training on {len(ids)} GPU(s): " + ", ".join(f"{i}: {n}" for i, n in zip(ids, names_)))
+        if len(set(names_)) > 1:
+            say("WARNING: the GPUs are different models: every step waits for the slowest one (use --gpus to pick matching ones)")
     if dev.type == "cpu":
         print("WARNING: no CUDA GPU found, training on the processor (very slow)")
     out.mkdir(parents=True, exist_ok=True)
@@ -1110,9 +1147,13 @@ def stage_train(a, root, out):
     if not 0.1 <= a.gpu_memory <= 1.0:
         raise SystemExit("--gpu-memory is a share of the card's memory between 0.1 and 1.0 (e.g. 0.9)")
     if a.batch == "auto":
-        a.batch = auto_batch(net, dev, a.patch, max(1, a.crops), a.gpu_memory * (0.8 if (a.gan or a.perceptual) else 1.0)) if dev.type == "cuda" else 8
+        a.batch = auto_batch(net, dev, a.patch, max(1, a.crops), a.gpu_memory * (0.8 if (a.gan or a.perceptual) else 1.0), ids) if dev.type == "cuda" else 8
         say(f"--batch auto: {a.batch} patches per step")
     ema = copy.deepcopy(net).eval()
+    model = nn.DataParallel(net, device_ids=ids) if len(ids) > 1 else net      # (what the training steps run; net holds the weights)
+    if len(ids) > 1:
+        a.batch = max(len(ids), a.batch - a.batch % len(ids))                 # (a whole number of patches per GPU)
+        say(f"{a.batch} patches per step, {a.batch // len(ids)} on each GPU")
     for q in ema.parameters():
         q.requires_grad = False
     opt = torch.optim.Adam(net.parameters(), lr=a.lr, betas=(0.9, 0.99))
@@ -1158,7 +1199,7 @@ def stage_train(a, root, out):
 
     per = max(1, a.crops)
     ds = Pairs(root, train, a.patch, per, a.rotate)
-    workers = a.train_workers
+    workers = a.train_workers * max(1, len(ids))              # (more GPUs eat data faster)
     dl = torch.utils.data.DataLoader(ds, batch_size=max(1, a.batch // per), num_workers=workers,
                                      collate_fn=collate, persistent_workers=workers > 0,
                                      pin_memory=dev.type == "cuda", prefetch_factor=4 if workers > 0 else None)
@@ -1187,7 +1228,7 @@ def stage_train(a, root, out):
             for g in opt.param_groups:
                 g["lr"] = lr_now
             with torch.autocast(dev.type, torch.float16, enabled=dev.type == "cuda"):
-                pred = net(lr_img)
+                pred = model(lr_img)
                 loss = F.l1_loss(pred, hr_img)
                 logs = {"l1": loss.item()}
                 if vgg:
@@ -1454,6 +1495,22 @@ def stage_export(a, run_dir, work):
     return True
 
 
+def pick_gpus(spec):
+    """CUDA device numbers to train on: 'all' (default) or a list like '0,1'. [] without CUDA."""
+    n = torch.cuda.device_count()
+    if n == 0:
+        return []
+    if str(spec).strip().lower() == "all":
+        return list(range(n))
+    try:
+        ids = [int(x) for x in str(spec).split(",") if x.strip() != ""]
+    except ValueError:
+        raise SystemExit(f"--gpus: 'all' or a list of numbers like 0,1 (got {spec!r})")
+    if not ids or len(set(ids)) != len(ids) or any(i < 0 or i >= n for i in ids):
+        raise SystemExit(f"--gpus {spec}: this PC has {n} CUDA GPU(s), numbered 0..{n - 1} (as nvidia-smi lists them), each used once")
+    return ids
+
+
 def batch_arg(v):
     return v if v == "auto" else int(v)
 
@@ -1510,6 +1567,9 @@ def main():
     g.add_argument("--gpu-memory", type=float, default=1.0, metavar="FRACTION",
                    help="--batch auto grows the batch until it no longer fits, up to this share of the graphics card's memory "
                         "(default 1.0: everything that fits; lower it to leave room for other programs)")
+    g.add_argument("--gpus", default="all", metavar="LIST",
+                   help="NVIDIA GPUs to train on: 'all' (default) or numbers like 0,1 (as nvidia-smi lists them). "
+                        "With 2 or more, each step is split across them (needs matching cards; the slowest sets the pace)")
     g.add_argument("--no-channels-last", action="store_true", help="turn off the GPU-friendly memory layout (on by default with CUDA)")
     g.add_argument("--save-every", type=int, default=1000)
     g.add_argument("--val-crop", type=int, default=384, help="held-out frames are judged on this centre square (DVD px)")
