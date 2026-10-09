@@ -742,6 +742,8 @@ def compact_model(a):
     return any(m in a.model for m in ("animevideov3", "general"))
 
 
+TRAINED_MODEL = "upscale-training-x2"   # the model training/upscale_training.py makes (--trained)
+
 AUTO_THREADS = [8]      # frames on the GPU at once without --gpu-threads (lowered, see Chunk)
 MIN_THREADS = 2         # ...down to this (2: the upscaler's own default, the least memory)
 
@@ -3825,6 +3827,9 @@ def build_parser():
                         "(default 8:8:2:12)")
     p.add_argument("--model", default=None, help="override model name")
     p.add_argument("--scale", type=int, default=None, help="override model scale")
+    p.add_argument("--trained", action="store_true",
+                   help=f"use the model made by training/upscale_training.py ({TRAINED_MODEL}, scale 2): "
+                        "short for --model " + TRAINED_MODEL + " --scale 2")
     p.add_argument("--height", type=int, default=1080)
     p.add_argument("--dar", default=None, help="force aspect, e.g. 16:9 or 4:3")
     p.add_argument("--fps", default=None, help="override output fps, e.g. 24000/1001")
@@ -4003,6 +4008,9 @@ def main():
     if find("ffmpeg"):
         check_ffmpeg()
     resolve_type(a, find)
+    if a.trained:
+        a.model = a.model or TRAINED_MODEL
+        a.scale = a.scale or 2
     # model, scale, chunk frames, pre-denoise (hqdn3d), ai blend, post smoothing, sharpen
     presets = {"anime": ("realesr-animevideov3", 2, 1440, "2:1.5:3:2.5", 1.0, 0, 0.6),
                # x2plus: on small DVD faces x4plus draws eyes as black outlined almonds and
