@@ -38,10 +38,11 @@ IOS_TOOL = "pymobiledevice3"
 ANDROID_TOOL = "adb"
 
 
-def _run(cmd: list[str], timeout: int = 600) -> subprocess.CompletedProcess:
+def _run(cmd: list[str], timeout: int = 600, cwd: str | None = None
+         ) -> subprocess.CompletedProcess:
     """Run a command, capturing output; never raise on non-zero exit."""
     return subprocess.run(
-        cmd, capture_output=True, text=True, timeout=timeout, check=False
+        cmd, capture_output=True, text=True, timeout=timeout, check=False, cwd=cwd
     )
 
 
@@ -953,6 +954,128 @@ def android_photos(out: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Cameras (PTP/MTP via gphoto2) - a different protocol from phones.
+# ---------------------------------------------------------------------------
+CAMERA_TOOL = "gphoto2"
+_CAMERA_INSTALL = "install gphoto2 (Linux: apt install gphoto2; macOS: brew install gphoto2)"
+
+
+def camera_info() -> int:
+    """Detect a connected camera and print its model/summary via gphoto2."""
+    if not tool_available(CAMERA_TOOL):
+        print(f"ERROR: {CAMERA_TOOL} not installed - {_CAMERA_INSTALL}.")
+        return 2
+    detect = _run([CAMERA_TOOL, "--auto-detect"], timeout=60)
+    sys.stdout.write(detect.stdout)
+    lines = [l for l in detect.stdout.splitlines()[2:] if l.strip()]
+    if not lines:
+        print("No camera detected. Connect it, power on, and set USB mode to")
+        print("PTP / 'PC connection' (not 'charge only' or 'mass storage').")
+        return 1
+    summary = _run([CAMERA_TOOL, "--summary"], timeout=60)
+    print("\nCamera summary")
+    print("-" * 14)
+    sys.stdout.write(summary.stdout)
+    if summary.returncode != 0:
+        sys.stderr.write(summary.stderr)
+    return 0
+
+
+def camera_photos(out: Path) -> int:
+    """Download all photos from the camera into `out` via gphoto2."""
+    if not tool_available(CAMERA_TOOL):
+        print(f"ERROR: {CAMERA_TOOL} not installed - {_CAMERA_INSTALL}.")
+        return 2
+    out.mkdir(parents=True, exist_ok=True)
+    print(f"Downloading all camera files -> {out}")
+    # Run inside the destination so gphoto2 writes there.
+    res = _run([CAMERA_TOOL, "--get-all-files", "--skip-existing"],
+               timeout=7200, cwd=str(out))
+    sys.stdout.write(res.stdout)
+    if res.returncode != 0:
+        sys.stderr.write(res.stderr)
+        print("\n  If it failed: set the camera's USB mode to PTP and ensure no")
+        print("  other program (Photos, gvfs) has grabbed the device.")
+    return res.returncode
+
+
+# ---------------------------------------------------------------------------
+# Cars (OBD-II via an ELM327 adapter + python-OBD) - reads trouble codes.
+# ---------------------------------------------------------------------------
+# A small map of common generic trouble codes to plain-language fixes.
+DTC_FIXES = {
+    "P0300": ("Random/multiple cylinder misfire",
+              "Check spark plugs, coils, and fuel delivery; clear and recheck."),
+    "P0171": ("System too lean (bank 1)",
+              "Look for vacuum/intake leaks, a dirty MAF sensor, or weak fuel pump."),
+    "P0420": ("Catalyst efficiency below threshold (bank 1)",
+              "Often a failing catalytic converter or an O2 sensor; verify sensor first."),
+    "P0455": ("Large EVAP system leak",
+              "Check the gas cap first (reseat/replace), then EVAP hoses."),
+    "P0128": ("Coolant thermostat below regulating temperature",
+              "Usually a stuck-open thermostat; replace it."),
+    "P0442": ("Small EVAP system leak",
+              "Reseat/replace the gas cap; inspect EVAP lines for small cracks."),
+}
+
+
+def _decode_dtc_prefix(code: str) -> str:
+    systems = {"P": "Powertrain", "C": "Chassis", "B": "Body", "U": "Network"}
+    if not code:
+        return ""
+    return systems.get(code[0].upper(), "Unknown system")
+
+
+def car_diagnose(port: str | None) -> int:
+    """Read stored diagnostic trouble codes over OBD-II and suggest fixes."""
+    try:
+        import obd  # python-OBD; talks to an ELM327 adapter
+    except ImportError:
+        print("ERROR: python-OBD not installed (pip install obd).")
+        print("You also need an ELM327 OBD-II adapter plugged into the car's")
+        print("OBD-II port (usually under the dashboard) and the ignition on.")
+        return 2
+
+    print("Car OBD-II diagnostics")
+    print("-" * 22)
+    connection = obd.OBD(port) if port else obd.OBD()
+    if not connection.is_connected():
+        print("Could not connect to the vehicle. Check that:")
+        print("  - the ELM327 adapter is seated in the OBD-II port,")
+        print("  - the ignition is ON (engine running for live data),")
+        print("  - the right serial port is given via --port (e.g. /dev/ttyUSB0,")
+        print("    COM3, or a Bluetooth rfcomm device).")
+        return 1
+
+    vin = connection.query(obd.commands.VIN)
+    if vin.value:
+        print(f"  VIN            : {vin.value}")
+
+    resp = connection.query(obd.commands.GET_DTC)
+    codes = resp.value or []
+    if not codes:
+        print("  Trouble codes  : none stored. No stored faults reported.")
+    else:
+        print(f"  Trouble codes  : {len(codes)} stored")
+        for code, desc in codes:
+            system = _decode_dtc_prefix(code)
+            print(f"\n  {code}  [{system}]")
+            if desc:
+                print(f"      Meaning: {desc}")
+            if code in DTC_FIXES:
+                meaning, fix = DTC_FIXES[code]
+                print(f"      ({meaning})")
+                print(f"      Fix: {fix}")
+            else:
+                print("      Fix: look up this exact code for your make/model; a")
+                print("           scan-tool live-data check pinpoints the part.")
+    connection.close()
+    print("\n  Note: codes point to a symptom, not always the root cause. A shop")
+    print("  scan tool with live data is authoritative before replacing parts.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Auto: detect connected devices and run every read-only check on each
 # ---------------------------------------------------------------------------
 def _ios_device_present() -> bool:
@@ -1050,6 +1173,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="target an Android device (phone, TV, box, head-unit)")
     p.add_argument("--computer", action="store_true",
                    help="target THIS laptop/desktop (reads its own OS)")
+    p.add_argument("--camera", action="store_true",
+                   help="target a camera over PTP/MTP (needs gphoto2)")
+    p.add_argument("--car", action="store_true",
+                   help="target a car over OBD-II (needs python-OBD + ELM327)")
+    p.add_argument("--port", metavar="DEV",
+                   help="serial port for --car (e.g. /dev/ttyUSB0, COM3)")
     p.add_argument("--net", metavar="HOST[:PORT]",
                    help="connect adb over the network first (Android TV / Fire TV "
                         "/ boxes); e.g. --net 192.168.1.50:5555")
@@ -1101,6 +1230,16 @@ def main(argv: list[str] | None = None) -> int:
             return computer_diagnose()
         return computer_specs()  # default to specs
 
+    # Camera over PTP/MTP (gphoto2).
+    if args.camera:
+        if args.photos:
+            return camera_photos(args.out)
+        return camera_info()  # default: detect + summary
+
+    # Car over OBD-II (python-OBD + ELM327 adapter).
+    if args.car:
+        return car_diagnose(args.port)  # diagnostics is the only action
+
     # Network adb for Android TVs / boxes / head-units.
     if args.net:
         if not tool_available(ANDROID_TOOL):
@@ -1115,12 +1254,13 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         args.android = True  # treat it as an Android target from here on
 
-    if args.check or not (args.ios or args.android or args.computer):
+    any_target = args.ios or args.android or args.computer or args.camera or args.car
+    if args.check or not any_target:
         check_environment()
-        if not (args.ios or args.android or args.computer):
-            print("\nNothing to do. Pick a target (--ios / --android / --computer)"
-                  " and an action (--info/--hardware/--specs/--authenticity/"
-                  "--diagnose/--photos), or use --apple-model / --net.")
+        if not any_target:
+            print("\nNothing to do. Pick a target (--ios / --android / --computer"
+                  " / --camera / --car) and an action (--info/--hardware/--specs/"
+                  "--authenticity/--diagnose/--photos), or --auto / --apple-model.")
         return 0
 
     if args.ios and args.info:
