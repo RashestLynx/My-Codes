@@ -23,6 +23,17 @@ python upscale_training.py --dvd "movie_dvd.mkv" --bluray "movie_bd.mkv"
 
 Then: `python dvd_upscale.py <movie> --trained` (it picks `ai-<kind>-x2` for the kind it detects).
 
+## A 4K Blu-ray (x4 model)
+With a 4K Blu-ray (2160p) instead of a regular one, the same command trains an **x4** model,
+`ai-<kind>-x4` (the size is taken from the disc; `--scale 2` or `--scale 4` sets it). It starts from
+`RealESRGAN_x4plus.pth` (https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth),
+put next to `upscale_training.py` like x2plus. 4K discs are almost always HDR: their frames are turned into
+normal colour (tone mapping with ffmpeg's zscale) before they are compared with the DVD, and the DVD's own
+colours are matched after that. The pairs take about 2.5x the disk space of 1080p pairs. Then upscale to 4K:
+`python dvd_upscale.py <movie> --trained --scale 4 --height 2160` (with `--height 2160` the x4 model is
+picked by itself). With `--all` / `--queue`, movies with a 4K disc get their own model per kind, next to
+the x2 one. `--mix` works on x4 models too (mixed with x4plus).
+
 ## Several movies, one model per kind
 `python upscale_training.py --all "D:\Movies"` finds every `Name_dvd.mkv` + `Name_bd.mkv` pair in that folder
 and its `anime` / `live` / `cgi` / `vhs` folders, makes the pairs of each, then trains one model per kind on

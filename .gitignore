@@ -17,3 +17,5 @@ ncnn_opts.json
 d1_secrets*.txt
 *.key
 *.dkey
+# model weights (RealESRGAN_x2plus/x4plus.pth next to upscale_training.py, trained models): too big for git
+*.pth
