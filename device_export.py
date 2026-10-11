@@ -24,6 +24,9 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import contextlib
+import datetime as _dt
+import io
 import os
 import platform
 import shutil
@@ -950,10 +953,96 @@ def android_photos(out: Path) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Auto: detect connected devices and run every read-only check on each
+# ---------------------------------------------------------------------------
+def _ios_device_present() -> bool:
+    if not tool_available(IOS_TOOL):
+        return False
+    res = _run([IOS_TOOL, "usbmux", "list"], timeout=30)
+    out = res.stdout.strip()
+    return res.returncode == 0 and out not in ("", "[]")
+
+
+def _android_targets() -> list[str]:
+    if not tool_available(ANDROID_TOOL):
+        return []
+    res = _run([ANDROID_TOOL, "devices"], timeout=30)
+    targets = []
+    for line in res.stdout.splitlines()[1:]:
+        line = line.strip()
+        if line.endswith("\tdevice") or line.endswith(" device"):
+            targets.append(line.split()[0])
+    return targets
+
+
+def auto_report(save: str | None = None) -> int:
+    """Detect every reachable target and run all read-only checks on each."""
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print("=" * 60)
+        print("AUTOMATIC DEVICE REPORT")
+        print(f"Generated: {_dt.datetime.now().isoformat(timespec='seconds')}")
+        print("Read-only checks. Phones must be unlocked + trusted to read.")
+        print("=" * 60)
+
+        # This computer is always available.
+        print("\n########## THIS COMPUTER ##########")
+        computer_specs()
+        print()
+        computer_diagnose()
+
+        # iPhone.
+        print("\n########## iPHONE (Apple) ##########")
+        if not tool_available(IOS_TOOL):
+            print("  pymobiledevice3 not installed - skipping iPhone checks.")
+        elif not _ios_device_present():
+            print("  No iPhone detected (plug in, unlock, tap 'Trust').")
+        else:
+            for fn in (ios_hardware, ios_specs, ios_info, ios_authenticity,
+                       ios_diagnose):
+                print()
+                fn()
+
+        # Android (phones, TVs, boxes).
+        print("\n########## ANDROID ##########")
+        if not tool_available(ANDROID_TOOL):
+            print("  adb not installed - skipping Android checks.")
+        else:
+            targets = _android_targets()
+            if not targets:
+                print("  No authorized Android device (unlock + allow USB/ADB).")
+            else:
+                print(f"  Detected: {', '.join(targets)}")
+                for fn in (android_hardware, android_specs, android_info,
+                           android_authenticity, android_diagnose):
+                    print()
+                    fn()
+
+        print("\n" + "=" * 60)
+        print("END OF REPORT")
+        print("=" * 60)
+
+    text = buf.getvalue()
+    sys.stdout.write(text)
+    if save:
+        try:
+            with open(save, "w", encoding="utf-8") as fh:
+                fh.write(text)
+            print(f"\n(Report saved to {save})")
+        except OSError as exc:
+            print(f"\nCould not save report: {exc}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    p.add_argument("--auto", action="store_true",
+                   help="detect all connected devices and run every check")
+    p.add_argument("--save", metavar="FILE",
+                   help="also write the --auto report to this file")
     p.add_argument("--check", action="store_true",
                    help="report installed backends and visible devices")
     p.add_argument("--ios", action="store_true", help="target an iPhone")
@@ -985,6 +1074,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out", type=Path, default=Path("./export"),
                    help="destination folder (default: ./export)")
     args = p.parse_args(argv)
+
+    # Auto: detect everything and run all checks.
+    if args.auto:
+        return auto_report(save=args.save)
 
     # Offline lookup needs no device and no backend tools.
     if args.apple_model:
