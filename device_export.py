@@ -317,6 +317,126 @@ def android_hardware() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Full specs
+# ---------------------------------------------------------------------------
+def ios_specs() -> int:
+    """Dump a broad set of iPhone specs from lockdown info."""
+    if not tool_available(IOS_TOOL):
+        print(f"ERROR: {IOS_TOOL} not installed (pip install pymobiledevice3).")
+        return 2
+    res = _run([IOS_TOOL, "lockdown", "info"], timeout=60)
+    if res.returncode != 0:
+        sys.stderr.write(res.stderr)
+        print("Could not read device. Unlock the iPhone and tap 'Trust', then retry.")
+        return res.returncode
+    text = res.stdout
+    product_type = _grep_value(text, "ProductType")
+    named = apple_model_lookup(product_type)
+
+    print("iPhone specifications")
+    print("-" * 21)
+    if named:
+        print(f"  Model              : {named[0]}")
+        print(f"  Chip (SoC)         : {named[1]}")
+    fields = [
+        ("ProductType", "Product type"),
+        ("ModelNumber", "Model number"),
+        ("RegionInfo", "Region"),
+        ("ProductVersion", "iOS version"),
+        ("BuildVersion", "Build"),
+        ("DeviceClass", "Device class"),
+        ("CPUArchitecture", "CPU architecture"),
+        ("HardwareModel", "Hardware model"),
+        ("DeviceColor", "Color"),
+        ("TotalDiskCapacity", "Total storage (bytes)"),
+        ("SerialNumber", "Serial number"),
+        ("InternationalMobileEquipmentIdentity", "IMEI"),
+        ("WiFiAddress", "Wi-Fi MAC"),
+        ("BluetoothAddress", "Bluetooth MAC"),
+    ]
+    for key, label in fields:
+        value = _grep_value(text, key)
+        if value:
+            print(f"  {label:<18} : {value}")
+    return 0
+
+
+def android_specs() -> int:
+    """Dump a broad set of Android specs via adb getprop and shell utilities."""
+    if not tool_available(ANDROID_TOOL):
+        print(f"ERROR: {ANDROID_TOOL} not installed (Android platform-tools).")
+        return 2
+
+    def prop(name: str) -> str:
+        r = _run([ANDROID_TOOL, "shell", "getprop", name], timeout=30)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    def shell(args: list[str]) -> str:
+        r = _run([ANDROID_TOOL, "shell", *args], timeout=30)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    manufacturer = prop("ro.product.manufacturer")
+    model = prop("ro.product.model")
+    if not (manufacturer or model):
+        print("No data - unlock the phone and authorize this computer, then retry.")
+        return 1
+
+    soc = f"{prop('ro.soc.manufacturer')} {prop('ro.soc.model')}".strip()
+    platform = prop("ro.board.platform")
+    if not soc:
+        soc = QCOM_PLATFORMS.get(platform, platform)
+
+    # Memory and storage.
+    mem_total = ""
+    meminfo = shell(["cat", "/proc/meminfo"])
+    for line in meminfo.splitlines():
+        if line.startswith("MemTotal"):
+            try:
+                kb = int(line.split()[1])
+                mem_total = f"{kb / 1024 / 1024:.1f} GB"
+            except (IndexError, ValueError):
+                pass
+            break
+    storage = ""
+    df = shell(["df", "-h", "/data"])
+    for line in df.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2:
+            storage = f"{parts[1]} total (/data partition)"
+            break
+
+    screen = shell(["wm", "size"]).replace("Physical size:", "").strip()
+    density = shell(["wm", "density"]).replace("Physical density:", "").strip()
+    cores = ""
+    cpuinfo = shell(["cat", "/proc/cpuinfo"])
+    if cpuinfo:
+        cores = str(cpuinfo.count("processor"))
+
+    specs = [
+        ("Device", f"{manufacturer} {model}".strip()),
+        ("Chip (SoC)", soc),
+        ("Platform code", platform),
+        ("Android version", prop("ro.build.version.release")),
+        ("API level (SDK)", prop("ro.build.version.sdk")),
+        ("Build ID", prop("ro.build.display.id")),
+        ("Security patch", prop("ro.build.version.security_patch")),
+        ("CPU ABI", prop("ro.product.cpu.abi")),
+        ("CPU cores", cores),
+        ("RAM", mem_total),
+        ("Storage", storage),
+        ("Screen", screen),
+        ("Density (dpi)", density),
+        ("Serial", prop("ro.serialno")),
+    ]
+    print("Android specifications")
+    print("-" * 22)
+    for label, value in specs:
+        if value:
+            print(f"  {label:<16} : {value}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # iPhone export
 # ---------------------------------------------------------------------------
 def ios_photos(out: Path) -> int:
@@ -391,6 +511,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="read serial / IMEI from the unlocked, trusted device")
     p.add_argument("--hardware", action="store_true",
                    help="report model + chipset (SoC) from the connected device")
+    p.add_argument("--specs", action="store_true",
+                   help="dump full specs (OS, RAM, storage, screen, SoC, ...)")
     p.add_argument("--apple-model", dest="apple_model", metavar="PRODUCTTYPE",
                    help="offline: map an Apple product type (e.g. iPhone12,1) to "
                         "its model name and chip - no device needed")
@@ -426,6 +548,10 @@ def main(argv: list[str] | None = None) -> int:
         return ios_hardware()
     if args.android and args.hardware:
         return android_hardware()
+    if args.ios and args.specs:
+        return ios_specs()
+    if args.android and args.specs:
+        return android_specs()
     if args.ios and args.backup:
         return ios_backup(args.out)
     if args.ios and args.photos:
@@ -437,7 +563,8 @@ def main(argv: list[str] | None = None) -> int:
         print("use Samsung Smart Switch on the desktop for a complete backup.")
         return 2
 
-    p.error("choose an action: --info, --hardware, --photos (or --backup for iOS)")
+    p.error("choose an action: --info, --hardware, --specs, --photos "
+            "(or --backup for iOS)")
     return 2
 
 
