@@ -30,14 +30,19 @@ The user's changes:
 
 - `python3 e2e.py ../dvd_upscale.py TAG [case...]` runs 14 cases: frame order, sync and chunk
   seams for NTSC/PAL film, VHS and AVI, plus the AI path with a fake upscaler and two GPUs.
-  - Expected: every case has `breaks 0`, except `ntsc_film_bff`, which has one repeated first
-    frame (it was there before these changes).
+  - Expected: every case has `breaks 0` (`ntsc_film_bff` had one repeated first frame until
+    `repeatfields` was left out for discs with no soft pulldown).
   - VHS AVI captures are offset by -33 ms (mpeg4) and -67 ms (h264): this is the B-frame delay,
     and it is the same as before.
   - Run it on ffmpeg 6.1 and on master: `PATH=dl/ffmpeg-master-latest-linux64-gpl/bin:$PATH`.
 - `simgpu/run.sh` and `simgpu/runR.sh`: `--gpu-jobs` 1 vs 2 on a simulated GPU, plus the retire
   case.
 - `failesrgan/`: an upscaler that fails once on the chunks in `FAIL_CHUNKS` (retry path).
+- `resetesrgan/`: an upscaler whose GPU is reset ("vkQueueSubmit failed -4", black frames,
+  exit code 0, as on a Windows laptop) on frames wider than 300 pixels, unless the tile size is
+  at most `RESET_TILE_MAX` and the frames at once at most `RESET_THREADS_MAX`. `RESET_LOG` gets
+  each call's `-j`/`-t`. It tests the step-down after a GPU reset (`GPU_STEPS`) and its
+  carry-over to the next movie of a `--queue`.
 - `stabrun.py NAME ZOOM [args]` with `stabtest.py`: the jitter left after `--stabilize`, seams,
   sync.
 - `filtertest.py`: filter-graph checks.
