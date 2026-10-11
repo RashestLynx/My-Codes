@@ -475,6 +475,198 @@ def android_authenticity() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Diagnostics: readable faults (battery / storage / thermal / crashes) + fixes
+# ---------------------------------------------------------------------------
+# Suggested fixes keyed by detected condition. These are general guidance.
+FIXES = {
+    "battery_worn": [
+        "Battery is worn (high cycle count / reduced health).",
+        "Fix: schedule a battery replacement (Apple/Samsung service or an",
+        "     authorized shop). Meanwhile, enable battery-saver and avoid heat.",
+    ],
+    "battery_unhealthy": [
+        "Battery health reports a fault (not 'good').",
+        "Fix: stop charging if it reads OVERHEAT/OVER_VOLTAGE; have the battery",
+        "     checked/replaced by a technician before further use.",
+    ],
+    "overheating": [
+        "Device temperature is high.",
+        "Fix: remove the case, stop charging, close heavy apps, let it cool.",
+        "     Persistent heat with light use suggests a battery/board fault.",
+    ],
+    "storage_full": [
+        "Storage is nearly full - this causes crashes, slowness, update fails.",
+        "Fix: delete large videos/apps, clear caches, offload photos to cloud,",
+        "     then reboot. Aim to keep >10% free.",
+    ],
+    "low_memory": [
+        "Very little free RAM - apps may be getting killed.",
+        "Fix: reboot, close background apps, remove memory-heavy apps.",
+    ],
+    "app_crashes": [
+        "Recent app/system crashes were found in the crash log.",
+        "Fix: update or reinstall the crashing app(s); if system processes",
+        "     crash, install pending OS updates or back up and factory reset.",
+    ],
+    "hardware_note": [
+        "Software cannot see physical faults (screen, cameras, speakers, mic,",
+        "buttons, water damage). For those, run the maker's built-in hardware",
+        "test and/or visit authorized service:",
+        "  Samsung: dial *#0*# for the hardware test menu (screen, sensors...).",
+        "  iPhone: Apple Support app / Genius Bar diagnostics.",
+    ],
+}
+
+
+def _emit_fix(key: str) -> None:
+    for line in FIXES[key]:
+        print(f"      {line}")
+
+
+def android_diagnose() -> int:
+    """Read battery, thermal, storage, memory and recent crashes; suggest fixes."""
+    if not tool_available(ANDROID_TOOL):
+        print(f"ERROR: {ANDROID_TOOL} not installed (Android platform-tools).")
+        return 2
+
+    def shell(args: list[str]) -> str:
+        r = _run([ANDROID_TOOL, "shell", *args], timeout=30)
+        return r.stdout if r.returncode == 0 else ""
+
+    print("Android diagnostics")
+    print("-" * 19)
+    found = False
+
+    # Battery health + temperature.
+    batt = shell(["dumpsys", "battery"])
+    health_map = {
+        "1": "unknown", "2": "good", "3": "overheat", "4": "dead",
+        "5": "over-voltage", "6": "unspecified failure", "7": "cold",
+    }
+    health_val = temp_c = level = None
+    for line in batt.splitlines():
+        s = line.strip()
+        if s.startswith("health:"):
+            health_val = s.split(":", 1)[1].strip()
+        elif s.startswith("temperature:"):
+            try:
+                temp_c = int(s.split(":", 1)[1]) / 10.0
+            except ValueError:
+                pass
+        elif s.startswith("level:"):
+            level = s.split(":", 1)[1].strip()
+    if health_val:
+        name = health_map.get(health_val, health_val)
+        print(f"  Battery health : {name}  (level {level}%, "
+              f"{temp_c if temp_c is not None else '?'} C)")
+        if name not in ("good", "unknown"):
+            found = True
+            _emit_fix("battery_unhealthy")
+        if temp_c is not None and temp_c >= 43:
+            found = True
+            _emit_fix("overheating")
+
+    # Storage.
+    df = shell(["df", "-h", "/data"])
+    for line in df.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 5 and parts[4].endswith("%"):
+            try:
+                used = int(parts[4].rstrip("%"))
+            except ValueError:
+                continue
+            print(f"  Storage used   : {used}% of /data")
+            if used >= 90:
+                found = True
+                _emit_fix("storage_full")
+            break
+
+    # Memory.
+    mem = shell(["cat", "/proc/meminfo"])
+    total = avail = None
+    for line in mem.splitlines():
+        if line.startswith("MemTotal"):
+            total = int(line.split()[1])
+        elif line.startswith("MemAvailable"):
+            avail = int(line.split()[1])
+    if total and avail:
+        pct = avail / total * 100
+        print(f"  Free RAM       : {avail // 1024} MB ({pct:.0f}%)")
+        if pct < 8:
+            found = True
+            _emit_fix("low_memory")
+
+    # Recent crashes.
+    crash = _run([ANDROID_TOOL, "logcat", "-b", "crash", "-d", "-t", "400"], timeout=30)
+    fatals = [l for l in crash.stdout.splitlines() if "FATAL EXCEPTION" in l]
+    if fatals:
+        print(f"  Crash log      : {len(fatals)} recent fatal crash entr"
+              f"{'y' if len(fatals) == 1 else 'ies'}")
+        found = True
+        _emit_fix("app_crashes")
+    else:
+        print("  Crash log      : no recent fatal crashes")
+
+    if not found:
+        print("\n  No software/battery faults detected in readable data.")
+    print("\n  Physical hardware check:")
+    _emit_fix("hardware_note")
+    return 0
+
+
+def ios_diagnose() -> int:
+    """Read iPhone battery (cycle count) and recent crash reports; suggest fixes."""
+    if not tool_available(IOS_TOOL):
+        print(f"ERROR: {IOS_TOOL} not installed (pip install pymobiledevice3).")
+        return 2
+
+    print("iPhone diagnostics")
+    print("-" * 18)
+    found = False
+
+    batt = _run([IOS_TOOL, "diagnostics", "battery"], timeout=60)
+    if batt.returncode == 0 and batt.stdout.strip():
+        cycles = _grep_value(batt.stdout, "CycleCount")
+        if cycles:
+            print(f"  Battery cycles : {cycles}")
+            try:
+                if int(cycles) >= 800:
+                    found = True
+                    _emit_fix("battery_worn")
+            except ValueError:
+                pass
+        design = _grep_value(batt.stdout, "DesignCapacity")
+        actual = _grep_value(batt.stdout, "AppleRawMaxCapacity") or \
+            _grep_value(batt.stdout, "NominalChargeCapacity")
+        try:
+            if design and actual and int(actual) < 0.8 * int(design):
+                found = True
+                print("  Battery health : below ~80% of design capacity")
+                _emit_fix("battery_worn")
+        except ValueError:
+            pass
+    else:
+        print("  Battery        : unreadable (unlock + trust, then retry)")
+
+    crashes = _run([IOS_TOOL, "crash", "ls"], timeout=60)
+    if crashes.returncode == 0:
+        reports = [l for l in crashes.stdout.splitlines() if l.strip()
+                   and not l.strip().endswith("/")]
+        if reports:
+            print(f"  Crash reports  : {len(reports)} on device")
+            found = True
+            _emit_fix("app_crashes")
+        else:
+            print("  Crash reports  : none found")
+
+    if not found:
+        print("\n  No software/battery faults detected in readable data.")
+    print("\n  Physical hardware check:")
+    _emit_fix("hardware_note")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Full specs
 # ---------------------------------------------------------------------------
 def ios_specs() -> int:
@@ -680,6 +872,8 @@ def main(argv: list[str] | None = None) -> int:
                         "serial - no device needed")
     p.add_argument("--authenticity", action="store_true",
                    help="run counterfeit/authenticity heuristics on the device")
+    p.add_argument("--diagnose", action="store_true",
+                   help="check battery/storage/thermal/crashes and suggest fixes")
     p.add_argument("--photos", action="store_true", help="pull the camera roll (DCIM)")
     p.add_argument("--backup", action="store_true", help="full iPhone backup (iOS only)")
     p.add_argument("--out", type=Path, default=Path("./export"),
@@ -725,6 +919,10 @@ def main(argv: list[str] | None = None) -> int:
         return ios_authenticity()
     if args.android and args.authenticity:
         return android_authenticity()
+    if args.ios and args.diagnose:
+        return ios_diagnose()
+    if args.android and args.diagnose:
+        return android_diagnose()
     if args.ios and args.backup:
         return ios_backup(args.out)
     if args.ios and args.photos:
@@ -737,7 +935,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     p.error("choose an action: --info, --hardware, --specs, --authenticity, "
-            "--photos (or --backup for iOS)")
+            "--diagnose, --photos (or --backup for iOS)")
     return 2
 
 
