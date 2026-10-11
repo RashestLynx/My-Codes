@@ -24,6 +24,8 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -475,6 +477,104 @@ def android_authenticity() -> int:
 
 
 # ---------------------------------------------------------------------------
+# This computer (laptop/desktop) - reads the machine the script runs on.
+# No phone protocol needed; the OS reports its own specs and health.
+# ---------------------------------------------------------------------------
+def _linux_cpu_model() -> str:
+    try:
+        with open("/proc/cpuinfo", encoding="utf-8") as fh:
+            for line in fh:
+                if line.lower().startswith("model name"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return platform.processor() or "unknown"
+
+
+def _total_ram_bytes() -> int | None:
+    # Works on Linux and macOS via sysconf; None elsewhere.
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    except (ValueError, AttributeError, OSError):
+        return None
+
+
+def computer_specs() -> int:
+    uname = platform.uname()
+    print("Computer specifications")
+    print("-" * 23)
+    print(f"  Hostname       : {uname.node}")
+    print(f"  OS             : {uname.system} {uname.release}")
+    print(f"  OS version     : {uname.version}")
+    print(f"  Architecture   : {uname.machine}")
+    print(f"  Processor      : {_linux_cpu_model()}")
+    print(f"  CPU cores      : {os.cpu_count()}")
+    ram = _total_ram_bytes()
+    if ram:
+        print(f"  RAM            : {ram / 1024**3:.1f} GB")
+    try:
+        du = shutil.disk_usage("/")
+        print(f"  Disk (/)       : {du.total / 1024**3:.0f} GB total, "
+              f"{du.free / 1024**3:.0f} GB free")
+    except OSError:
+        pass
+    print(f"  Python         : {platform.python_version()}")
+    return 0
+
+
+def computer_diagnose() -> int:
+    print("Computer diagnostics")
+    print("-" * 20)
+    found = False
+
+    # Disk space.
+    try:
+        du = shutil.disk_usage("/")
+        used_pct = du.used / du.total * 100
+        print(f"  Disk used      : {used_pct:.0f}% of / "
+              f"({du.free / 1024**3:.0f} GB free)")
+        if used_pct >= 90:
+            found = True
+            _emit_fix("storage_full")
+    except OSError:
+        pass
+
+    # CPU load (Unix).
+    try:
+        load1, _, _ = os.getloadavg()
+        cores = os.cpu_count() or 1
+        print(f"  Load (1 min)   : {load1:.2f} over {cores} cores")
+        if load1 > cores * 2:
+            found = True
+            print("      High sustained CPU load.")
+            print("      Fix: find heavy processes (Task Manager / Activity")
+            print("           Monitor / top), close or update them; reboot.")
+    except (OSError, AttributeError):
+        pass
+
+    # Battery (Linux sysfs; other OSes need vendor tools).
+    bat = Path("/sys/class/power_supply/BAT0")
+    if bat.exists():
+        try:
+            cap = (bat / "capacity").read_text().strip()
+            status = (bat / "status").read_text().strip()
+            print(f"  Battery        : {cap}% ({status})")
+        except OSError:
+            pass
+    else:
+        print("  Battery        : not readable via stdlib on this OS")
+        print("      (Windows: 'powercfg /batteryreport'; macOS: System")
+        print("       Information -> Power; for health use the vendor tool.)")
+
+    if not found:
+        print("\n  No disk/load faults detected in readable data.")
+    print("\n  Physical/vendor diagnostics:")
+    print("      Windows: 'dxdiag', vendor support assistant (Dell/HP/Lenovo).")
+    print("      macOS  : Apple Diagnostics (hold D / power on startup).")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Diagnostics: readable faults (battery / storage / thermal / crashes) + fixes
 # ---------------------------------------------------------------------------
 # Suggested fixes keyed by detected condition. These are general guidance.
@@ -857,7 +957,13 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--check", action="store_true",
                    help="report installed backends and visible devices")
     p.add_argument("--ios", action="store_true", help="target an iPhone")
-    p.add_argument("--android", action="store_true", help="target an Android phone")
+    p.add_argument("--android", action="store_true",
+                   help="target an Android device (phone, TV, box, head-unit)")
+    p.add_argument("--computer", action="store_true",
+                   help="target THIS laptop/desktop (reads its own OS)")
+    p.add_argument("--net", metavar="HOST[:PORT]",
+                   help="connect adb over the network first (Android TV / Fire TV "
+                        "/ boxes); e.g. --net 192.168.1.50:5555")
     p.add_argument("--info", action="store_true",
                    help="read serial / IMEI from the unlocked, trusted device")
     p.add_argument("--hardware", action="store_true",
@@ -896,11 +1002,32 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  Manufacture date: {apple_serial_date(args.apple_serial_date)}")
         return 0
 
-    if args.check or not (args.ios or args.android):
+    # This computer: no device, no protocol - reads the local OS.
+    if args.computer:
+        if args.diagnose:
+            return computer_diagnose()
+        return computer_specs()  # default to specs
+
+    # Network adb for Android TVs / boxes / head-units.
+    if args.net:
+        if not tool_available(ANDROID_TOOL):
+            print(f"ERROR: {ANDROID_TOOL} not installed (needed for --net).")
+            return 2
+        target = args.net if ":" in args.net else f"{args.net}:5555"
+        conn = _run([ANDROID_TOOL, "connect", target], timeout=30)
+        sys.stdout.write(conn.stdout)
+        if "connected" not in conn.stdout.lower():
+            print("Could not connect. On the device, enable Developer options ->")
+            print("'ADB debugging' / 'Network debugging' and confirm the IP:port.")
+            return 1
+        args.android = True  # treat it as an Android target from here on
+
+    if args.check or not (args.ios or args.android or args.computer):
         check_environment()
-        if not (args.ios or args.android):
-            print("\nNothing to do (pass --ios or --android with "
-                  "--info/--hardware/--photos/--backup, or use --apple-model).")
+        if not (args.ios or args.android or args.computer):
+            print("\nNothing to do. Pick a target (--ios / --android / --computer)"
+                  " and an action (--info/--hardware/--specs/--authenticity/"
+                  "--diagnose/--photos), or use --apple-model / --net.")
         return 0
 
     if args.ios and args.info:
