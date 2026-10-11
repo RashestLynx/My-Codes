@@ -108,6 +108,11 @@ pre{margin:0;font:12px/1.35 ui-monospace,Consolas,monospace;white-space:pre-wrap
 .qi{display:flex;gap:8px;padding:6px 0;border-top:1px solid var(--line);font-size:14px;align-items:baseline}
 .qi .st{width:16px;flex:none;text-align:center}.qi .l{overflow-wrap:anywhere}
 .qi .d{color:var(--mut);margin-left:auto;text-align:right;flex:none;max-width:50%}
+.hw{width:100%;border-collapse:collapse;font-size:14px;font-variant-numeric:tabular-nums}
+.hw th{color:var(--mut);font-weight:600;font-size:12px;text-align:right;padding:2px 0 4px 8px}
+.hw td{text-align:right;padding:4px 0 4px 8px;border-top:1px solid var(--line);white-space:nowrap}
+.hw th:first-child,.hw td:first-child{text-align:left;padding-left:0;white-space:normal}
+.hw td.pk{font-weight:600}.hwi{color:var(--mut);font-size:13px;margin-top:8px}
 .qi.running{font-weight:600}.qi.done .st{color:var(--ok)}.qi.failed .st,.qi.failed .d{color:#dc2626}
 </style></head><body><main>
 <h1 id="title">Progress</h1><div class="sub" id="sub">connecting...</div>
@@ -115,7 +120,7 @@ pre{margin:0;font:12px/1.35 ui-monospace,Consolas,monospace;white-space:pre-wrap
 <div class="card"><div class="row"><div class="big" id="pct">-</div><div class="m"><b id="eta">-</b><span>time left</span></div>
 <div class="m"><b id="el">-</b><span>elapsed</span></div><div class="m"><b id="speed">-</b><span id="speedl">speed</span></div></div>
 <div class="bar" style="margin-top:10px"><div id="fill"></div></div></div>
-<div class="card" id="metrics"></div><div id="charts"></div>
+<div class="card" id="metrics"></div><div class="card" id="hw" style="display:none"></div><div id="charts"></div>
 <div class="card"><h2>Latest</h2><pre id="log"></pre></div></main>
 <script>
 const $=id=>document.getElementById(id);
@@ -127,6 +132,10 @@ e.innerHTML='<h2>Queue: '+q.done+' of '+q.total+' done</h2><div class="row"><div
 '<div class="bar" style="margin:8px 0 6px"><div style="width:'+(100*(q.frac||0))+'%"></div></div>'+
 q.items.map(i=>'<div class="qi '+i.state+'"><span class="st">'+(IC[i.state]||'')+'</span><span class="l">'+esc(i.label)+
 '</span><span class="d">'+esc(i.detail)+'</span></div>').join('')}
+function hw(h){const e=$('hw');if(!h||!h.rows||!h.rows.length){e.style.display='none';return}e.style.display='';
+e.innerHTML='<h2>Hardware'+(h.since!=null?' (peak and average over '+fmt(h.since)+')':'')+'</h2><table class="hw"><tr><th></th><th>now</th><th>peak</th><th>average</th></tr>'+
+h.rows.map(r=>'<tr><td>'+esc(r[0])+'</td><td>'+esc(r[1])+'</td><td class="pk">'+esc(r[2])+'</td><td>'+esc(r[3])+'</td></tr>').join('')+'</table>'+
+(h.info||[]).map(r=>'<div class="hwi">'+esc(r[0])+': '+esc(r[1])+'</div>').join('')}
 function fmt(s){if(s==null||!isFinite(s))return '-';s=Math.round(s);const h=Math.floor(s/3600),m=Math.floor(s%3600/60);
 return h?h+' h '+m+' min':m?m+' min':s+' s'}
 function chart(el,name,pts,refs){const c=el.querySelector('canvas'),r=devicePixelRatio||1;c.width=c.clientWidth*r;c.height=c.clientHeight*r;
@@ -145,7 +154,7 @@ $('pct').className='big'+(s.finished?' done':'');$('fill').style.width=(done*100
 $('speed').textContent=s.speed_text||'-';$('el').textContent=fmt(s.elapsed);queue(s.queue);
 $('metrics').innerHTML='<div class="row"><div class="m"><b>'+s.step+(s.total?' / '+s.total:'')+'</b><span>'+(s.unit||'steps')+'</span></div>'+
 Object.entries(s.metrics||{}).map(([k,v])=>'<div class="m"><b>'+v+'</b><span>'+k+'</span></div>').join('')+'</div>';
-const ch=$('charts');Object.entries(s.series||{}).forEach(([k,pts])=>{let el=document.getElementById('c_'+k);
+hw(s.hw);const ch=$('charts');Object.entries(s.series||{}).forEach(([k,pts])=>{let el=document.getElementById('c_'+k);
 if(!el){el=document.createElement('div');el.id='c_'+k;el.className='card';el.innerHTML='<h2>'+k+'</h2><canvas></canvas>';ch.appendChild(el)}
 if(pts.length>1)chart(el,k,pts,(s.refs||{})[k])});
 $('log').textContent=(s.log||[]).join('\\n');}catch(e){$('sub').textContent='cannot reach the PC...'}}
@@ -192,7 +201,7 @@ class Progress:
         """A new stage: clear the numbers and charts (the log stays)."""
         with self.lock:
             self.s.update(title=title, phase="starting", step=0, total=0, eta=None, speed_text="",
-                          metrics={}, series={}, refs={}, finished=False, unit="steps", updated=time.time())
+                          metrics={}, series={}, refs={}, hw=None, finished=False, unit="steps", updated=time.time())
 
     def hold(self, seconds=60):
         """If someone has the page open, keep it up a little after the end so they see 'finished'."""
@@ -534,6 +543,9 @@ def ram_use():
         return None
 
 
+CPU_NAME = cpu_name()
+
+
 # what the peak / average report covers: (key, label, unit, format of one number)
 STAT_KEYS = (("gpu_watts", "GPU power", "W", "{:.0f}"), ("gpu_busy", "GPU busy", "%", "{:.0f}"),
              ("gpu_temp", "GPU temp", "C", "{:.0f}"), ("gpu_clock", "GPU clock", "MHz", "{:.0f}"),
@@ -708,6 +720,39 @@ class HwMonitor:
             if s:
                 out[label] = f"{f.format(s[0])} / {f.format(s[1])} {unit}"
         return out
+
+    def table(self):
+        """For the progress page: rows of [reading, now, peak, average] and a few lines of other info."""
+        g, gb = self.gpu or {}, lambda v: None if v is None else v / 1024
+        now = dict(gpu_watts=g.get("watts"), gpu_busy=g.get("busy"), gpu_temp=g.get("temp"), gpu_clock=g.get("clock"),
+                   gpu_mem=gb(g.get("mem")), gpu_mem_busy=g.get("mem_busy"), gpu_fan=g.get("fan"), cpu=self.cpu,
+                   cpu_core=self.cpu_core, cpu_mhz=self.cpu_mhz, ram=gb(self.ram))
+        keys = list(STAT_KEYS)
+        if len(self.gpus) > 1:
+            for i, r in zip(self.focus, self.gpus):
+                keys += [(f"gpu{i}_watts", f"GPU {i} power", "W", "{:.0f}"), (f"gpu{i}_busy", f"GPU {i} busy", "%", "{:.0f}"),
+                         (f"gpu{i}_temp", f"GPU {i} temp", "C", "{:.0f}")]
+                now.update({f"gpu{i}_watts": r["watts"], f"gpu{i}_busy": r["busy"], f"gpu{i}_temp": r["temp"]})
+        rows = []
+        for key, label, unit, f in keys:
+            s, v = self.stat(key), now.get(key)
+            if s or v is not None:
+                show = lambda x: "-" if x is None else f"{f.format(x)} {unit}"
+                rows.append([label, show(v), show(s and s[0]), show(s and s[1])])
+        info = []
+        if g:
+            info.append(["GPU", g["name"]])
+            if g.get("watts_max"):
+                info.append(["GPU power limit", f"{g['watts_max']:.0f} W"])
+            if g.get("mem_max"):
+                info.append(["GPU memory size", f"{g['mem_max'] / 1024:.1f} GB"])
+            info.append(["GPU slowed by", ", ".join(g["slowed"]) or "nothing"])
+        if self.cpu is not None:
+            info.append(["processor", f"{CPU_NAME}, {os.cpu_count() or '?'} threads"
+                         + (f", up to {self.cpu_mhz_max:.0f} MHz" if self.cpu_mhz_max else "")])
+        if self.ram_max:
+            info.append(["RAM size", f"{self.ram_max / 1024:.1f} GB"])
+        return dict(rows=rows, info=info, since=time.time() - self.stats_since)
 
     def report(self):
         """Lines for the end of a run: peak and average of everything that could be read."""
@@ -1408,7 +1453,7 @@ def build_offsets(a, dvd_pre, bd_pre, ddur):
         if PROG:
             PROG.set(phase="measuring the offset between the discs", step=i, total=n_total,
                      unit="offset measurements", eta=eta, elapsed=el, speed_text=f"{el / i:.1f} s each")
-            PROG.metric(**(HW.metrics() if HW else {}))
+            PROG.set(hw=HW.table() if HW else None)
         if ok:
             anchors.append((t, off)); guess, span = off, 40
         else:
@@ -1686,7 +1731,8 @@ def stage_pairs(a, out):
                 if PROG:
                     PROG.set(step=done, eta=eta, speed_text=f"{new / el * 60:.1f} pairs/min", pairs_per_min=new / el * 60,
                              elapsed=el)
-                    PROG.metric(rejected=sum(rejects.values()), **(HW.metrics() if HW else {}))
+                    PROG.set(hw=HW.table() if HW else None)
+                    PROG.metric(rejected=sum(rejects.values()))
                 if done >= a.count:
                     break
         except KeyboardInterrupt:
@@ -2101,7 +2147,7 @@ def stage_train(a, roots, out):
         if len(set(names_)) > 1:
             say("WARNING: the GPUs are different models: every step waits for the slowest one (use --gpus to pick matching ones)")
     ram = ram_use()
-    say(f"processor: {cpu_name()}, {os.cpu_count() or '?'} threads"
+    say(f"processor: {CPU_NAME}, {os.cpu_count() or '?'} threads"
         + (f", {ram[1] / 1024:.0f} GB RAM" if ram else ""))
     if dev.type == "cpu":
         print("WARNING: no CUDA GPU found, training on the processor (very slow)")
@@ -2305,7 +2351,7 @@ def stage_train(a, roots, out):
                                     HW.line()[:1] + queue_parts(eta) + HW.line()[1:])
                         if prog:
                             prog.set(step=step, eta=eta, speed_text=f"{sps:.2f} s/step", sec_per_step=sps, elapsed=el)
-                            prog.metric(**HW.metrics())
+                            prog.set(hw=HW.table())
                     if step % 100 == 0 and n_run:
                         el = time.time() - t0
                         avg = {k: v.item() / n_run for k, v in run.items()}     # (n_run: fewer than 100 after a resume)
@@ -2322,8 +2368,7 @@ def stage_train(a, roots, out):
                             say(f"   peak / average: " + "  ".join(f"{k} {v}" for k, v in peaks.items()))
                         say(f"   -> {why}")
                         if prog:
-                            prog.metric(**{"data wait": f"{100 * wf:.0f} %", "what limits it": why},
-                                        **{f"{k} peak / avg": v for k, v in peaks.items()})
+                            prog.metric(**{"data wait": f"{100 * wf:.0f} %", "what limits it": why})
                             if HW.gpu and HW.gpu["watts"] is not None:
                                 prog.point("GPU power (W)", step, HW.gpu["watts"])
                             if HW.gpu and HW.gpu["busy"] is not None:
@@ -2398,6 +2443,8 @@ def stage_train(a, roots, out):
     say(f"training finished in {hms(time.time() - run_t0)}")
     for line in HW.report():
         say(line)
+    if prog:
+        prog.set(hw=HW.table())
     return True
 
 
@@ -3057,7 +3104,7 @@ class QueueStatus(Progress):
         s.current = None
         s.child_file.unlink(missing_ok=True)
         s.set(title="Training queue", phase="starting the next one", step=0, total=0, eta=None, speed_text="",
-              elapsed=None, metrics={}, series={}, refs={})
+              elapsed=None, metrics={}, series={}, refs={}, hw=None)
         s.refresh()
 
     def snapshot(s):
