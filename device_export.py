@@ -317,6 +317,164 @@ def android_hardware() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Manufacture-date estimate (legacy Apple serials only)
+# ---------------------------------------------------------------------------
+# Apple's 2010-2020 serials encoded the build date. Serials since ~2021 are
+# randomized, so the date is NOT derivable from them - use checkcoverage.
+_APPLE_YEAR_ALPHABET = "CDFGHJKLMNPQRSTVWXYZ"          # 2 chars per year from 2010
+_APPLE_WEEK_ALPHABET = "123456789CDFGHJKLMNPQRTVWXY"   # 1..27 within a half-year
+
+
+def apple_serial_date(serial: str) -> str:
+    """Estimate manufacture date from a legacy (11/12-char) Apple serial.
+
+    Returns a human string, or a note that the date can't be derived. This is
+    an ESTIMATE and only works for pre-2021 serials; checkcoverage.apple.com
+    is authoritative.
+    """
+    s = serial.strip().upper()
+    if len(s) not in (11, 12):
+        return "not derivable from this serial (new-format/randomized) - " \
+               "use checkcoverage.apple.com"
+    year_c = s[3]
+    week_c = s[4]
+    if year_c not in _APPLE_YEAR_ALPHABET or week_c not in _APPLE_WEEK_ALPHABET:
+        return "not a legacy-format serial - use checkcoverage.apple.com"
+    pos = _APPLE_YEAR_ALPHABET.index(year_c)
+    year = 2010 + pos // 2
+    half = pos % 2  # 0 = first half of year, 1 = second half
+    week = _APPLE_WEEK_ALPHABET.index(week_c) + 1 + (26 if half else 0)
+    week = min(week, 53)
+    return (
+        f"IF this is a pre-2021 device: ~{year}, around week {week}. "
+        "NOTE: serials from ~2021 on are randomized and look identical, so this "
+        "number is meaningless for newer phones - confirm at checkcoverage.apple.com."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Authenticity / counterfeit heuristics (NOT definitive)
+# ---------------------------------------------------------------------------
+_DISCLAIMER = (
+    "These are heuristics, not proof. Confirm at the authoritative source: "
+    "Apple -> checkcoverage.apple.com; Samsung/Android -> the carrier/maker "
+    "IMEI check and the Settings 'About phone' screen."
+)
+
+
+def ios_authenticity() -> int:
+    """Cross-protocol check: a genuine iPhone speaks Apple's lockdown protocol;
+    a fake 'iPhone' that is really Android does not (but answers adb)."""
+    print("iPhone authenticity signals")
+    print("-" * 27)
+    ios_ok = tool_available(IOS_TOOL)
+    speaks_lockdown = False
+    text = ""
+    if ios_ok:
+        res = _run([IOS_TOOL, "lockdown", "info"], timeout=60)
+        speaks_lockdown = res.returncode == 0 and bool(res.stdout.strip())
+        text = res.stdout
+
+    # Does it answer Android's adb instead? Strong red flag for a "fake iPhone".
+    answers_adb = False
+    if tool_available(ANDROID_TOOL):
+        adb = _run([ANDROID_TOOL, "devices"], timeout=30)
+        answers_adb = any(
+            l.strip() and not l.startswith("List")
+            for l in adb.stdout.splitlines()
+        )
+
+    if speaks_lockdown:
+        print("  [ok ] Responds to Apple's lockdown protocol (genuine iOS trait).")
+        device_class = _grep_value(text, "DeviceClass")
+        product = _grep_value(text, "ProductName") or _grep_value(text, "ProductType")
+        serial = _grep_value(text, "SerialNumber")
+        if device_class.lower() == "iphone":
+            print(f"  [ok ] Device class reports as iPhone ({product}).")
+        if serial:
+            print(f"  [ i ] Serial {serial} - verify it at checkcoverage.apple.com.")
+            print(f"        Manufacture date estimate: {apple_serial_date(serial)}")
+    elif answers_adb:
+        print("  [!! ] Does NOT speak Apple's protocol but DOES answer Android adb.")
+        print("        A real iPhone never does this -> very likely a FAKE iPhone")
+        print("        (an Android phone dressed up to look like iOS).")
+    else:
+        print("  [ ? ] No response. Ensure it's unlocked + trusted, or pymobiledevice3")
+        print("        is installed, then retry. Can't assess authenticity yet.")
+    print(f"\n  {_DISCLAIMER}")
+    return 0
+
+
+def android_authenticity() -> int:
+    """Consistency checks that commonly expose counterfeit Android/Samsung phones."""
+    if not tool_available(ANDROID_TOOL):
+        print(f"ERROR: {ANDROID_TOOL} not installed (Android platform-tools).")
+        return 2
+
+    def prop(name: str) -> str:
+        r = _run([ANDROID_TOOL, "shell", "getprop", name], timeout=30)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    brand = prop("ro.product.brand")
+    manufacturer = prop("ro.product.manufacturer")
+    model = prop("ro.product.model")
+    fingerprint = prop("ro.build.fingerprint")
+    platform = prop("ro.board.platform")
+    hardware = prop("ro.hardware")
+    abi = prop("ro.product.cpu.abi")
+    gms = prop("ro.com.google.gmsversion")
+
+    if not (brand or model):
+        print("No data - unlock the phone and authorize this computer, then retry.")
+        return 1
+
+    print("Android authenticity signals")
+    print("-" * 28)
+    print(f"  Claims to be   : {manufacturer} {model} (brand '{brand}')".strip())
+
+    # 1) Emulator / spoof environment.
+    if hardware.lower() in {"goldfish", "ranchu"} or prop("ro.kernel.qemu") == "1":
+        print("  [!! ] Looks like an EMULATOR, not a physical phone.")
+
+    # 2) Build fingerprint should mention the same brand/model.
+    fp = fingerprint.lower()
+    if fingerprint:
+        if brand and brand.lower() in fp:
+            print("  [ok ] Build fingerprint brand matches the claimed brand.")
+        else:
+            print("  [warn] Build fingerprint brand does NOT match claimed brand:")
+            print(f"         {fingerprint}")
+    else:
+        print("  [warn] No build fingerprint reported (unusual for a genuine ROM).")
+
+    # 3) Samsung/flagship claim but a MediaTek SoC is a classic clone tell.
+    is_mediatek = platform.lower().startswith("mt") or "mt" in hardware.lower()[:2]
+    claims_premium = any(
+        k in model.lower() for k in ("galaxy s", "galaxy note", "galaxy z")
+    )
+    if claims_premium and is_mediatek:
+        print("  [!! ] Claims a Samsung flagship but runs a MediaTek SoC "
+              f"(platform '{platform}') - a very common counterfeit pattern.")
+    elif platform:
+        label = QCOM_PLATFORMS.get(platform)
+        print(f"  [ i ] SoC platform: {platform}" + (f" ({label})" if label else ""))
+
+    # 4) Google Play certification hint.
+    if gms:
+        print(f"  [ok ] Google Mobile Services present (gmsversion {gms}).")
+    else:
+        print("  [warn] No Google Mobile Services version - check Play Protect")
+        print("         certification in the Play Store (Settings -> About).")
+
+    # 5) 64-bit ABI is expected on any genuine modern phone.
+    if abi and "arm64" not in abi and "x86_64" not in abi:
+        print(f"  [warn] CPU ABI is '{abi}', not 64-bit - unusual for a modern phone.")
+
+    print(f"\n  {_DISCLAIMER}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Full specs
 # ---------------------------------------------------------------------------
 def ios_specs() -> int:
@@ -419,6 +577,7 @@ def android_specs() -> int:
         ("Android version", prop("ro.build.version.release")),
         ("API level (SDK)", prop("ro.build.version.sdk")),
         ("Build ID", prop("ro.build.display.id")),
+        ("Build date", prop("ro.build.date")),
         ("Security patch", prop("ro.build.version.security_patch")),
         ("CPU ABI", prop("ro.product.cpu.abi")),
         ("CPU cores", cores),
@@ -516,6 +675,11 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--apple-model", dest="apple_model", metavar="PRODUCTTYPE",
                    help="offline: map an Apple product type (e.g. iPhone12,1) to "
                         "its model name and chip - no device needed")
+    p.add_argument("--apple-serial-date", dest="apple_serial_date", metavar="SERIAL",
+                   help="offline: estimate manufacture date from a legacy Apple "
+                        "serial - no device needed")
+    p.add_argument("--authenticity", action="store_true",
+                   help="run counterfeit/authenticity heuristics on the device")
     p.add_argument("--photos", action="store_true", help="pull the camera roll (DCIM)")
     p.add_argument("--backup", action="store_true", help="full iPhone backup (iOS only)")
     p.add_argument("--out", type=Path, default=Path("./export"),
@@ -531,6 +695,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  Chip  : {named[1]}")
         else:
             print("  Not in the local map. Cross-check at checkcoverage.apple.com.")
+        return 0
+
+    if args.apple_serial_date:
+        print(f"Apple serial: {args.apple_serial_date}")
+        print(f"  Manufacture date: {apple_serial_date(args.apple_serial_date)}")
         return 0
 
     if args.check or not (args.ios or args.android):
@@ -552,6 +721,10 @@ def main(argv: list[str] | None = None) -> int:
         return ios_specs()
     if args.android and args.specs:
         return android_specs()
+    if args.ios and args.authenticity:
+        return ios_authenticity()
+    if args.android and args.authenticity:
+        return android_authenticity()
     if args.ios and args.backup:
         return ios_backup(args.out)
     if args.ios and args.photos:
@@ -563,8 +736,8 @@ def main(argv: list[str] | None = None) -> int:
         print("use Samsung Smart Switch on the desktop for a complete backup.")
         return 2
 
-    p.error("choose an action: --info, --hardware, --specs, --photos "
-            "(or --backup for iOS)")
+    p.error("choose an action: --info, --hardware, --specs, --authenticity, "
+            "--photos (or --backup for iOS)")
     return 2
 
 
