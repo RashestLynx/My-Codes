@@ -118,7 +118,7 @@ pre{margin:0;font:12px/1.35 ui-monospace,Consolas,monospace;white-space:pre-wrap
 <h1 id="title">Progress</h1><div class="sub" id="sub">connecting...</div>
 <div class="card" id="queue" style="display:none"></div>
 <div class="card"><div class="row"><div class="big" id="pct">-</div><div class="m"><b id="eta">-</b><span>time left</span></div>
-<div class="m"><b id="el">-</b><span>elapsed</span></div><div class="m"><b id="speed">-</b><span id="speedl">speed</span></div></div>
+<div class="m"><b id="el">-</b><span>elapsed</span></div><div class="m"><b id="speed">-</b><span>speed</span></div></div>
 <div class="bar" style="margin-top:10px"><div id="fill"></div></div></div>
 <div class="card" id="metrics"></div><div class="card" id="hw" style="display:none"></div><div id="charts"></div>
 <div class="card"><h2>Latest</h2><pre id="log"></pre></div></main>
@@ -153,9 +153,9 @@ const done=s.total?s.step/s.total:0;$('pct').textContent=s.total?(done*100).toFi
 $('pct').className='big'+(s.finished?' done':'');$('fill').style.width=(done*100)+'%';$('eta').textContent=s.finished?'finished':fmt(s.eta);
 $('speed').textContent=s.speed_text||'-';$('el').textContent=fmt(s.elapsed);queue(s.queue);
 $('metrics').innerHTML='<div class="row"><div class="m"><b>'+s.step+(s.total?' / '+s.total:'')+'</b><span>'+(s.unit||'steps')+'</span></div>'+
-Object.entries(s.metrics||{}).map(([k,v])=>'<div class="m"><b>'+v+'</b><span>'+k+'</span></div>').join('')+'</div>';
+Object.entries(s.metrics||{}).map(([k,v])=>'<div class="m"><b>'+esc(v)+'</b><span>'+esc(k)+'</span></div>').join('')+'</div>';
 hw(s.hw);const ch=$('charts');Object.entries(s.series||{}).forEach(([k,pts])=>{let el=document.getElementById('c_'+k);
-if(!el){el=document.createElement('div');el.id='c_'+k;el.className='card';el.innerHTML='<h2>'+k+'</h2><canvas></canvas>';ch.appendChild(el)}
+if(!el){el=document.createElement('div');el.id='c_'+k;el.className='card';el.innerHTML='<h2>'+esc(k)+'</h2><canvas></canvas>';ch.appendChild(el)}
 if(pts.length>1)chart(el,k,pts,(s.refs||{})[k])});
 $('log').textContent=(s.log||[]).join('\\n');}catch(e){$('sub').textContent='cannot reach the PC...'}}
 tick();setInterval(tick,3000);
@@ -185,6 +185,8 @@ class Progress:
             self.s["refs"].setdefault(series, {})[label] = value
 
     def point(self, series, x, y):
+        if not math.isfinite(y):
+            return                          # (JSON has no NaN: one would stop the page updating for the rest of the run)
         with self.lock:
             pts = self.s["series"].setdefault(series, [])
             pts.append([x, y])
@@ -1708,9 +1710,10 @@ def stage_pairs(a, out):
             for f in as_completed(futs):
                 lr, hr, info = f.result()
                 if lr is None:
-                    rejects[info.split()[0]] += 1
-                    if not info.startswith("error"):           # (an ffmpeg hiccup may work next time)
-                        rej_fh.write(f"{futs_t[f]:.3f} {info.split()[0]}\n")
+                    why = "error" if info.startswith("error") else re.sub(r"\s*[-+\d.]+$", "", info)    # ("ecc 0.85" -> "ecc")
+                    rejects[why] += 1
+                    if why != "error":                          # (an ffmpeg hiccup may work next time)
+                        rej_fh.write(f"{futs_t[f]:.3f} {why}\n")
                     continue
                 done += 1
                 name = f"{done:06d}"
@@ -2362,10 +2365,10 @@ def stage_train(a, roots, out):
                             prog.metric(**{k: f"{v:.4f}" for k, v in avg.items()})
                         wf = wait_t / loop_t if loop_t else 0.0
                         why = verdict(HW, wf, el / n_run)
-                        say(f"   hardware: " + "  ".join(f"{k} {v}" for k, v in HW.metrics().items()) + f"  | data wait {100 * wf:.0f}%")
+                        say("   hardware: " + "  ".join(f"{k} {v}" for k, v in HW.metrics().items()) + f"  | data wait {100 * wf:.0f}%")
                         peaks = HW.peaks()
                         if peaks:
-                            say(f"   peak / average: " + "  ".join(f"{k} {v}" for k, v in peaks.items()))
+                            say("   peak / average: " + "  ".join(f"{k} {v}" for k, v in peaks.items()))
                         say(f"   -> {why}")
                         if prog:
                             prog.metric(**{"data wait": f"{100 * wf:.0f} %", "what limits it": why})
@@ -2552,7 +2555,7 @@ def finish_ncnn(ops, binbuf, dest_dir, model_name):
     for li, op in enumerate(ops):
         for k, b in enumerate(op[2]):
             readers.setdefault(b, []).append((li, k))
-    final, made = [], 0
+    final = []
     for li, op in enumerate(ops):
         final.append(op)
         for b in op[3]:
@@ -2571,8 +2574,15 @@ def finish_ncnn(ops, binbuf, dest_dir, model_name):
                      + (" " + params if params else ""))
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
-    (dest_dir / f"{model_name}.param").write_text("\n".join(lines) + "\n")
-    (dest_dir / f"{model_name}.bin").write_bytes(bytes(binbuf))
+    # (each written whole, then renamed over the old one: a crash or power cut never leaves a model in use half-written)
+    for path, data in ((dest_dir / f"{model_name}.bin", bytes(binbuf)),
+                       (dest_dir / f"{model_name}.param", ("\n".join(lines) + "\n").encode())):
+        tmp = path.with_name(path.name + ".tmp")
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        replace_file(tmp, path)
     return len(final), len(binbuf)
 
 
