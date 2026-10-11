@@ -201,6 +201,122 @@ def _parse_service_call_imei(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Hardware / chipset identification
+# ---------------------------------------------------------------------------
+# Apple product type -> (marketing name, SoC). A partial but useful map.
+APPLE_MODELS = {
+    "iPhone9,1": ("iPhone 7", "Apple A10 Fusion"),
+    "iPhone9,3": ("iPhone 7", "Apple A10 Fusion"),
+    "iPhone10,1": ("iPhone 8", "Apple A11 Bionic"),
+    "iPhone10,4": ("iPhone 8", "Apple A11 Bionic"),
+    "iPhone10,3": ("iPhone X", "Apple A11 Bionic"),
+    "iPhone10,6": ("iPhone X", "Apple A11 Bionic"),
+    "iPhone11,2": ("iPhone XS", "Apple A12 Bionic"),
+    "iPhone11,8": ("iPhone XR", "Apple A12 Bionic"),
+    "iPhone12,1": ("iPhone 11", "Apple A13 Bionic"),
+    "iPhone12,3": ("iPhone 11 Pro", "Apple A13 Bionic"),
+    "iPhone12,8": ("iPhone SE (2nd gen)", "Apple A13 Bionic"),
+    "iPhone13,1": ("iPhone 12 mini", "Apple A14 Bionic"),
+    "iPhone13,2": ("iPhone 12", "Apple A14 Bionic"),
+    "iPhone13,3": ("iPhone 12 Pro", "Apple A14 Bionic"),
+    "iPhone14,5": ("iPhone 13", "Apple A15 Bionic"),
+    "iPhone14,2": ("iPhone 13 Pro", "Apple A15 Bionic"),
+    "iPhone14,6": ("iPhone SE (3rd gen)", "Apple A15 Bionic"),
+    "iPhone14,7": ("iPhone 14", "Apple A15 Bionic"),
+    "iPhone15,2": ("iPhone 14 Pro", "Apple A16 Bionic"),
+    "iPhone15,4": ("iPhone 15", "Apple A16 Bionic"),
+    "iPhone16,1": ("iPhone 15 Pro", "Apple A17 Pro"),
+}
+
+# Qualcomm platform codename (ro.board.platform) -> Snapdragon marketing name.
+QCOM_PLATFORMS = {
+    "msm8998": "Snapdragon 835",
+    "sdm845": "Snapdragon 845",
+    "sdm660": "Snapdragon 660",
+    "msmnile": "Snapdragon 855",
+    "kona": "Snapdragon 865",
+    "lahaina": "Snapdragon 888",
+    "taro": "Snapdragon 8 Gen 1",
+    "kalama": "Snapdragon 8 Gen 2",
+    "pineapple": "Snapdragon 8 Gen 3",
+}
+
+
+def apple_model_lookup(product_type: str) -> tuple[str, str] | None:
+    return APPLE_MODELS.get(product_type.strip())
+
+
+def ios_hardware() -> int:
+    """Report iPhone model + Apple SoC from lockdown info."""
+    if not tool_available(IOS_TOOL):
+        print(f"ERROR: {IOS_TOOL} not installed (pip install pymobiledevice3).")
+        return 2
+    res = _run([IOS_TOOL, "lockdown", "info"], timeout=60)
+    if res.returncode != 0:
+        sys.stderr.write(res.stderr)
+        print("Could not read device. Unlock the iPhone and tap 'Trust', then retry.")
+        return res.returncode
+    product_type = _grep_value(res.stdout, "ProductType")
+    arch = _grep_value(res.stdout, "CPUArchitecture")
+    hw_model = _grep_value(res.stdout, "HardwareModel")
+    print("iPhone hardware")
+    print("-" * 15)
+    print(f"  Product type   : {product_type or 'unknown'}")
+    named = apple_model_lookup(product_type)
+    if named:
+        print(f"  Model          : {named[0]}")
+        print(f"  Chip (SoC)     : {named[1]}")
+    else:
+        print("  Model/chip     : not in local map (see ProductType above)")
+    if arch:
+        print(f"  CPU arch       : {arch}")
+    if hw_model:
+        print(f"  Hardware model : {hw_model}")
+    return 0
+
+
+def android_hardware() -> int:
+    """Report Android manufacturer, model, and SoC via adb getprop."""
+    if not tool_available(ANDROID_TOOL):
+        print(f"ERROR: {ANDROID_TOOL} not installed (Android platform-tools).")
+        return 2
+
+    def prop(name: str) -> str:
+        r = _run([ANDROID_TOOL, "shell", "getprop", name], timeout=30)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    manufacturer = prop("ro.product.manufacturer")
+    model = prop("ro.product.model")
+    platform = prop("ro.board.platform")
+    hardware = prop("ro.hardware")
+    abi = prop("ro.product.cpu.abi")
+    soc_mfr = prop("ro.soc.manufacturer")   # Android 12+
+    soc_model = prop("ro.soc.model")        # Android 12+
+
+    print("Android hardware")
+    print("-" * 16)
+    if not any([manufacturer, model, platform, soc_model]):
+        print("  (no data - unlock the phone and authorize this computer)")
+        return 1
+    if manufacturer or model:
+        print(f"  Device         : {manufacturer} {model}".strip())
+    # Prefer the explicit SoC fields; fall back to platform codename mapping.
+    soc = f"{soc_mfr} {soc_model}".strip()
+    if not soc:
+        soc = QCOM_PLATFORMS.get(platform, "")
+    if soc:
+        print(f"  Chip (SoC)     : {soc}")
+    if platform:
+        label = QCOM_PLATFORMS.get(platform)
+        print(f"  Platform code  : {platform}" + (f" ({label})" if label else ""))
+    if hardware:
+        print(f"  ro.hardware    : {hardware}")
+    if abi:
+        print(f"  CPU ABI        : {abi}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # iPhone export
 # ---------------------------------------------------------------------------
 def ios_photos(out: Path) -> int:
@@ -273,22 +389,43 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--android", action="store_true", help="target an Android phone")
     p.add_argument("--info", action="store_true",
                    help="read serial / IMEI from the unlocked, trusted device")
+    p.add_argument("--hardware", action="store_true",
+                   help="report model + chipset (SoC) from the connected device")
+    p.add_argument("--apple-model", dest="apple_model", metavar="PRODUCTTYPE",
+                   help="offline: map an Apple product type (e.g. iPhone12,1) to "
+                        "its model name and chip - no device needed")
     p.add_argument("--photos", action="store_true", help="pull the camera roll (DCIM)")
     p.add_argument("--backup", action="store_true", help="full iPhone backup (iOS only)")
     p.add_argument("--out", type=Path, default=Path("./export"),
                    help="destination folder (default: ./export)")
     args = p.parse_args(argv)
 
+    # Offline lookup needs no device and no backend tools.
+    if args.apple_model:
+        named = apple_model_lookup(args.apple_model)
+        print(f"Apple product type: {args.apple_model}")
+        if named:
+            print(f"  Model : {named[0]}")
+            print(f"  Chip  : {named[1]}")
+        else:
+            print("  Not in the local map. Cross-check at checkcoverage.apple.com.")
+        return 0
+
     if args.check or not (args.ios or args.android):
         check_environment()
         if not (args.ios or args.android):
-            print("\nNothing to export (pass --ios or --android with --photos/--backup).")
+            print("\nNothing to do (pass --ios or --android with "
+                  "--info/--hardware/--photos/--backup, or use --apple-model).")
         return 0
 
     if args.ios and args.info:
         return ios_info()
     if args.android and args.info:
         return android_info()
+    if args.ios and args.hardware:
+        return ios_hardware()
+    if args.android and args.hardware:
+        return android_hardware()
     if args.ios and args.backup:
         return ios_backup(args.out)
     if args.ios and args.photos:
@@ -300,7 +437,7 @@ def main(argv: list[str] | None = None) -> int:
         print("use Samsung Smart Switch on the desktop for a complete backup.")
         return 2
 
-    p.error("choose an action: --info, --photos (or --backup for iOS)")
+    p.error("choose an action: --info, --hardware, --photos (or --backup for iOS)")
     return 2
 
 
