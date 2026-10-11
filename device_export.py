@@ -96,6 +96,111 @@ def _show_android_devices() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Device identifiers (serial / IMEI) - needs an unlocked, trusted device
+# ---------------------------------------------------------------------------
+def ios_info() -> int:
+    """Read SerialNumber / IMEI from a trusted, unlocked iPhone via lockdown."""
+    if not tool_available(IOS_TOOL):
+        print(f"ERROR: {IOS_TOOL} not installed (pip install pymobiledevice3).")
+        return 2
+    res = _run([IOS_TOOL, "lockdown", "info"], timeout=60)
+    if res.returncode != 0:
+        sys.stderr.write(res.stderr)
+        print("Could not read device. Unlock the iPhone and tap 'Trust', then retry.")
+        return res.returncode
+    wanted = {
+        "SerialNumber": "Serial number",
+        "InternationalMobileEquipmentIdentity": "IMEI",
+        "InternationalMobileEquipmentIdentity2": "IMEI 2",
+        "DeviceName": "Device name",
+        "ProductType": "Model (product type)",
+        "ProductVersion": "iOS version",
+    }
+    print("iPhone identifiers")
+    print("-" * 18)
+    text = res.stdout
+    for key, label in wanted.items():
+        value = _grep_value(text, key)
+        if value:
+            print(f"  {label:<22}: {value}")
+    print("  (Also printed on the SIM tray, the box, and the receipt.)")
+    return 0
+
+
+def android_info() -> int:
+    """Read serial / IMEI from an unlocked, authorized Android phone via adb."""
+    if not tool_available(ANDROID_TOOL):
+        print(f"ERROR: {ANDROID_TOOL} not installed (Android platform-tools).")
+        return 2
+    print("Android identifiers")
+    print("-" * 19)
+    serial = _run([ANDROID_TOOL, "shell", "getprop", "ro.serialno"], timeout=30)
+    if serial.returncode == 0 and serial.stdout.strip():
+        print(f"  Serial number         : {serial.stdout.strip()}")
+    else:
+        print("  Serial number         : unavailable (unlock + authorize first)")
+    # IMEI retrieval is restricted on newer Android; try the legacy service call.
+    imei = _run(
+        [ANDROID_TOOL, "shell", "service", "call", "iphonesubinfo", "1"], timeout=30
+    )
+    digits = _parse_service_call_imei(imei.stdout) if imei.returncode == 0 else ""
+    # Only trust a result that is a valid 15-digit IMEI; never show partial junk.
+    if len(digits) == 15 and _luhn_is_valid(digits):
+        print(f"  IMEI                  : {digits}")
+    else:
+        print("  IMEI                  : unavailable via adb on this Android version")
+        print("    -> dial *#06#, or see the SIM tray / box / receipt.")
+    return 0
+
+
+def _grep_value(text: str, key: str) -> str:
+    """Pull a value for `key` from pymobiledevice3's key/value or plist-ish output."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped.startswith(key):
+            # handles 'Key: value' and 'Key = value' style lines
+            for sep in (":", "="):
+                if sep in stripped:
+                    return stripped.split(sep, 1)[1].strip().strip("\"',")
+    return ""
+
+
+def _luhn_is_valid(number: str) -> bool:
+    """Luhn checksum used to validate a candidate IMEI before trusting it."""
+    if not number.isdigit():
+        return False
+    total = 0
+    for i, ch in enumerate(number[::-1]):
+        d = int(ch)
+        if i % 2 == 1:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    return total % 10 == 0
+
+
+def _parse_service_call_imei(raw: str) -> str:
+    """Decode digits from the UTF-16 hex words 'service call iphonesubinfo' prints.
+
+    Each 32-bit word printed as 8 hex digits holds two UTF-16 code units; the
+    low 16 bits are the earlier character, so read (low half, high half) and
+    interpret each half directly as the code point.
+    """
+    digits = ""
+    for token in raw.split():
+        if len(token) == 8 and all(c in "0123456789abcdefABCDEF" for c in token):
+            for half in (token[4:8], token[0:4]):  # low half first
+                try:
+                    ch = chr(int(half, 16))
+                except ValueError:
+                    continue
+                if ch.isdigit():
+                    digits += ch
+    return digits
+
+
+# ---------------------------------------------------------------------------
 # iPhone export
 # ---------------------------------------------------------------------------
 def ios_photos(out: Path) -> int:
@@ -166,6 +271,8 @@ def main(argv: list[str] | None = None) -> int:
                    help="report installed backends and visible devices")
     p.add_argument("--ios", action="store_true", help="target an iPhone")
     p.add_argument("--android", action="store_true", help="target an Android phone")
+    p.add_argument("--info", action="store_true",
+                   help="read serial / IMEI from the unlocked, trusted device")
     p.add_argument("--photos", action="store_true", help="pull the camera roll (DCIM)")
     p.add_argument("--backup", action="store_true", help="full iPhone backup (iOS only)")
     p.add_argument("--out", type=Path, default=Path("./export"),
@@ -178,6 +285,10 @@ def main(argv: list[str] | None = None) -> int:
             print("\nNothing to export (pass --ios or --android with --photos/--backup).")
         return 0
 
+    if args.ios and args.info:
+        return ios_info()
+    if args.android and args.info:
+        return android_info()
     if args.ios and args.backup:
         return ios_backup(args.out)
     if args.ios and args.photos:
@@ -189,7 +300,7 @@ def main(argv: list[str] | None = None) -> int:
         print("use Samsung Smart Switch on the desktop for a complete backup.")
         return 2
 
-    p.error("choose what to export: --photos (or --backup for iOS)")
+    p.error("choose an action: --info, --photos (or --backup for iOS)")
     return 2
 
 
