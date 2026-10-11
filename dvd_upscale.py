@@ -113,7 +113,7 @@ queue.txt has one movie per line, exactly what you'd type after "python dvd_upsc
 - Each movie starts with the processor's and NVIDIA GPU's model, and every chunk's progress line
   is followed by their load during that chunk: CPU busy %, GPU busy %, clock, temperature, power
   and video memory, each as average and peak. When the movie's chunks are done, the same for the
-  whole run.
+  whole run. The --phone page shows them too (last chunk and whole run, next to the live values).
 - While it runs the PC is kept from going to sleep (single movies too). Keep it plugged in, and if you
   close the lid, set the lid action to "Do nothing" for when it's plugged in.
 - Also while it runs (Windows; --no-guard turns this off): a click in the window can't freeze the
@@ -318,6 +318,30 @@ def phone_setup(queue_parent):
 
 PHONE_GPU = dict(t=0.0, gpus=[])
 PHONE_GPU_LOCK = threading.Lock()
+PHONE_CPU = dict(t=0.0, last=None, busy=None, name=None, threads=0)
+
+
+def phone_load(chunk, run):
+    """The CPU and GPU load (average and peak) of the last chunk and of the whole run so far,
+    for the page (LoadWatch.stats(); chunk None at the end of the movie)."""
+    if PHONE is not None:
+        with PHONE_LOCK:
+            PHONE["load"] = dict(chunk=chunk, run=run)
+            PHONE_DIRTY[0] = True
+
+
+def phone_cpu():
+    """The processor right now (its load between two of the page's polls, at most every
+    2.5 s): name, threads, busy % (None until there are two readings)."""
+    with PHONE_GPU_LOCK:
+        if PHONE_CPU["name"] is None:
+            PHONE_CPU["name"], PHONE_CPU["threads"] = cpu_name()
+        if time.time() - PHONE_CPU["t"] >= 2.5:
+            now, last = cpu_times(), PHONE_CPU["last"]
+            busy = (100.0 * (now[0] - last[0]) / (now[1] - last[1])
+                    if now and last and now[1] > last[1] else None)
+            PHONE_CPU.update(t=time.time(), last=now, busy=busy)
+        return dict(name=PHONE_CPU["name"], threads=PHONE_CPU["threads"], busy=PHONE_CPU["busy"])
 PHONE_GPU_FIELDS = ("index,name,temperature.gpu,power.draw,power.limit,utilization.gpu,"
                     "memory.used,memory.total,clocks.sm,clocks.max.sm,fan.speed,"
                     "clocks_throttle_reasons.active")
@@ -447,34 +471,47 @@ class LoadWatch:
     def stop(self):
         self.stop_event.set()
 
-    def lines(self, since_last=False):
+    def stats(self, since_last=False):
+        """The [average, peak] of each value, over the samples since the last
+        stats(since_last=True) or over the whole run: {"cpu": [..] or None, "gpus": [{...}]}."""
         rows = self.samples[self.mark:] if since_last else self.samples
         if since_last:
             self.mark = len(self.samples)
-        out = []
-        avg_peak = lambda xs, fmt, unit: (f"{fmt.format(sum(xs) / len(xs))}{unit} avg, "
-                                          f"{fmt.format(max(xs))}{unit} peak")
-        cpu = [c for c, _ in rows if c is not None]
-        if cpu:
-            out.append(f"CPU: {avg_peak(cpu, '{:.0f}', '%')}")
+        ap = lambda xs: [sum(xs) / len(xs), max(xs)] if xs else None
         by_gpu = {}
         for _, gpus in rows:
             for g in gpus:
                 by_gpu.setdefault(g["index"], []).append(g)
+        out = dict(cpu=ap([c for c, _ in rows if c is not None]), gpus=[])
         for idx, gs in by_gpu.items():
-            vals = lambda k: [g[k] for g in gs if g[k] is not None]
-            parts = []
-            for key, fmt, unit in (("busy", "{:.0f}", "%"), ("clock", "{:.0f}", " MHz"),
-                                   ("temp", "{:.0f}", " C"), ("power", "{:.0f}", " W")):
-                if vals(key):
-                    parts.append(avg_peak(vals(key), fmt, unit))
-            mem, mem_max = vals("mem"), vals("mem_max")
-            if mem:
-                parts.append(f"VRAM {sum(mem) / len(mem) / 1024:.1f} GB avg, "
-                             f"{max(mem) / 1024:.1f} GB peak"
-                             + (f" of {max(mem_max) / 1024:.1f}" if mem_max else ""))
+            vals = lambda k: [g[k] for g in gs if g.get(k) is not None]
+            out["gpus"].append(dict(index=idx, name=gs[-1].get("name", ""),
+                                    mem_max=max(vals("mem_max"), default=None),
+                                    **{k: ap(vals(k)) for k in
+                                       ("busy", "clock", "temp", "power", "mem")}))
+        return out
+
+    def lines(self, since_last=False):
+        return self.format(self.stats(since_last))
+
+    @staticmethod
+    def format(st):
+        """stats() as text lines: CPU, then each GPU."""
+        out = []
+        avg_peak = lambda x, fmt, unit: (f"{fmt.format(x[0])}{unit} avg, "
+                                         f"{fmt.format(x[1])}{unit} peak")
+        if st["cpu"]:
+            out.append(f"CPU: {avg_peak(st['cpu'], '{:.0f}', '%')}")
+        for g in st["gpus"]:
+            parts = [avg_peak(g[key], "{:.0f}", unit)
+                     for key, unit in (("busy", "%"), ("clock", " MHz"), ("temp", " C"),
+                                       ("power", " W")) if g[key]]
+            if g["mem"]:
+                parts.append(f"VRAM {g['mem'][0] / 1024:.1f} GB avg, "
+                             f"{g['mem'][1] / 1024:.1f} GB peak"
+                             + (f" of {g['mem_max'] / 1024:.1f}" if g["mem_max"] else ""))
             if parts:
-                label = "GPU" if len(by_gpu) == 1 else f"GPU {idx}"
+                label = "GPU" if len(st["gpus"]) == 1 else f"GPU {g['index']}"
                 out.append(f"{label}: " + " | ".join(parts))
         return out
 
@@ -485,7 +522,8 @@ def phone_snapshot():
             PHONE_CACHE[0] = json.load(f)
     except (OSError, ValueError, TypeError):
         pass                            # (not written yet, or being replaced: the last one)
-    out = dict(now=time.time(), movie=PHONE_CACHE[0], queue=None, gpus=phone_gpus())
+    out = dict(now=time.time(), movie=PHONE_CACHE[0], queue=None, gpus=phone_gpus(),
+               cpu=phone_cpu())
     if PHONE_QUEUE[0] and PHONE is not None:
         with PHONE_LOCK:
             out["queue"] = dict(PHONE, log=list(PHONE["log"]))
@@ -791,6 +829,11 @@ li time{color:var(--dim);flex:none}
 .mini>i{display:block;height:100%;background:var(--acc)}
 .hot b{color:var(--warn)}.vhot b{color:var(--bad)}
 .slow{margin-top:10px;font-size:13px;color:var(--warn)}
+.ap{width:100%;border-collapse:collapse;margin-top:12px;font-size:13px;font-variant-numeric:tabular-nums}
+.ap th{color:var(--dim);font-weight:600;font-size:12px;text-align:right;padding:0 0 4px}
+.ap th:first-child,.ap td:first-child{text-align:left;color:var(--dim)}
+.ap td{text-align:right;padding:5px 0;border-top:1px solid var(--line);white-space:nowrap}
+.ap td+td,.ap th+th{padding-left:10px}
 .banner{display:none;background:var(--bad);color:#fff;border-radius:12px;padding:12px 14px;
 margin-bottom:12px;font-size:14px}
 footer{color:var(--dim);font-size:12px;text-align:center;margin-top:8px}
@@ -808,6 +851,7 @@ or the PC is asleep or off this Wi-Fi. Showing the last thing it reported.</div>
  <div class="row" id="allrow" hidden><span>All movies</span><b id="etaall">-</b></div>
  <div class="now" id="now"></div>
 </div>
+<div class="card" id="ccard" hidden><h2>Processor</h2><div id="cpu"></div></div>
 <div class="card" id="gcard" hidden><h2>Graphics card</h2><div id="gpus"></div></div>
 <div class="card" id="qcard" hidden><h2>Queue</h2><ol id="qlog"></ol></div>
 <div class="card"><h2>Recent output</h2><ol id="log"></ol></div>
@@ -846,7 +890,23 @@ function tile(label,val,unit,frac,cls){
   i.style.width=Math.min(100,Math.max(0,frac*100))+'%';m.append(i);t.append(m)}
  return t}
 const r0=x=>x==null?null:Math.round(x);
-function showGpus(gs){
+function apTable(ld,rows){
+ const cols=ld?[['Last chunk',ld.chunk],['Whole run',ld.run]].filter(c=>c[1]):[];if(!cols.length)return null;
+ const t=document.createElement('table');t.className='ap';const h=t.insertRow();
+ ['avg / peak',...cols.map(c=>c[0])].forEach(s=>{const c=document.createElement('th');c.textContent=s;h.append(c)});
+ const ap=(x,f)=>x?`${f(x[0])} / ${f(x[1])}`:'-';
+ rows.forEach(([label,get,f])=>{const v=cols.map(c=>get(c[1]));if(!v.some(x=>x))return;
+  const r=t.insertRow();[label,...v.map(x=>ap(x,f))].forEach(s=>{r.insertCell().textContent=s})});
+ return t.rows.length>1?t:null}
+function showCpu(c,ld){
+ const box=$('cpu'),has=ld&&((ld.chunk&&ld.chunk.cpu)||(ld.run&&ld.run.cpu));
+ $('ccard').hidden=!c&&!has;if(!c&&!has)return;box.textContent='';
+ if(c){const n=document.createElement('div');n.className='gname';
+  n.textContent=(c.name||'Processor')+(c.threads?` · ${c.threads} threads`:'');box.append(n);
+  const ts=document.createElement('div');ts.className='tiles';
+  ts.append(tile('Busy now',r0(c.busy),'%',c.busy==null?null:c.busy/100));box.append(ts)}
+ const t=apTable(ld,[['Busy %',s=>s.cpu,r0]]);if(t)box.append(t)}
+function showGpus(gs,ld){
  const box=$('gpus');$('gcard').hidden=!gs||!gs.length;if(!gs||!gs.length)return;box.textContent='';
  gs.forEach(g=>{const d=document.createElement('div');d.className='gpu';
   const n=document.createElement('div');n.className='gname';n.textContent=g.name;d.append(n);
@@ -863,6 +923,11 @@ function showGpus(gs){
   d.append(ts);
   if(g.slowed&&g.slowed.length){const w=document.createElement('div');w.className='slow';
    w.textContent='⚠ Slowing itself down: '+g.slowed.join(', ');d.append(w)}
+  const of=s=>s.gpus.find(x=>x.index===g.index)||{};
+  const t=apTable(ld,[['Busy %',s=>of(s).busy,r0],['Clock MHz',s=>of(s).clock,r0],
+   ['Temperature °C',s=>of(s).temp,r0],['Power W',s=>of(s).power,r0],
+   ['Memory GB',s=>of(s).mem,x=>(x/1024).toFixed(1)]]);
+  if(t)d.append(t);
   box.append(d)})}
 function status(){
  const pill=$('pill'),now=Date.now()/1000,off=now-lastOk>12;
@@ -876,7 +941,7 @@ function status(){
 }
 async function poll(){
  try{const r=await fetch('/status.json',{cache:'no-store'});const d=await r.json();
-  last=d;lastOk=Date.now()/1000;skew=d.now-lastOk;show(d);showGpus(d.gpus)}catch(e){}
+  last=d;lastOk=Date.now()/1000;skew=d.now-lastOk;show(d);const ld=d.movie&&d.movie.load;showCpu(d.cpu,ld);showGpus(d.gpus,ld)}catch(e){}
  status()}
 poll();setInterval(poll,3000);
 </script></body></html>"""
@@ -8043,7 +8108,9 @@ def upscale_chunks(a, info, fps, work, plan, cut, eps):
                    ", all chunks done, finishing the file..."))
             if detail and not helpers:
                 say("        upscale: " + "; ".join(detail))
-            for line in load.lines(since_last=True):
+            chunk_load, run_load = load.stats(since_last=True), load.stats()
+            phone_load(chunk_load, run_load)
+            for line in load.format(chunk_load):
                 say("        " + line)
             if later > 0 and remaining:
                 # the movies still to come, at this movie's speed (seconds of work per second
@@ -8063,7 +8130,9 @@ def upscale_chunks(a, info, fps, work, plan, cut, eps):
             took = time.time() - t_start
             say(f"Upscaled {progress['frames']} frames in {short_time(took)} "
                 f"({progress['frames'] / took:.1f} frames/s)")
-        overall = load.lines()
+        run_load = load.stats()
+        phone_load(None, run_load)
+        overall = load.format(run_load)
         if overall:
             say("Load over the whole run (average and peak):")
             for line in overall:
