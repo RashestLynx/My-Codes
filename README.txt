@@ -30,18 +30,20 @@ at the result before a run that takes hours.
 
 Options
 -------
-Open Upscale.bat in Notepad and change the line  set "OPTIONS=--faces" , for example:
+Open Upscale.bat in Notepad and change the line  set "OPTIONS=" , for example:
   --faces 0.8        stronger face restoration (default 0.6)
+  --no-faces         no face restoration (it is on by itself for live action and home video)
   --stabilize        steady a shaky camcorder video
   --hevc             smaller files (HEVC) for newer TVs and players
-Remove --faces to upscale without face restoration. All options:
+All options:
   python\python.exe dvd_upscale.py --help
 
 Notes
 -----
-- Faces are restored only in live action and home videos; anime, cartoons and 3D animation are
-  recognised and left alone.
-- A movie started without --faces can't be finished with it (or the other way round): delete its
+- Faces are restored by themselves in live action and home videos; anime, cartoons and 3D
+  animation are recognised and left alone (add --faces to a 3D-animation movie to restore them
+  there too, after checking a clip).
+- A movie started with faces can't be finished without them (or the other way round): delete its
   "<movie>_work" folder to start it again.
 - Move the whole folder anywhere, it keeps working. Run setup.bat again after moving it, or to
   repair a missing or damaged file.

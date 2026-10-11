@@ -15,7 +15,7 @@ import json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-SCRIPT = HERE.parent / "dvd_upscale.py"
+SCRIPT = Path(os.environ.get("GOLDEN_SCRIPT") or HERE.parent / "dvd_upscale.py")  # (a copy: GOLDEN_SCRIPT=path)
 FAKE = HERE / "fakeesrgan" / "realesrgan-ncnn-vulkan"
 RUNS = HERE / "runs" / "golden"
 OUT = HERE / "golden"

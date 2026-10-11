@@ -6,9 +6,10 @@ rem   - put movies in the Movies folder next to it and double-click it.
 rem Finished movies go into a "1080p Upscale" folder next to the originals. It can be stopped
 rem (close the window or Ctrl+C) and picks up where it left off when started again.
 rem
-rem Options for every movie: --faces restores faces (live action and home video; anime and 3D
-rem animation are left alone). Add more after it, e.g.  --faces 0.8 --stabilize
-set "OPTIONS=--faces"
+rem Options for every movie (add them after OPTIONS=). Faces are restored by themselves in live
+rem action and home video (anime and 3D animation are left alone); --no-faces turns that off,
+rem --faces 0.8 makes it stronger. Others, e.g.  --stabilize  --hevc
+set "OPTIONS="
 
 set "HERE=%~dp0"
 set "PY=%HERE%python\python.exe"

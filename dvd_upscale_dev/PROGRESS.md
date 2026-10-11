@@ -38,6 +38,11 @@ The user's changes:
 - `simgpu/run.sh` and `simgpu/runR.sh`: `--gpu-jobs` 1 vs 2 on a simulated GPU, plus the retire
   case.
 - `failesrgan/`: an upscaler that fails once on the chunks in `FAIL_CHUNKS` (retry path).
+- `resetesrgan/`: an upscaler whose GPU is reset ("vkQueueSubmit failed -4", black frames,
+  exit code 0, as on a Windows laptop) on frames wider than 300 pixels, unless the tile size is
+  at most `RESET_TILE_MAX` and the frames at once at most `RESET_THREADS_MAX`. `RESET_LOG` gets
+  each call's `-j`/`-t`. It tests the step-down after a GPU reset (`GPU_STEPS`) and its
+  carry-over to the next movie of a `--queue`.
 - `stabrun.py NAME ZOOM [args]` with `stabtest.py`: the jitter left after `--stabilize`, seams,
   sync.
 - `filtertest.py`: filter-graph checks.

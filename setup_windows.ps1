@@ -137,21 +137,41 @@ if ((Have (Join-Path $Here 'realesrgan-ncnn-vulkan.exe') 1MB) -and (Have (Join-P
 }
 
 Step 'realesrgan-x2plus model (live action and movie tapes)'
-if ((Have (Join-Path $Models 'realesrgan-x2plus.bin') 1MB) -and (Have (Join-Path $Models 'realesrgan-x2plus.param') 1KB)) {
+$zip = Join-Path $Here 'realesrgan-x2plus.zip'
+$installed = (Have (Join-Path $Models 'realesrgan-x2plus.bin') 1MB) -and (Have (Join-Path $Models 'realesrgan-x2plus.param') 1KB)
+if (Test-Path -LiteralPath $zip) {
+    # both files from the zip whenever either differs (a newer zip, or a pair that doesn't belong
+    # together): they must come from the same download
+    try {
+        $dir = Expand-Fresh $zip 'x2plus'
+        $same = $true
+        foreach ($n in 'realesrgan-x2plus.param', 'realesrgan-x2plus.bin') {
+            $dst = Join-Path $Models $n
+            if (-not (Test-Path -LiteralPath $dst) -or
+                (Get-FileHash -LiteralPath (Find-In $dir $n).FullName).Hash -ne (Get-FileHash -LiteralPath $dst).Hash) {
+                $same = $false
+            }
+        }
+        if ($same) {
+            Write-Host '  already here'
+        } else {
+            foreach ($n in 'realesrgan-x2plus.param', 'realesrgan-x2plus.bin') {
+                Copy-Item -LiteralPath (Find-In $dir $n).FullName -Destination (Join-Path $Models $n) -Force
+            }
+            Write-Host '  done (from realesrgan-x2plus.zip)'
+        }
+    } catch {
+        # (a damaged zip: the rest of the setup still runs)
+        Write-Host "  realesrgan-x2plus.zip can't be read ($($_.Exception.Message))" -ForegroundColor Yellow
+        if ($installed) { Write-Host '  keeping the installed model' -ForegroundColor Yellow }
+        [void]$Problems.Add('realesrgan-x2plus.zip is damaged: download it again')
+    }
+} elseif ($installed) {
     Write-Host '  already here'
 } else {
-    $zip = Join-Path $Here 'realesrgan-x2plus.zip'
-    if (Test-Path -LiteralPath $zip) {
-        $dir = Expand-Fresh $zip 'x2plus'
-        foreach ($n in 'realesrgan-x2plus.param', 'realesrgan-x2plus.bin') {
-            Copy-Item -LiteralPath (Find-In $dir $n).FullName -Destination (Join-Path $Models $n) -Force
-        }
-        Write-Host '  done'
-    } else {
-        Write-Host '  realesrgan-x2plus.zip is not in this folder: live action uses the slower' -ForegroundColor Yellow
-        Write-Host '  realesrgan-x4plus until it is (put the zip here and run setup.bat again).' -ForegroundColor Yellow
-        [void]$Problems.Add('realesrgan-x2plus.zip missing (live action works, but slower, with realesrgan-x4plus)')
-    }
+    Write-Host '  realesrgan-x2plus.zip is not in this folder: live action uses the slower' -ForegroundColor Yellow
+    Write-Host '  realesrgan-x4plus until it is (put the zip here and run setup.bat again).' -ForegroundColor Yellow
+    [void]$Problems.Add('realesrgan-x2plus.zip missing (live action works, but slower, with realesrgan-x4plus)')
 }
 
 # ---- Python and the face restoration ----------------------------------------------------------
@@ -193,6 +213,18 @@ Step 'Face restoration packages (onnxruntime-directml, OpenCV, numpy)'
 [void](Run-Quiet $PyExe @('-m', 'pip', 'uninstall', '-y', 'onnxruntime', 'onnxruntime-gpu'))
 if ((Run $PyExe @('-m', 'pip', 'install', '--upgrade', '--no-warn-script-location', 'onnxruntime-directml', 'opencv-python-headless', 'numpy')) -ne 0) {
     throw "The face restoration packages couldn't be installed (see the messages above)"
+}
+
+Step 'GPU engine for live action and CGI (the current ncnn)'
+# realesrgan-ncnn-vulkan.exe's own engine is from 2022: on NVIDIA drivers from 570 on, the big
+# live-action model makes the GPU reset now and then. dvd_upscale.py uses this one for it when
+# it is installed. --no-deps: it needs only numpy (installed above); its other listed packages
+# include opencv-python, which would clash with opencv-python-headless
+if ((Run $PyExe @('-m', 'pip', 'install', '--upgrade', '--no-deps', '--no-warn-script-location', 'ncnn==1.0.20260526')) -ne 0) {
+    Write-Host '  not installed: live action and CGI use the upscaler''s own (older) engine' -ForegroundColor Yellow
+    [void]$Problems.Add('the current ncnn (GPU engine for live action and CGI) is not installed')
+} else {
+    Write-Host '  done'
 }
 
 Step 'Face restoration models'

@@ -221,7 +221,6 @@ Each row lists: condition, the function that handles it, today's outcome.
 
 **Silent today, candidates for a NOTE (optional step O5, needs the user's OK):**
 - `--fast` ignores `--model`, `--scale`, `--tile`, `--gpu-threads`, `--ai-blend`, `--smooth` and `--gpu-jobs`;
-- `--gpu-threads` is ignored for x2plus/x4plus;
 - `--mask`/`--chroma-delay` are ignored with an explicit non-tape type;
 - `--face-model`/`--face-models` without `--faces`;
 - `--delete-originals` with `--test` is skipped.

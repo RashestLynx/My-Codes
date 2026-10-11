@@ -7,7 +7,21 @@ src, dst, s, gpu = opt["-i"], opt["-o"], int(opt["-s"]), opt.get("-g", "0")
 print(f"[{gpu} FakeGPU {gpu}]  queueC=2[8]  queueG=0[16]  queueT=1[2]", flush=True)
 if os.environ.get("FAKE_SLOW_GPU") == gpu:
     time.sleep(float(os.environ.get("FAKE_SLOW_SECS", "5")))
-r = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", os.path.join(src, "%06d.png"),
+# every PNG of -i, whatever its numbers (like the real upscaler, which lists the folder): the
+# files go to ffmpeg as one numbered run in a scratch folder, and come back under their names
+import shutil, tempfile
+names = sorted(f for f in os.listdir(src) if f.lower().endswith(".png"))
+if not names:
+    sys.exit(0)
+tmp = tempfile.mkdtemp(prefix="fakeesrgan_")
+os.mkdir(os.path.join(tmp, "i")); os.mkdir(os.path.join(tmp, "o"))
+for k, f in enumerate(names, 1):
+    os.symlink(os.path.abspath(os.path.join(src, f)), os.path.join(tmp, "i", f"{k:06d}.png"))
+r = subprocess.run(["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", os.path.join(tmp, "i", "%06d.png"),
                     "-vf", f"scale=iw*{s}:ih*{s}:flags=bicubic", "-compression_level", "1",
-                    os.path.join(dst, "%06d.png")])
+                    os.path.join(tmp, "o", "%06d.png")])
+if r.returncode == 0:
+    for k, f in enumerate(names, 1):
+        shutil.move(os.path.join(tmp, "o", f"{k:06d}.png"), os.path.join(dst, f))
+shutil.rmtree(tmp, ignore_errors=True)
 sys.exit(r.returncode)

@@ -10,3 +10,10 @@ __pycache__/
 /face_models/
 /Movies/
 /realesrgan-x2plus.zip
+# what dvd_upscale.py remembers about this PC's GPU (made by the runs, not code)
+gpu_steps.json
+ncnn_opts.json
+# ps3_dump.py: private keys / secrets, never commit
+d1_secrets*.txt
+*.key
+*.dkey
