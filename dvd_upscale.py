@@ -2149,15 +2149,25 @@ TRAINED_MODEL = "upscale-training-x2"   # the single model older versions of ups
 
 def trained_model(a):
     """--trained: the model upscale_training.py made for this kind of movie (it names them ai-anime-x2,
-    ai-cgi-x2, ai-live-x2, ai-vhs-x2), else the single model older versions made."""
-    for m in (f"ai-{a.type}-x2", TRAINED_MODEL):
-        a.model = m
+    ai-cgi-x2, ai-live-x2, ai-vhs-x2; from a 4K Blu-ray ai-<type>-x4), else the single model older versions
+    made. --scale 2/4 picks the size; without it a 4K output (--height over 1080) prefers the x4 model and a
+    1080p one the x2 model, each falling back on the other. Sets a.scale to the model's."""
+    x2 = [(f"ai-{a.type}-x2", 2), (TRAINED_MODEL, 2)]
+    x4 = [(f"ai-{a.type}-x4", 4)]
+    S = a.trained_scale
+    order = (x4 if S == 4 else x2) if S else (x4 + x2 if a.height > 1080 else x2 + x4)
+    for m, sc in order:
+        a.model, a.scale = m, sc
         if model_installed(a):
             if m == TRAINED_MODEL:
                 print(f"NOTE: --trained: no ai-{a.type}-x2 model yet (upscale_training.py makes it from a "
                       f"{TYPE_NAMES[a.type]} movie): using {TRAINED_MODEL}, the earlier trained model")
+            elif m != order[0][0]:
+                print(f"NOTE: --trained: no {order[0][0]} model, using {m}"
+                      + (" (made from a 4K Blu-ray: --height 2160 gives its full detail)" if sc == 4 else ""))
             return m
-    return f"ai-{a.type}-x2"            # (not there: reported as missing below)
+    a.model, a.scale = order[0]
+    return a.model                      # (not there: reported as missing below)
 
 
 def models_dir(a):
@@ -6662,7 +6672,8 @@ def build_parser():
     p.add_argument("--trained", action="store_true",
                    help="use the model made by upscale_training.py for this kind of movie "
                         "(ai-anime-x2, ai-cgi-x2, ai-live-x2 or ai-vhs-x2, by the detected --type; else the "
-                        f"older {TRAINED_MODEL}), scale 2")
+                        f"older {TRAINED_MODEL}). From a 4K Blu-ray it makes ai-<type>-x4: --trained --scale 4 "
+                        "--height 2160 (with --height over 1080 the x4 model is picked by itself)")
     p.add_argument("--height", type=int, default=1080)
     p.add_argument("--dar", default=None, help="force aspect, e.g. 16:9 or 4:3")
     p.add_argument("--fps", default=None, help="override output fps, e.g. 24000/1001")
@@ -7091,6 +7102,7 @@ def start_run(a):
         check_ffmpeg()
     resolve_type(a, find)
     a.trained_pick = a.trained and a.model is None     # (the model for the type, once its folder is known)
+    a.trained_scale = a.scale                           # (--scale 2 / 4 as given: an x2 or x4 trained model)
     if a.trained:
         a.model = a.model or TRAINED_MODEL
         a.scale = a.scale or 2
@@ -7203,6 +7215,8 @@ def pick_model(a, find, user):
         a.esrgan_path = find(a.esrgan)
         if a.trained_pick:
             a.model = trained_model(a)
+            if a.scale == 4 and user_chunk is None:
+                a.chunk_frames = min(a.chunk_frames, 480)      # (x4 frames: as for the other x4 models)
         best = ncnn_saved().get("best_model")
         if a.best_quality and not best:
             print("NOTE: --best-quality: no best model is saved yet: run "
@@ -9504,6 +9518,23 @@ def self_test_main(argv):
         def test_trained(self):
             a = du.build_parser().parse_args(["in.mkv", "--trained"])
             self.assertTrue(a.trained)
+
+        def test_trained_picks_x2_or_x4(self):
+            with tempfile.TemporaryDirectory() as d:
+                models = Path(d) / "models"
+                models.mkdir()
+                put = lambda n: [(models / f"{n}.{e}").write_text("x") for e in ("param", "bin")]
+                pick = lambda height, scale=None: (lambda a: (du.trained_model(a), a.scale))(SimpleNamespace(
+                    type="live", height=height, trained_scale=scale, esrgan_path=str(Path(d) / "esrgan")))
+                with mock.patch("builtins.print"):
+                    put("ai-live-x2")
+                    self.assertEqual(pick(1080), ("ai-live-x2", 2))
+                    self.assertEqual(pick(2160), ("ai-live-x2", 2))         # (no x4 model: the x2 one)
+                    self.assertEqual(pick(1080, 4), ("ai-live-x4", 4))      # (asked for: reported missing)
+                    put("ai-live-x4")
+                    self.assertEqual(pick(2160), ("ai-live-x4", 4))
+                    self.assertEqual(pick(1080), ("ai-live-x2", 2))
+                    self.assertEqual(pick(2160, 2), ("ai-live-x2", 2))
 
         def test_commands_text(self):
             self.assertIn("--all", du.commands_text())

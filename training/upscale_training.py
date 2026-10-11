@@ -54,6 +54,13 @@ finished are skipped; the pairs and the training both resume). --stages picks st
 Then upscale with:
   python dvd_upscale.py <movie> --trained     (picks ai-<type>-x2 for the type it detects in that movie)
 
+A 4K Blu-ray (2160p) instead of a Blu-ray trains an x4 model (ai-<type>-x4), by itself from the disc's size
+(--scale 2/4 sets it): it starts from RealESRGAN_x4plus.pth (put it next to this script too), and its frames
+are 4x the DVD's. HDR discs (HDR10/PQ, HLG; nearly every 4K Blu-ray) are turned into normal colour first
+(tone mapping, needs an ffmpeg with zscale). The 4K pairs need about 2.5x the disk space. Then:
+  python dvd_upscale.py <movie> --trained --scale 4 --height 2160      (a 4K upscale)
+With --all / --queue, movies with a 4K Blu-ray get their own model per kind (ai-live-x4 next to ai-live-x2).
+
 While it runs, PowerShell shows one live line with an ETA, and a page opens on port 8643 for a browser
 or a phone on the same Wi-Fi (the address is printed; --web 0 turns it off; read-only, no password).
 
@@ -86,6 +93,9 @@ import torch, torch.nn as nn, torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 
 PRETRAINED_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.1/RealESRGAN_x2plus.pth"
+# the starting model for each scale: x2 for a Blu-ray (1080p), x4 for a 4K Blu-ray (2160p)
+PRETRAINED_URLS = {2: PRETRAINED_URL,
+                   4: "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"}
 
 
 # =============================== live progress: a page and a console line ===============================
@@ -1261,7 +1271,8 @@ def upscaler_settings(a, work):
     (the same movie keeps them, so resumed pairs are made the same way). None if it can't be asked."""
     saved = Path(work) / "upscaler.json"
     dvd = Path(a.dvd)
-    key = dict(dvd=dvd.name, folder=dvd.resolve().parent.name.lower(), size=dvd.stat().st_size, type=a.type, dar=a.dar)
+    key = dict(dvd=dvd.name, folder=dvd.resolve().parent.name.lower(), size=dvd.stat().st_size, type=a.type, dar=a.dar,
+               **({"scale": a.scale} if getattr(a, "scale", None) == 4 else {}))
     try:
         old = json.loads(saved.read_text(encoding="utf-8"))
         if old.get("key") == key and old.get("filters"):
@@ -1273,8 +1284,9 @@ def upscaler_settings(a, work):
         return None
     report = Path(work) / "upscaler_report.json"
     report.unlink(missing_ok=True)
-    # (--trained: the frame sizes it uses with the 2x model trained here, e.g. a tape's, not a 4x model's)
-    cmd = [sys.executable, str(up), str(dvd), "--analyze", "--trained", "--work", str(Path(work) / "upscaler_check")]
+    # (--trained --scale: the frame sizes it uses with the model trained here, x2 or x4: a tape's differ)
+    cmd = [sys.executable, str(up), str(dvd), "--analyze", "--trained", "--scale", str(getattr(a, "scale", None) or 2),
+           "--work", str(Path(work) / "upscaler_check")]
     cmd += (["--type", a.type] if a.type != "auto" else []) + (["--dar", a.dar] if a.dar else [])
     say(f"asking {up.name} what this movie is and how it prepares its frames (--analyze, a minute or two)...")
     r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",
@@ -1330,8 +1342,10 @@ def setup_kind(a, work, need_filters):
         say(f"movie type: {TYPE_NAMES.get(a.kind, a.kind)} ({how})")
 
 
-def model_name(a, kind):
-    return a.name or (f"ai-{kind}-x2" if kind else "upscale-training-x2")
+def model_name(a, kind, scale=None):
+    """ai-<kind>-x2 (Blu-ray) or ai-<kind>-x4 (4K Blu-ray), or --name."""
+    S = scale or getattr(a, "scale", None) or 2
+    return a.name or (f"ai-{kind}-x{S}" if kind else f"upscale-training-x{S}")
 
 
 # =============================== step 1: the DVD / Blu-ray pairs ===============================
@@ -1408,10 +1422,11 @@ def read_frames(cmd, w, h, channels):
     return np.frombuffer(raw[:n * w * h * channels], np.uint8).reshape(n, h, w, channels) if n else None
 
 
-def thumbs(path, t0, secs, rate, vf):
-    """Tiny grey frames: `rate` per second, or every frame when rate is None."""
+def thumbs(path, t0, secs, rate, vf, tone=()):
+    """Tiny grey frames: `rate` per second, or every frame when rate is None (tone: an HDR disc's tone mapping)."""
     cmd = ["ffmpeg", "-v", "error", "-ss", f"{max(t0, 0):.3f}", "-t", f"{secs:.3f}", "-i", str(path),
-           "-vf", ",".join(vf + ([f"fps={rate}"] if rate else []) + [f"scale={THUMB[0]}:{THUMB[1]}:flags=area", "format=gray"]),
+           "-vf", ",".join(vf + ([f"fps={rate}"] if rate else []) + [f"scale={THUMB[0]}:{THUMB[1]}:flags=area"]
+                           + list(tone) + ["format=gray"]),
            "-fps_mode", "passthrough", "-f", "rawvideo", "-"]
     return read_frames(cmd, THUMB[0], THUMB[1], 1)
 
@@ -1426,7 +1441,7 @@ def anchor_offset(a, t, guess, span, dvd_pre, bd_pre, win=30, rate=2):
     """Blu-ray time minus DVD-time*speed around DVD time t, and how well the thumbnails match."""
     d = thumbs(a.dvd, t, win, rate, dvd_pre)
     start = max(t * a.speed + guess - span, 0)
-    b = thumbs(a.bluray, start, win * a.speed + 2 * span, rate, bd_pre)
+    b = thumbs(a.bluray, start, win * a.speed + 2 * span, rate, bd_pre, a.bd_tone)
     if d is None or b is None or len(b) < len(d):
         return None, 0.0
     nd, nb = norm(d), norm(b)
@@ -1503,6 +1518,25 @@ def low_freq_match(hr, lr, sigma=24):
     return np.clip(hr_f + diff, 0, 255).astype(np.uint8)
 
 
+def hdr_tone(path):
+    """The filters that turn an HDR disc (4K Blu-rays: PQ, BT.2020; HLG) into an SDR BT.709 picture like the DVD's
+    (zscale + Hable tone mapping; the DVD's own colour grade is matched afterwards, see low_freq_match); []
+    for an SDR disc."""
+    out = run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+               "stream=color_transfer,color_primaries,color_space", "-of", "default=nw=1", str(path)])
+    tags = dict(line.split("=", 1) for line in out.splitlines() if "=" in line)
+    trc = tags.get("color_transfer", "")
+    if trc not in ("smpte2084", "arib-std-b67"):
+        return []
+    if "zscale" not in run(["ffmpeg", "-hide_banner", "-filters"]):
+        sys.exit(f"{Path(path).name} is HDR ({'HDR10/PQ' if trc == 'smpte2084' else 'HLG'}): turning it into normal "
+                 "colour needs an ffmpeg with zscale (libzimg), e.g. the gyan.dev or BtbN builds")
+    prim = tags.get("color_primaries") if tags.get("color_primaries", "unknown") != "unknown" else "bt2020"
+    mat = tags.get("color_space") if tags.get("color_space", "unknown") != "unknown" else "bt2020nc"
+    return [f"zscale=tin={trc}:pin={prim}:min={mat}:rin=tv:t=linear:npl=100", "format=gbrpf32le",
+            "zscale=p=bt709", "tonemap=tonemap=hable:desat=0", "zscale=t=bt709:m=bt709:r=tv", "format=yuv420p"]
+
+
 def make_pair(a, dvd_t, dvd_crop, bd_crop, dvd_pre, lrw, lrh, anchors, bd_fps):
     """-> (lr, hr, info) or (None, None, reason)."""
     c = lambda cr: [f"crop={cr[0]}:{cr[1]}:{cr[2]}:{cr[3]}"] if cr else []
@@ -1529,7 +1563,7 @@ def make_pair(a, dvd_t, dvd_crop, bd_crop, dvd_pre, lrw, lrh, anchors, bd_fps):
     best = None
     for off in offset_candidates(anchors, dvd_t):
         ss = max(dvd_t * a.speed + off - a.window, 0)
-        th = thumbs(a.bluray, ss, 2 * a.window, None, c(bd_crop))
+        th = thumbs(a.bluray, ss, 2 * a.window, None, c(bd_crop), a.bd_tone)
         if th is None:
             continue
         sc = (norm(th) @ dthumb.T)[:, 0]
@@ -1541,9 +1575,11 @@ def make_pair(a, dvd_t, dvd_crop, bd_crop, dvd_pre, lrw, lrh, anchors, bd_fps):
     if best is None or best[0] < a.min_thumb:
         return None, None, "thumb"
     _, ss, k = best
+    S = a.scale                                     # (the Blu-ray frame at 2x the DVD's size, or 4x from a 4K disc)
     hr = read_frames(["ffmpeg", "-v", "error", "-ss", f"{ss:.3f}", "-t", f"{2 * a.window:.3f}", "-i", str(a.bluray),
-                      "-vf", ",".join(c(bd_crop) + [f"select=eq(n\\,{k})", f"scale={2 * lrw}:{2 * lrh}:flags=lanczos", "format=bgr24"]),
-                      "-fps_mode", "passthrough", "-frames:v", "1", "-f", "rawvideo", "-"], 2 * lrw, 2 * lrh, 3)
+                      "-vf", ",".join(c(bd_crop) + [f"select=eq(n\\,{k})", f"scale={S * lrw}:{S * lrh}:flags=lanczos"]
+                                      + a.bd_tone + ["format=bgr24"]),
+                      "-fps_mode", "passthrough", "-frames:v", "1", "-f", "rawvideo", "-"], S * lrw, S * lrh, 3)
     if hr is None:
         return None, None, "no blu-ray frame"
     hr = hr[0]
@@ -1553,8 +1589,8 @@ def make_pair(a, dvd_t, dvd_crop, bd_crop, dvd_pre, lrw, lrh, anchors, bd_fps):
         return None, None, f"ecc {cc:.2f}"
     if np.abs(warp[:, :2] - np.eye(2)).max() > a.max_warp:
         return None, None, "warp too large"
-    # (translation of the warp is in LR pixels: x2 for the HR image; the 2x2 part is unchanged)
-    hr = cv2.warpAffine(hr, warp * np.array([[1, 1, 2], [1, 1, 2]], np.float32), (2 * lrw, 2 * lrh),
+    # (translation of the warp is in LR pixels: x2 (x4) for the HR image; the 2x2 part is unchanged)
+    hr = cv2.warpAffine(hr, warp * np.array([[1, 1, S], [1, 1, S]], np.float32), (S * lrw, S * lrh),
                         flags=cv2.INTER_LANCZOS4 + cv2.WARP_INVERSE_MAP, borderMode=cv2.BORDER_REFLECT)
     if a.color_match == "low":
         hr = low_freq_match(hr, lr)
@@ -1592,6 +1628,10 @@ def stage_pairs(a, out):
             for r in csv.DictReader(fh):
                 done_times.add(round(float(r["t_dvd"]), 3))
                 have = max(have, int(r["name"]))
+    a.scale = a.scale or bluray_scale(a.bluray)
+    if have and pairs_scale(out) and pairs_scale(out) != a.scale:
+        sys.exit(f"the pairs in {out} are x{pairs_scale(out)} (from a {'4K ' if pairs_scale(out) == 4 else ''}Blu-ray), "
+                 f"these would be x{a.scale}: run with --fresh to make them again, or use another --work")
     dw, dh, dsar, ddur, _ = probe(a.dvd)
     dvd_pre = dvd_chain(a, dw, dh, dsar)
     # the DVD frames of the pairs already made must have been prepared the same way as the new ones
@@ -1615,13 +1655,17 @@ def stage_pairs(a, out):
             say(f"already {have} pairs, which is --count {a.count} or more: nothing to do")
             return True
     bw, bh, _, bdur, bd_fps = probe(a.bluray)
-    print(f"DVD {dw}x{dh} sar {dsar}, {ddur / 60:.1f} min;  Blu-ray {bw}x{bh}, {bdur / 60:.1f} min")
+    a.bd_tone = hdr_tone(a.bluray)
+    print(f"DVD {dw}x{dh} sar {dsar}, {ddur / 60:.1f} min;  Blu-ray {bw}x{bh}, {bdur / 60:.1f} min"
+          + ("; HDR, turned into normal colour (tone mapped) for the pairs" if a.bd_tone else "")
+          + f";  pairs at x{a.scale} (the {'4K ' if a.scale == 4 else ''}Blu-ray frame {a.scale}x the DVD's size)")
     # the picture areas and the offsets between the discs are measured once (minutes) and kept for a
     # resumed run, as long as it's the same two files with the same settings
     measured_file = out / "measured.json"
     key = dict(dvd=Path(a.dvd).name, dvd_size=Path(a.dvd).stat().st_size, bd=Path(a.bluray).name,
                bd_size=Path(a.bluray).stat().st_size, filters=dvd_pre, speed=a.speed, offset=a.offset, skip=a.skip,
-               search=a.search, anchor_every=a.anchor_every, min_anchor=a.min_anchor)
+               search=a.search, anchor_every=a.anchor_every, min_anchor=a.min_anchor,
+               **({"tone": a.bd_tone} if a.bd_tone else {}))
     try:
         measured = json.loads(measured_file.read_text(encoding="utf-8"))
         if measured.get("key") != key:
@@ -1644,7 +1688,7 @@ def stage_pairs(a, out):
               "(a re-framed transfer: pairs will be rejected or distorted)")
     lrw -= lrw % 2
     lrh -= lrh % 2
-    check_disk(out, int((a.count - have) * lrw * lrh * 3 * 5 * 0.55 * 1.2), f"{a.count} pairs")
+    check_disk(out, int((a.count - have) * lrw * lrh * 3 * (1 + a.scale ** 2) * 0.55 * 1.2), f"{a.count} pairs")
 
     cropped_bd_pre = ([f"crop={bd_crop[0]}:{bd_crop[1]}:{bd_crop[2]}:{bd_crop[3]}"] if bd_crop else [])
     cropped_dvd_pre = dvd_pre + [f"crop={dvd_crop[0]}:{dvd_crop[1]}:{dvd_crop[2]}:{dvd_crop[3]}"]
@@ -1673,7 +1717,7 @@ def stage_pairs(a, out):
     rejected_file = out / "rejected.txt"
     tried = set(done_times)
     # (a verdict is only valid for the settings and filters it was made with: the first line records them)
-    rej_key = json.dumps(dict(filters=dvd_pre, min_thumb=a.min_thumb, min_ecc=a.min_ecc, min_ncc=a.min_ncc,
+    rej_key = json.dumps(dict(filters=dvd_pre, scale=a.scale, tone=a.bd_tone, min_thumb=a.min_thumb, min_ecc=a.min_ecc, min_ncc=a.min_ncc,
                               max_warp=a.max_warp, window=a.window, speed=a.speed, color_match=a.color_match),
                          sort_keys=True)
     same_rej = False
@@ -1789,9 +1833,13 @@ class RRDB(nn.Module):
 
 
 class RRDBNetX2(nn.Module):
-    def __init__(s, nf=64, nb=23, gc=32):
+    """Real-ESRGAN's RRDBNet: x2plus (scale 2: the picture is folded into 12 channels at half size first) or
+    x4plus (scale 4: the same network on the picture as it is). Both end with two 2x enlargements."""
+
+    def __init__(s, nf=64, nb=23, gc=32, scale=2):
         super().__init__()
-        s.conv_first = nn.Conv2d(3 * 4, nf, 3, 1, 1)
+        s.scale = scale
+        s.conv_first = nn.Conv2d(3 * 4 if scale == 2 else 3, nf, 3, 1, 1)
         s.body = nn.Sequential(*[RRDB(nf, gc) for _ in range(nb)])
         s.conv_body = nn.Conv2d(nf, nf, 3, 1, 1); s.conv_up1 = nn.Conv2d(nf, nf, 3, 1, 1)
         s.conv_up2 = nn.Conv2d(nf, nf, 3, 1, 1); s.conv_hr = nn.Conv2d(nf, nf, 3, 1, 1)
@@ -1799,7 +1847,7 @@ class RRDBNetX2(nn.Module):
         s.use_checkpoint = False
 
     def forward(s, x):
-        feat = s.conv_first(F.pixel_unshuffle(x, 2))
+        feat = s.conv_first(F.pixel_unshuffle(x, 2) if s.scale == 2 else x)
         body = feat
         for blk in s.body:
             body = checkpoint(blk, body, use_reentrant=False) if s.use_checkpoint and s.training else blk(body)
@@ -1810,37 +1858,39 @@ class RRDBNetX2(nn.Module):
 
 
 class SRVGGNetCompactX2(nn.Module):
-    """Real-ESRGAN's small, fast 'compact' network (realesr-animevideov3 / general-x4v3 style) as a 2x:
+    """Real-ESRGAN's small, fast 'compact' network (realesr-animevideov3 / general-x4v3 style) as a 2x (or 4x):
     plain convs + PReLU, a pixel-shuffle at the end and a nearest-neighbour copy of the input added back.
-    Several times faster than RRDBNetX2, but there is no 2x starting model: it trains from random."""
+    Several times faster than RRDBNetX2, but there is no starting model: it trains from random."""
 
-    def __init__(s, nf=64, nconv=16):
+    def __init__(s, nf=64, nconv=16, scale=2):
         super().__init__()
+        s.scale = scale
         s.body = nn.ModuleList([nn.Conv2d(3, nf, 3, 1, 1), nn.PReLU(num_parameters=nf)])
         for _ in range(nconv):
             s.body += [nn.Conv2d(nf, nf, 3, 1, 1), nn.PReLU(num_parameters=nf)]
-        s.body.append(nn.Conv2d(nf, 3 * 4, 3, 1, 1))
+        s.body.append(nn.Conv2d(nf, 3 * scale * scale, 3, 1, 1))
         s.use_checkpoint = False                          # (kept so both networks take the same switch)
 
     def forward(s, x):
         out = x
         for layer in s.body:
             out = layer(out)
-        return F.pixel_shuffle(out, 2) + F.interpolate(x, scale_factor=2, mode="nearest")
+        return F.pixel_shuffle(out, s.scale) + F.interpolate(x, scale_factor=s.scale, mode="nearest")
 
 
 def arch_of(sd):
-    """('rrdb', {}) or ('compact', {nf, nconv}) from the names in a state dict."""
+    """('rrdb', {scale}) or ('compact', {nf, nconv, scale}) from the names and shapes in a state dict."""
     if "conv_first.weight" in sd:
-        return "rrdb", {}
+        return "rrdb", dict(scale=2 if sd["conv_first.weight"].shape[1] == 12 else 4)
     if "body.0.weight" in sd:
         last = max(int(k.split(".")[1]) for k in sd if k.startswith("body.") and k.endswith(".weight"))
-        return "compact", dict(nf=sd["body.0.weight"].shape[0], nconv=(last - 2) // 2)
+        return "compact", dict(nf=sd["body.0.weight"].shape[0], nconv=(last - 2) // 2,
+                               scale=round(math.sqrt(sd[f"body.{last}.weight"].shape[0] / 3)))
     raise ValueError("unknown network: neither RRDBNetX2 nor SRVGGNetCompactX2 weights")
 
 
-def make_net(arch, nf=64, nconv=16):
-    return SRVGGNetCompactX2(nf, nconv) if arch == "compact" else RRDBNetX2()
+def make_net(arch, nf=64, nconv=16, scale=2):
+    return SRVGGNetCompactX2(nf, nconv, scale) if arch == "compact" else RRDBNetX2(scale=scale)
 
 
 def load_weights(net, path):
@@ -1853,8 +1903,8 @@ class Pairs(torch.utils.data.Dataset):
     """Each item: `crops` random patches of one random pair -> (lr [n,3,p,p], hr [n,3,2p,2p]).
     items: (pairs folder, name), from one movie or several."""
 
-    def __init__(s, items, patch, crops, rotate=False, min_match=0.0, focus=(), focus_share=0.5):
-        s.items, s.p, s.n, s.rotate, s.min_match = items, patch, crops, rotate, min_match
+    def __init__(s, items, patch, crops, rotate=False, min_match=0.0, focus=(), focus_share=0.5, scale=2):
+        s.items, s.p, s.n, s.rotate, s.min_match, s.scale = items, patch, crops, rotate, min_match, scale
         # (focus: the new movies' pairs, drawn `focus_share` of the time, the rest from all of them: among many
         #  movies a new one would otherwise get only its small share of the steps and hardly be learned)
         s.focus = list(focus) if focus and len(focus) < len(items) * focus_share else []
@@ -1868,15 +1918,16 @@ class Pairs(torch.utils.data.Dataset):
             root, name = random.choice(s.focus if s.focus and random.random() < s.focus_share else s.items)
             lr = cv2.imread(str(Path(root) / "lr" / f"{name}.png"))
             hr = cv2.imread(str(Path(root) / "hr" / f"{name}.png"))
-            if lr is not None and hr is not None and hr.shape[0] == 2 * lr.shape[0] and hr.shape[1] == 2 * lr.shape[1]:
+            if lr is not None and hr is not None and hr.shape[0] == s.scale * lr.shape[0] \
+                    and hr.shape[1] == s.scale * lr.shape[1]:
                 break
         else:
             raise RuntimeError(f"can't read a valid pair from {root} (10 tries)")
         h, w = lr.shape[:2]
-        p, lrs, hrs = s.p, [], []
+        p, lrs, hrs, S = s.p, [], [], s.scale
         for _ in range(s.n):
             y, x = pick_spot(lr, hr, p, s.min_match)
-            a, b = lr[y:y + p, x:x + p], hr[2 * y:2 * (y + p), 2 * x:2 * (x + p)]
+            a, b = lr[y:y + p, x:x + p], hr[S * y:S * (y + p), S * x:S * (x + p)]
             # flips are safe. 90-degree turns are off by default: a DVD is stretched sideways (anamorphic),
             # so its blur and artifacts have a direction the model should learn the right way round (--rotate)
             if random.random() < 0.5:
@@ -1908,13 +1959,14 @@ def pick_spot(lr, hr, p, min_match, want=3, tries=8):
     pairs step while someone in it moved between the two frames), the one with the most going on.
     min_match 0 skips the check; if no spot lines up, the best-matching one is used."""
     h, w = lr.shape[:2]
+    S = hr.shape[0] // h                    # (2 or 4: the Blu-ray frame's size against the DVD's)
     good, fallback = [], None
     for _ in range(tries if min_match > 0 else want):
         y, x = random.randint(0, h - p), random.randint(0, w - p)
         a = lr[y:y + p, x:x + p]
         v = float(a.std())
         if min_match > 0:
-            m = patch_match(a, hr[2 * y:2 * (y + p), 2 * x:2 * (x + p)])
+            m = patch_match(a, hr[S * y:S * (y + p), S * x:S * (x + p)])
             if fallback is None or m > fallback[0]:
                 fallback = (m, y, x)
             if m < min_match:
@@ -1928,6 +1980,27 @@ def pick_spot(lr, hr, p, min_match, want=3, tries=8):
     return y, x
 
 
+def pairs_scale(root):
+    """2 or 4: how much bigger the Blu-ray frames of a pairs folder are than its DVD frames (from its first
+    pair); None when it has no readable pair."""
+    root = Path(root)
+    for f in sorted((root / "lr").glob("*.png"))[:5]:
+        lr, hr = png_dims(f), png_dims(root / "hr" / f.name)
+        if lr and hr and lr[1] and hr[1] % lr[1] == 0:
+            return hr[1] // lr[1]
+    return None
+
+
+def png_dims(path):
+    """(width, height) from a PNG's header (no decoding: the 4K frames are large); None if unreadable."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(24)
+        return struct.unpack(">II", head[16:24]) if head[:8] == b"\x89PNG\r\n\x1a\n" else None
+    except OSError:
+        return None
+
+
 def collate(items):
     return torch.cat([i[0] for i in items]), torch.cat([i[1] for i in items])
 
@@ -1936,10 +2009,11 @@ def load_frame(root, name, crop):
     lr = cv2.imread(str(Path(root) / "lr" / f"{name}.png"))
     hr = cv2.imread(str(Path(root) / "hr" / f"{name}.png"))
     h, w = lr.shape[:2]
+    S = hr.shape[0] // h
     c = min(crop, h - h % 2, w - w % 2)
     y, x = (h - c) // 2, (w - c) // 2
     t = lambda im: torch.from_numpy(np.ascontiguousarray(im[..., ::-1])).permute(2, 0, 1).float()[None] / 255
-    return t(lr[y:y + c, x:x + c]), t(hr[2 * y:2 * (y + c), 2 * x:2 * (x + c)])
+    return t(lr[y:y + c, x:x + c]), t(hr[S * y:S * (y + c), S * x:S * (x + c)])
 
 
 # ---- losses ----
@@ -2069,7 +2143,7 @@ def eval_plain(dev, items, crop, lp=None):
     rows = []
     for root, n in items:
         lr, hr = load_frame(root, n, crop)
-        up = F.interpolate(lr.to(dev), scale_factor=2, mode="bicubic", align_corners=False)
+        up = F.interpolate(lr.to(dev), scale_factor=hr.shape[-1] // lr.shape[-1], mode="bicubic", align_corners=False)
         rows.append(scores(up, hr.to(dev), lp))
     return mean_scores(rows)
 
@@ -2137,10 +2211,17 @@ def stage_train(a, roots, out):
     """Step 2: fine-tune on the pairs in the folders `roots` (one movie's, or several movies' of one kind).
     Carries on from out/train_state.pt. True when finished, False when stopped with Ctrl+C."""
     prog, live = PROG, LIVE
-    if a.pretrained != "none" and not Path(a.pretrained).exists():
-        raise SystemExit(f"starting model not found: {a.pretrained}\nDownload RealESRGAN_x2plus.pth from\n"
-                         f"{PRETRAINED_URL}\n"
-                         "and put it in the training folder (or pass its path with --pretrained).")
+    # the pairs' scale (Blu-ray: x2, 4K Blu-ray: x4) decides the network and its starting model
+    scales = {pairs_scale(r) for r in roots} - {None}
+    if len(scales) > 1:
+        raise SystemExit("these pairs folders mix Blu-ray (x2) and 4K Blu-ray (x4) pairs: train them separately")
+    S = scales.pop() if scales else (a.scale or 2)
+    if a.scale and a.scale != S:
+        raise SystemExit(f"--scale {a.scale}, but the pairs are x{S} (made from a {'4K ' if S == 4 else ''}Blu-ray)")
+    a.scale = S
+    set_pretrained(a, S)
+    if pretrained_missing(a, S):
+        raise SystemExit(pretrained_missing(a, S))
     ids = pick_gpus(a.gpus)
     dev = torch.device(f"cuda:{ids[0]}") if ids else torch.device("cpu")
     if ids:
@@ -2188,9 +2269,13 @@ def stage_train(a, roots, out):
         torch.backends.cudnn.benchmark = True            # (every step has the same shape: the fastest kernels are picked once)
     if a.gan > 0 and a.disc == "unet" and a.patch % 4:
         raise SystemExit(f"--patch {a.patch}: the U-Net discriminator needs a multiple of 4 (or use --disc patch)")
-    net = make_net(a.arch, a.compact_feat, a.compact_convs).to(dev)
+    net = make_net(a.arch, a.compact_feat, a.compact_convs, S).to(dev)
     if a.pretrained != "none":
-        load_weights(net, a.pretrained)
+        try:
+            load_weights(net, a.pretrained)
+        except RuntimeError:
+            raise SystemExit(f"{a.pretrained} isn't an x{S} {a.arch} model: these pairs need RealESRGAN_x{S}plus.pth "
+                             f"({PRETRAINED_URLS[S]})") from None
     elif a.arch == "compact":
         print("note: the compact network has no 2x starting model, so it learns from zero: it needs far more "
               "steps than the default (try --iters 100000 or more) and more pairs (--count 6000+)")
@@ -2231,6 +2316,9 @@ def stage_train(a, roots, out):
     check_disk(out, int(10 * 4 * sum(q.numel() for q in net.parameters()) * 1.2), "the saved training (and its backup)")
     if state_path.exists() or state_path.with_name(state_path.name + ".prev").exists():
         st, used = load_state(state_path, dev)
+        if st.get("scale", 2) != S:
+            raise SystemExit(f"{state_path} is an x{st.get('scale', 2)} training, but these pairs are x{S}: use another "
+                             "--work folder")
         if st.get("arch", "rrdb") != a.arch:
             raise SystemExit(f"{state_path} is a '{st.get('arch', 'rrdb')}' training, not '{a.arch}': "
                              "use --arch to match it, or another --work folder for the new network")
@@ -2264,7 +2352,7 @@ def stage_train(a, roots, out):
         prog.set(step=step, phase="training")
 
     per = max(1, a.crops)
-    ds = Pairs(train, a.patch, per, a.rotate, a.min_patch_match, focus)
+    ds = Pairs(train, a.patch, per, a.rotate, a.min_patch_match, focus, scale=S)
     workers = a.train_workers * max(1, len(ids))              # (more GPUs eat data faster)
     def make_loader():
         return torch.utils.data.DataLoader(ds, batch_size=max(1, a.batch // per), num_workers=workers,
@@ -2277,7 +2365,7 @@ def stage_train(a, roots, out):
     def save_state():
         save_durably({"params_ema": ema.state_dict()}, out / "upscale_training_latest.pth")
         save_durably({"net": net.state_dict(), "ema": ema.state_dict(), "opt": opt.state_dict(),
-                      "step": step, "best": best, "scaler": scaler.state_dict(), "arch": a.arch, "split": split_id,
+                      "step": step, "best": best, "scaler": scaler.state_dict(), "arch": a.arch, "scale": S, "split": split_id,
                       **({"disc": disc.state_dict(), "d_opt": d_opt.state_dict()} if disc else {})}, state_path, keep_prev=True)
 
     it = iter(dl)
@@ -2487,8 +2575,8 @@ def export_ncnn(pth_file, dest_dir, model_name):
     def add(name, a, b, outp):
         ops.append(["BinaryOp", name, [a, b], [outp], "0=0"])
 
-    def up2(name, inp, outp):
-        ops.append(["Interp", name, [inp], [outp], "0=1 1=2.000000e+00 2=2.000000e+00"])
+    def up2(name, inp, outp, f=2):
+        ops.append(["Interp", name, [inp], [outp], f"0=1 1={f:e} 2={f:e}"])
 
     if arch == "compact":
         # conv + PReLU ..., conv to 12 channels, PixelShuffle, plus the input enlarged by nearest-neighbour
@@ -2504,20 +2592,23 @@ def export_ncnn(pth_file, dest_dir, model_name):
             prelu(f"prelu{i}", f"c{i}", f"p{i}", f"body.{i + 1}")
             x = f"p{i}"
         conv(f"conv{last}", x, "c_last", f"body.{last}")
-        ops.append(["PixelShuffle", "shuffle", ["c_last"], ["shuffled"], "0=2"])
-        up2("base", "data", "base_up")
+        ops.append(["PixelShuffle", "shuffle", ["c_last"], ["shuffled"], f"0={kw['scale']}"])
+        up2("base", "data", "base_up", kw["scale"])
         add("sum", "shuffled", "base_up", "output")
         return finish_ncnn(ops, binbuf, dest_dir, model_name)
 
-    # first conv folded: W6[o, c, 2*ky+i, 2*kx+j] = W3[o, c*4 + i*2 + j, ky, kx]
-    w3 = sd["conv_first.weight"]
-    w6 = torch.zeros(w3.shape[0], 3, 6, 6)
-    for c in range(3):
-        for i in range(2):
-            for j in range(2):
-                w6[:, c, i::2, j::2] = w3[:, c * 4 + i * 2 + j]
     ops.append(["Input", "data", [], ["data"], ""])
-    conv("conv_first", "data", "feat", "conv_first", k=6, s=2, p=2, w=w6)
+    if kw["scale"] == 2:
+        # first conv folded: W6[o, c, 2*ky+i, 2*kx+j] = W3[o, c*4 + i*2 + j, ky, kx]
+        w3 = sd["conv_first.weight"]
+        w6 = torch.zeros(w3.shape[0], 3, 6, 6)
+        for c in range(3):
+            for i in range(2):
+                for j in range(2):
+                    w6[:, c, i::2, j::2] = w3[:, c * 4 + i * 2 + j]
+        conv("conv_first", "data", "feat", "conv_first", k=6, s=2, p=2, w=w6)
+    else:
+        conv("conv_first", "data", "feat", "conv_first")          # (x4plus: on the picture as it is)
 
     x = "feat"
     for n in range(23):
@@ -2601,6 +2692,44 @@ def find_pretrained(name="RealESRGAN_x2plus.pth"):
     return here / name
 
 
+def set_pretrained(a, scale):
+    """--pretrained as given, else the starting model for this scale (RealESRGAN_x2plus.pth or
+    RealESRGAN_x4plus.pth, found as find_pretrained looks), none for the compact network."""
+    if not getattr(a, "pretrained_given", False):
+        a.pretrained = str(find_pretrained(f"RealESRGAN_x{scale}plus.pth")) if a.arch == "rrdb" else "none"
+
+
+def pretrained_missing(a, scale):
+    """The message for a starting model that isn't there (None when it is, or none is needed)."""
+    if a.pretrained == "none" or Path(a.pretrained).exists():
+        return None
+    return (f"starting model not found: {a.pretrained}\n(also looked in a Training folder next to this script and in "
+            f"the models folder)\nDownload RealESRGAN_x{scale}plus.pth from\n{PRETRAINED_URLS[scale]}\nand put it in the "
+            "same folder as upscale_training.py (or pass its path with --pretrained).")
+
+
+def bluray_scale(path):
+    """4 for a 4K Blu-ray (2160 lines; the x4 model), else 2."""
+    try:
+        w, h = probe(path)[:2]
+    except (SystemExit, KeyError, IndexError, ValueError):
+        return 2
+    return 4 if h >= 1600 or w >= 3000 else 2
+
+
+def planned_scale(a, roots, stages):
+    """The scale a run works at: --scale, else from the Blu-ray (making pairs), else from the pairs there."""
+    if a.scale:
+        return a.scale
+    if "pairs" in stages and a.bluray and Path(a.bluray).exists():
+        return bluray_scale(a.bluray)
+    for r in roots:
+        got = pairs_scale(r)
+        if got:
+            return got
+    return 2
+
+
 def find_models_dir():
     """The models folder next to realesrgan-ncnn-vulkan, looked for from here upwards."""
     here = Path(__file__).resolve().parent
@@ -2656,6 +2785,8 @@ def stage_export(a, run_dir, work, roots=()):
     if not pth.exists():
         say(f"no trained model in {run_dir}: run the train step first")
         return False
+    a.scale = arch_of((lambda sd: sd.get("params_ema", sd.get("params", sd)))(
+        torch.load(pth, map_location="cpu", weights_only=True)))[1]["scale"]       # (x2 or x4: names the model)
     models = Path(a.models) if a.models else find_models_dir()
     if models is None:
         models = work / "models"
@@ -2709,13 +2840,132 @@ def stage_export(a, run_dir, work, roots=()):
     return True
 
 
+# =============================== --mix: a trained model mixed with x2plus ===============================
+def mix_weights(trained, base, share):
+    """The two networks' weights mixed: `share` of the trained one, the rest of the starting model (Real-ESRGAN's
+    network interpolation). Both must be the same network (rrdb: x2plus and what was trained from it)."""
+    out = {}
+    for k, t in trained.items():
+        b = base[k]
+        out[k] = (share * t.float() + (1 - share) * b.float()).to(t.dtype) if t.is_floating_point() else t
+    return out
+
+
+def mix_roots(a):
+    """The pairs folders whose held-out frames judge the mixes: --pairs-from, else the movies the training in --work
+    learned from (an --all / --queue model's folder, or a single movie's), [] if none is known."""
+    if a.pairs_from:
+        return [Path(d) for d in a.pairs_from]
+    if a.work:
+        w = Path(a.work)
+        for f in ("movies.json", "accepted.json"):
+            try:
+                dirs = [Path(d) for d in json.loads((w / f).read_text(encoding="utf-8"))]
+                if dirs:
+                    return [d for d in dirs if (d / "lr").is_dir()]
+            except (OSError, ValueError, TypeError):
+                pass
+        if (w / "pairs" / "lr").is_dir():
+            return [w / "pairs"]
+    return []
+
+
+def mix_main(a):
+    """--mix 0.5 0.7 ...: the trained model (--mix-from, else ai-<type>-x2.pth in the models folder) mixed with
+    the starting model at each share, each written as <name>-mixNN (.param/.bin for the upscaler, .pth), and all of
+    them scored on held-out frames (--pairs-from or --work), with the trained and the starting model for comparison."""
+    shares = sorted(set(a.mix))
+    if any(not 0 < x < 1 for x in shares):
+        sys.exit("--mix: shares of the trained model between 0 and 1, e.g. --mix 0.5 0.7 0.9 (1 is the trained model "
+                 "itself, 0 the starting model)")
+    models = Path(a.models) if a.models else find_models_dir()
+    if a.mix_from:
+        src = Path(a.mix_from)
+        name = a.name or src.stem
+    else:
+        if a.type == "auto" and not a.name:
+            sys.exit("--mix: which model? --type anime/cgi/live/vhs (for ai-<type>-x2, or x4 with --scale 4), --name, "
+                     "or --mix-from FILE.pth")
+        if models is None:
+            sys.exit("--mix: the upscaler's models folder wasn't found next to realesrgan-ncnn-vulkan: pass --models")
+        # (--scale picks x2 or x4; without it the x2 model, else the x4 one if only that is there)
+        names = [model_name(a, a.type, S) for S in ([a.scale] if a.scale else [2, 4])]
+        name = next((n for n in names if (models / f"{n}.pth").is_file()), names[0])
+        src = models / f"{name}.pth"
+    if not src.is_file():
+        sys.exit(f"--mix: {src} not found (upscale_training.py keeps each model's .pth next to its .param/.bin; "
+                 "or pass --mix-from with the trained .pth, e.g. run\\upscale_training_best.pth)")
+    if models is None:
+        models = src.parent
+    load = lambda f: (lambda sd: sd.get("params_ema", sd.get("params", sd)))(torch.load(f, map_location="cpu", weights_only=True))
+    trained = load(src)
+    arch, kw = arch_of(trained)
+    S = kw["scale"]
+    set_pretrained(a, S)                        # (an x4 model mixes with x4plus)
+    if a.pretrained == "none" or not Path(a.pretrained).is_file():
+        sys.exit(f"--mix needs the starting model, RealESRGAN_x{S}plus.pth (looked for {a.pretrained}): download it "
+                 f"from {PRETRAINED_URLS[S]} and put it next to upscale_training.py, or pass --pretrained")
+    base = load(a.pretrained)
+    if arch != "rrdb" or arch_of(base) != (arch, kw) or trained.keys() != base.keys():
+        sys.exit("--mix works on models trained from x2plus (--arch rrdb, the default): a compact model is a different "
+                 "network and has nothing to mix with")
+    # (mixing only means something for a model fine-tuned from this starting model: its weights stay close to it.
+    #  Two unrelated networks averaged give noise)
+    t = torch.cat([v.float().flatten() for k, v in trained.items() if v.is_floating_point()])
+    b = torch.cat([base[k].float().flatten() for k, v in trained.items() if v.is_floating_point()])
+    same = float(F.cosine_similarity(t, b, dim=0))
+    if same < 0.9:
+        sys.exit(f"--mix: {src.name} wasn't trained from {Path(a.pretrained).name} (their weights match {same:.0%}; a "
+                 "model fine-tuned from it stays above 90%): mixed, they would give noise. Mix a model that started "
+                 "from this x2plus, or pass the --pretrained it started from.")
+    print(f"mixing {src.name} with {Path(a.pretrained).name}: " + ", ".join(f"{x:.0%}" for x in shares)
+          + " of the trained model", flush=True)
+    made = []
+    for x in shares:
+        mix = f"{name}-mix{round(x * 100)}"
+        pth = models / f"{mix}.pth"
+        save_durably({"params_ema": mix_weights(trained, base, x)}, pth)
+        n_layers, _ = export_ncnn(pth, models, mix)
+        made.append((x, mix, pth))
+        print(f"  wrote {models / mix}.param / .bin / .pth ({n_layers} layers)", flush=True)
+    roots = mix_roots(a)
+    val = held_out_items(roots)
+    pick = made[-1][1]                          # (the one to suggest: the best-scoring mix, else the largest share)
+    if not val:
+        print("not scored: no pairs to judge on (--pairs-from FOLDER, or --work with the training's folder)")
+    else:
+        dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        print(f"scoring on {len(val)} held-out frames of {len(roots)} movie{'s' * (len(roots) > 1)} "
+              f"(frames none of them trained on)...", flush=True)
+        rows = [(0.0, f"x{S}plus (starting model)", Path(a.pretrained))] + made + [(1.0, f"{name} (trained)", src)]
+        scored = []
+        for x, label, pth in rows:
+            sd = load(pth)
+            net = make_net("rrdb", scale=S).to(dev)
+            net.load_state_dict(sd, strict=True)
+            r = eval_on(net, dev, val, a.val_crop)
+            scored.append((x, label, r))
+            print(f"  {x:4.0%}  {label:<28} {fmt_scores(r)}", flush=True)
+            del net
+        best = max(scored, key=lambda t: t[2]["psnr"])
+        print(f"highest PSNR: {best[1]}")
+        pick = max((t for t in scored if 0 < t[0] < 1), key=lambda t: t[2]["psnr"])[1]
+        print("NOTE: held-out minutes of the training's own movies favour the trained model; a mix is for movies it "
+              "never saw. Judge on one of those with --pairs-from (its pairs folder, made with --stages pairs).")
+    print(f"use one:  python dvd_upscale.py <movie> --model {pick} --scale {S}" + (" --height 2160" if S == 4 else ""))
+    return 0
+
+
 def upscale_command(a):
-    """--trained picks ai-<type>-x2 by the type dvd_upscale.py detects (the same detection as here)."""
+    """--trained picks ai-<type>-x2 (or with --scale 4, ai-<type>-x4) by the type dvd_upscale.py detects (the same
+    detection as here)."""
+    S = getattr(a, "scale", None) or 2
+    four = " --scale 4 --height 2160" if S == 4 else ""          # (an x4 model makes 4K: its picture is 4x the DVD's)
     if a.name:
-        return f"python dvd_upscale.py <movie> --model {a.name} --scale 2"
+        return f"python dvd_upscale.py <movie> --model {a.name} --scale {S}" + (" --height 2160" if S == 4 else "")
     kind = getattr(a, "kind", None)
-    return "python dvd_upscale.py <movie> --trained" + (f"   (it picks {model_name(a, kind)} for movies it detects "
-                                                         f"as {TYPE_NAMES[kind]})" if kind in TYPE_NAMES else "")
+    return f"python dvd_upscale.py <movie> --trained{four}" + (f"   (it picks {model_name(a, kind)} for movies it "
+                                                             f"detects as {TYPE_NAMES[kind]})" if kind in TYPE_NAMES else "")
 
 
 def analyze(a):
@@ -2747,7 +2997,8 @@ def pick_gpus(spec):
 def bench(a, devs, steps=12, warm=3):
     """Patches per second for training steps on random data across `devs` (one card, or several split)."""
     dev = devs[0]
-    net = make_net(a.arch, a.compact_feat, a.compact_convs).to(dev)
+    S = a.scale or 2
+    net = make_net(a.arch, a.compact_feat, a.compact_convs, S).to(dev)
     net.train()
     model = nn.DataParallel(net, device_ids=[d.index for d in devs]) if len(devs) > 1 else net
     batch = 8 * len(devs)                                       # (8 patches per card, so the cards are compared fairly)
@@ -2755,7 +3006,7 @@ def bench(a, devs, steps=12, warm=3):
     cuda = dev.type == "cuda"
     scaler = torch.amp.GradScaler(enabled=cuda)
     x = torch.rand(batch, 3, a.patch, a.patch)
-    y = torch.rand(batch, 3, 2 * a.patch, 2 * a.patch, device=dev)
+    y = torch.rand(batch, 3, S * a.patch, S * a.patch, device=dev)
     for i in range(steps):
         if i == warm:
             if cuda:
@@ -2844,7 +3095,8 @@ def batch_arg(v):
 # ai-anime-x2 from every anime... (training them one by one would leave only the last movie's model).
 # Each step runs as a run of this script of its own, so a failure is logged and the queue goes on.
 VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".wmv", ".mov"}
-NOT_IN_QUEUE = ("--dvd", "--bluray", "--work", "--stages", "--name", "--pairs-from", "--focus-from", "--analyze", "--gpu-test")
+NOT_IN_QUEUE = ("--dvd", "--bluray", "--work", "--stages", "--name", "--pairs-from", "--focus-from", "--analyze", "--gpu-test",
+                "--mix", "--mix-from")
 STEPS_PER_MOVIE = 10000         # (the queue's training steps: per movie for a new model, per new movie when it carries on)
 STOPPED_CODES = (130, -2, 3221225786)        # (Ctrl+C: our own exit code, a signal, Windows' STATUS_CONTROL_C_EXIT)
 
@@ -2913,6 +3165,22 @@ def find_movie_pairs(folder):
     return found, left
 
 
+_SCALES = {}
+
+
+def file_scale(path):
+    """bluray_scale, remembered per file (the queue's list is read again and again)."""
+    p = Path(path)
+    try:
+        st = p.stat()
+    except OSError:
+        return 2
+    key = (str(p.resolve()), st.st_size, st.st_mtime)
+    if key not in _SCALES:
+        _SCALES[key] = bluray_scale(p)
+    return _SCALES[key]
+
+
 class QueueMovie:
     def __init__(s, label, args, base, parser, extras):
         """args: this movie's own options (its queue line, or --dvd/--bluray found by --all)."""
@@ -2933,6 +3201,7 @@ class QueueMovie:
                 return
         s.dvd, s.work, s.solo, s.name = Path(a.dvd), default_work(a), a.name is not None, a.name   # (--name: a model of its own)
         s.bluray = Path(a.bluray)
+        s.scale = a.scale or file_scale(s.bluray)          # (x4 from a 4K Blu-ray: a model of its own, ai-<kind>-x4)
         s.count, s.given = a.count, (a.type if a.type != "auto" else None)
         own = type_from_place(a.dvd)              # (its folder, else its name's tag: wins over a --type for all)
         s.own = own
@@ -3050,11 +3319,11 @@ class QueueStatus(Progress):
                               f"{k or 'kind ?'} · {pairs}" + (" · own model" if m.solo else "")))
             if not m.solo and state != "failed":
                 if k:
-                    kinds.setdefault(k, []).append(str((m.work / "pairs").resolve()))
+                    kinds.setdefault((k, m.scale), []).append(str((m.work / "pairs").resolve()))
                 else:
                     unknown += 1
         for k in sorted(kinds):
-            name = f"ai-{k}-x2"
+            name = f"ai-{k[0]}-x{k[1]}"
             st = s.models.get(name, "")
             twork = s.base / f"{name}_training"
             try:                                  # (trained before on all these movies: nothing to do)
@@ -3209,22 +3478,24 @@ def overview(a, base, parser, extras):
         if m.solo:
             state += ", " + ("its own model: done" if finished(m.work) else "then its own model")
         elif k:
-            kinds.setdefault(k, []).append(m)
+            kinds.setdefault((k, m.scale), []).append(m)
         else:
             unknown += 1
-        print(f"  {n:>2}. {m.label:<{width}}  {(k or '?'):<6} ({why})  {state}")
+        print(f"  {n:>2}. {m.label:<{width}}  {(k or '?'):<6} ({why})  {state}"
+              + ("  (4K Blu-ray: x4 model)" if m.scale == 4 else ""))
     for label, why in left + [(m.label, m.error) for m in movies if m.error]:
         print(f"   -  {label}: left out: {why}")
     def with_earlier(k, ms):
         # (a model keeps the movies it learned from before: see step 2 of queue_main)
         now = {str((m.work / "pairs").resolve()) for m in ms}
+        name = f"ai-{k[0]}-x{k[1]}"
         try:
-            before = json.loads((base / f"ai-{k}-x2_training" / "movies.json").read_text(encoding="utf-8"))
+            before = json.loads((base / f"{name}_training" / "movies.json").read_text(encoding="utf-8"))
         except (OSError, ValueError):
             before = []
         extra = len({d for d in before if d not in now and (Path(d) / "lr").is_dir()})
         total = len(now) + extra
-        return (f"ai-{k}-x2 from {total} movie{'s' * (total > 1)}"
+        return (f"{name} from {total} movie{'s' * (total > 1)}"
                 + (f" ({extra} from earlier runs)" if extra else ""))
 
     if kinds or unknown:
@@ -3265,11 +3536,12 @@ def queue_main(a, parser):
     overview(a, base, parser, extras)
     if a.list:
         return 0
-    if a.pretrained != "none" and not Path(a.pretrained).exists():
-        sys.exit(f"starting model not found: {a.pretrained}\n(also looked in a Training folder next to this script "
-                 f"and in the models folder)\nDownload RealESRGAN_x2plus.pth from\n{PRETRAINED_URL}\nand put it in "
-                 "the same folder as upscale_training.py (or pass its path with --pretrained). Checked now, before "
-                 "the hours of pairs, so the training at the end doesn't fail.")
+    # the starting model of each scale the movies need (x4plus for 4K Blu-rays), checked now, before the hours of
+    # pairs, so the training at the end doesn't fail
+    for S in sorted({m.scale for m in queue_movies(a, base, parser, extras)[0] if m.error is None and not m.solo} or {2}):
+        set_pretrained(a, S)
+        if pretrained_missing(a, S):
+            sys.exit(pretrained_missing(a, S) + " Checked now, before the hours of pairs.")
     global LOCK
     LOCK = hold_lock(base / ".training_queue.lock", f"Another --all / --queue is already running for {base}.")
     keep_awake()
@@ -3357,11 +3629,11 @@ def queue_main(a, parser):
         if m.error is None and not m.solo and results.get(str(m.work)) == "ok":
             kind = m.kind() or m.kind_and_why()[0]     # (upscaler.json, else --type / its folder / name tag)
             if kind:
-                groups.setdefault(kind, []).append(m)
+                groups.setdefault((kind, m.scale), []).append(m)
             else:
                 log(f"{m.label}: its kind of movie isn't known: left out of the training")
-    for i, (kind, ms) in enumerate(sorted(groups.items()), 1):
-        name = f"ai-{kind}-x2"
+    for i, ((kind, S), ms) in enumerate(sorted(groups.items()), 1):
+        name = f"ai-{kind}-x{S}"                     # (x2 from Blu-rays, x4 from 4K Blu-rays: separate models)
         twork = base / f"{name}_training"
         try:
             before = json.loads((twork / "movies.json").read_text(encoding="utf-8"))
@@ -3424,8 +3696,8 @@ def queue_main(a, parser):
             log(f"{name}: carrying on from the {name} in use, {len(new)} movie{'s' * (len(new) != 1)} new to it"
                 + (f", {steps} steps" if not "--iters" in given else ""))
         else:
-            log(f"{name}: a new model from x2plus" + (f", {steps} steps" if not "--iters" in given else ""))
-        rc = run_child(me + extras + ["--type", kind, "--work", str(twork), "--stages", "train,export",
+            log(f"{name}: a new model from x{S}plus" + (f", {steps} steps" if not "--iters" in given else ""))
+        rc = run_child(me + extras + ["--type", kind, "--scale", str(S), "--work", str(twork), "--stages", "train,export",
                                       "--pairs-from", *dirs] + more
                        + (["--pretrained", str(start_from)] if start_from else []),
                        base, f"model {i} of {len(groups)}: {what}", job_env(rest))
@@ -3450,7 +3722,8 @@ def queue_main(a, parser):
     failed = [k for k, v in results.items() if v.startswith("failed")]
     log(f"=== finished: {len(groups)} model(s) for {sum(len(v) for v in groups.values())} movie(s)"
         + (f"; {len(failed)} failed (see {log_file.name})" if failed else "")
-        + ".  Upscale with:  python dvd_upscale.py <movie> --trained  (it picks ai-<kind>-x2 for each movie)")
+        + ".  Upscale with:  python dvd_upscale.py <movie> --trained  (it picks ai-<kind>-x2 for each movie; "
+          "for 4K from an x4 model: --trained --scale 4 --height 2160)")
     if a.shutdown:
         allow_shutdown()                    # (this run's own shutdown block goes first)
         shutdown_pc()
@@ -3502,6 +3775,8 @@ def build_parser():
     g.add_argument("--max-warp", type=float, default=0.05, help="largest scale/shear the alignment may apply")
     g.add_argument("--pair-workers", type=int, default=None, help="frames made at the same time (default: from the number of processor cores, 2 to 6)")
     g.add_argument("--seed", type=int, default=1)
+    g.add_argument("--scale", type=int, choices=[2, 4], default=None,
+                   help="2: a Blu-ray (1080p), x2 model. 4: a 4K Blu-ray (2160p), x4 model. Default: from the Blu-ray's size")
     g = p.add_argument_group("step 2: train")
     g.add_argument("--arch", choices=["rrdb", "compact"], default="rrdb",
                    help="rrdb: Real-ESRGAN x2plus, best quality, slow (default). compact: a small fast network "
@@ -3549,6 +3824,12 @@ def build_parser():
     g.add_argument("--name", default=None,
                    help="model name for dvd_upscale.py --model (default: from the kind of movie, e.g. ai-anime-x2)")
     g.add_argument("--models", help="the upscaler's models folder (default: found next to realesrgan-ncnn-vulkan)")
+    g.add_argument("--mix", type=float, nargs="+", metavar="SHARE",
+                   help="mix a trained model with x2plus (network interpolation), e.g. --mix 0.5 0.7 0.9: each share "
+                        "of the trained model becomes <name>-mixNN in the models folder, and all are scored on held-out "
+                        "frames (--pairs-from, or --work with the training's folder). The model: --type live (ai-live-x2), "
+                        "--name, or --mix-from")
+    g.add_argument("--mix-from", metavar="FILE.pth", help="--mix this .pth instead of the one in the models folder")
     g.add_argument("--keep-any", action="store_true",
                    help="use the new model even when it scores lower than the one in use (default: it replaces it "
                         "only when it scores higher on the held-out frames of all its movies)")
@@ -3564,11 +3845,13 @@ def main():
         a.train_workers = max(2, min(8, cores // 2))
     if a.pair_workers is None:
         a.pair_workers = max(2, min(6, cores // 3))
-    if a.pretrained is None:
-        a.pretrained = str(find_pretrained()) if a.arch == "rrdb" else "none"
+    a.pretrained_given = a.pretrained is not None
+    set_pretrained(a, a.scale or 2)
 
     if a.gpu_test:
         return gpu_test(a)
+    if a.mix:
+        return mix_main(a)
     if a.analyze:
         return analyze(a)
     if a.all is not None or a.queue is not None:
@@ -3585,10 +3868,11 @@ def main():
     work = default_work(a)
     pairs_dir, run_dir = work / "pairs", work / "run"
     roots = [Path(x) for x in a.pairs_from] if a.pairs_from else [pairs_dir]
-    # fail now, not after hours of pairs
-    if "train" in stages and a.pretrained != "none" and not Path(a.pretrained).exists():
-        sys.exit(f"starting model not found: {a.pretrained}\nDownload RealESRGAN_x2plus.pth from\n{PRETRAINED_URL}\n"
-                 "and put it in the same folder as upscale_training.py (or pass its path with --pretrained).")
+    # fail now, not after hours of pairs (a 4K Blu-ray needs the x4 starting model)
+    a.scale = planned_scale(a, roots, stages)
+    set_pretrained(a, a.scale)
+    if "train" in stages and pretrained_missing(a, a.scale):
+        sys.exit(pretrained_missing(a, a.scale))
     for f in (a.dvd, a.bluray):
         if f and "pairs" in stages and not Path(f).exists():
             sys.exit(f"file not found: {f}")
