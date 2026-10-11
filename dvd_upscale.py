@@ -807,6 +807,7 @@ margin-right:6px;background:currentColor;vertical-align:1px}
 .pct{font-size:44px;font-weight:700;font-variant-numeric:tabular-nums;margin:12px 0 6px}
 .bar{height:10px;background:var(--line);border-radius:99px;overflow:hidden}
 .bar>i{display:block;height:100%;width:0;background:var(--acc);border-radius:99px;transition:width .6s}
+[hidden]{display:none!important}
 .row{display:flex;justify-content:space-between;gap:12px;margin-top:10px;font-size:14px}
 .row b{font-weight:600;text-align:right}
 .now{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:13px;color:var(--dim);
