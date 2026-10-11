@@ -29,6 +29,20 @@ and its `anime` / `live` / `cgi` / `vhs` folders, makes the pairs of each, then 
 all its movies. `--queue` does the same from `training_queue.txt` (one `--dvd ... --bluray ...` per line).
 Movies added later are learned on top of the model in use. `--list` shows the plan and stops.
 
+## Mixing a trained model with x2plus
+Your models are x2plus with its weights fine-tuned, so the two can be mixed (Real-ESRGAN's network
+interpolation): a dial between the original's look (safe on any movie) and yours (closer to your Blu-rays).
+
+```
+python upscale_training.py --mix 0.5 0.7 0.9 --type live --work "D:\Movies\ai-live-x2_training"
+```
+
+This writes `ai-live-x2-mix50`, `-mix70` and `-mix90` next to `ai-live-x2` in the models folder (as fast as any
+model) and scores each one, along with x2plus and the trained model, on held-out frames. The training's own
+movies favour the full model, so judge on a movie that wasn't in the training: make its pairs
+(`--stages pairs`) and pass `--pairs-from` that pairs folder. Then: `python dvd_upscale.py <movie> --model
+ai-live-x2-mix70 --scale 2`. `--mix-from FILE.pth` mixes another trained model; only `--arch rrdb` models mix.
+
 ## Stopping and carrying on
 Ctrl+C any time, then run **the same command again**. Finished steps are skipped, the pairs and the
 training both carry on from where they stopped. `--stages train,export` or `--stages export` runs

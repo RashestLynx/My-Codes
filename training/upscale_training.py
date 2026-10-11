@@ -2709,6 +2709,118 @@ def stage_export(a, run_dir, work, roots=()):
     return True
 
 
+# =============================== --mix: a trained model mixed with x2plus ===============================
+def mix_weights(trained, base, share):
+    """The two networks' weights mixed: `share` of the trained one, the rest of the starting model (Real-ESRGAN's
+    network interpolation). Both must be the same network (rrdb: x2plus and what was trained from it)."""
+    out = {}
+    for k, t in trained.items():
+        b = base[k]
+        out[k] = (share * t.float() + (1 - share) * b.float()).to(t.dtype) if t.is_floating_point() else t
+    return out
+
+
+def mix_roots(a):
+    """The pairs folders whose held-out frames judge the mixes: --pairs-from, else the movies the training in --work
+    learned from (an --all / --queue model's folder, or a single movie's), [] if none is known."""
+    if a.pairs_from:
+        return [Path(d) for d in a.pairs_from]
+    if a.work:
+        w = Path(a.work)
+        for f in ("movies.json", "accepted.json"):
+            try:
+                dirs = [Path(d) for d in json.loads((w / f).read_text(encoding="utf-8"))]
+                if dirs:
+                    return [d for d in dirs if (d / "lr").is_dir()]
+            except (OSError, ValueError, TypeError):
+                pass
+        if (w / "pairs" / "lr").is_dir():
+            return [w / "pairs"]
+    return []
+
+
+def mix_main(a):
+    """--mix 0.5 0.7 ...: the trained model (--mix-from, else ai-<type>-x2.pth in the models folder) mixed with
+    the starting model at each share, each written as <name>-mixNN (.param/.bin for the upscaler, .pth), and all of
+    them scored on held-out frames (--pairs-from or --work), with the trained and the starting model for comparison."""
+    shares = sorted(set(a.mix))
+    if any(not 0 < x < 1 for x in shares):
+        sys.exit("--mix: shares of the trained model between 0 and 1, e.g. --mix 0.5 0.7 0.9 (1 is the trained model "
+                 "itself, 0 the starting model)")
+    models = Path(a.models) if a.models else find_models_dir()
+    if a.mix_from:
+        src = Path(a.mix_from)
+        name = a.name or src.stem
+    else:
+        if a.name:
+            name = a.name
+        elif a.type != "auto":
+            name = model_name(a, a.type)
+        else:
+            sys.exit("--mix: which model? --type anime/cgi/live/vhs (for ai-<type>-x2), --name, or --mix-from FILE.pth")
+        if models is None:
+            sys.exit("--mix: the upscaler's models folder wasn't found next to realesrgan-ncnn-vulkan: pass --models")
+        src = models / f"{name}.pth"
+    if not src.is_file():
+        sys.exit(f"--mix: {src} not found (upscale_training.py keeps each model's .pth next to its .param/.bin; "
+                 "or pass --mix-from with the trained .pth, e.g. run\\upscale_training_best.pth)")
+    if a.pretrained == "none" or not Path(a.pretrained).is_file():
+        sys.exit(f"--mix needs the starting model, RealESRGAN_x2plus.pth (looked for {a.pretrained}): download it "
+                 f"from {PRETRAINED_URL} and put it next to upscale_training.py, or pass --pretrained")
+    if models is None:
+        models = src.parent
+    load = lambda f: (lambda sd: sd.get("params_ema", sd.get("params", sd)))(torch.load(f, map_location="cpu", weights_only=True))
+    trained, base = load(src), load(a.pretrained)
+    if arch_of(trained)[0] != "rrdb" or arch_of(base)[0] != "rrdb" or trained.keys() != base.keys():
+        sys.exit("--mix works on models trained from x2plus (--arch rrdb, the default): a compact model is a different "
+                 "network and has nothing to mix with")
+    # (mixing only means something for a model fine-tuned from this starting model: its weights stay close to it.
+    #  Two unrelated networks averaged give noise)
+    t = torch.cat([v.float().flatten() for k, v in trained.items() if v.is_floating_point()])
+    b = torch.cat([base[k].float().flatten() for k, v in trained.items() if v.is_floating_point()])
+    same = float(F.cosine_similarity(t, b, dim=0))
+    if same < 0.9:
+        sys.exit(f"--mix: {src.name} wasn't trained from {Path(a.pretrained).name} (their weights match {same:.0%}; a "
+                 "model fine-tuned from it stays above 90%): mixed, they would give noise. Mix a model that started "
+                 "from this x2plus, or pass the --pretrained it started from.")
+    print(f"mixing {src.name} with {Path(a.pretrained).name}: " + ", ".join(f"{x:.0%}" for x in shares)
+          + " of the trained model", flush=True)
+    made = []
+    for x in shares:
+        mix = f"{name}-mix{round(x * 100)}"
+        pth = models / f"{mix}.pth"
+        save_durably({"params_ema": mix_weights(trained, base, x)}, pth)
+        n_layers, _ = export_ncnn(pth, models, mix)
+        made.append((x, mix, pth))
+        print(f"  wrote {models / mix}.param / .bin / .pth ({n_layers} layers)", flush=True)
+    roots = mix_roots(a)
+    val = held_out_items(roots)
+    pick = made[-1][1]                          # (the one to suggest: the best-scoring mix, else the largest share)
+    if not val:
+        print("not scored: no pairs to judge on (--pairs-from FOLDER, or --work with the training's folder)")
+    else:
+        dev = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        print(f"scoring on {len(val)} held-out frames of {len(roots)} movie{'s' * (len(roots) > 1)} "
+              f"(frames none of them trained on)...", flush=True)
+        rows = [(0.0, "x2plus (starting model)", Path(a.pretrained))] + made + [(1.0, f"{name} (trained)", src)]
+        scored = []
+        for x, label, pth in rows:
+            sd = load(pth)
+            net = make_net("rrdb").to(dev)
+            net.load_state_dict(sd, strict=True)
+            r = eval_on(net, dev, val, a.val_crop)
+            scored.append((x, label, r))
+            print(f"  {x:4.0%}  {label:<28} {fmt_scores(r)}", flush=True)
+            del net
+        best = max(scored, key=lambda t: t[2]["psnr"])
+        print(f"highest PSNR: {best[1]}")
+        pick = max((t for t in scored if 0 < t[0] < 1), key=lambda t: t[2]["psnr"])[1]
+        print("NOTE: held-out minutes of the training's own movies favour the trained model; a mix is for movies it "
+              "never saw. Judge on one of those with --pairs-from (its pairs folder, made with --stages pairs).")
+    print(f"use one:  python dvd_upscale.py <movie> --model {pick} --scale 2")
+    return 0
+
+
 def upscale_command(a):
     """--trained picks ai-<type>-x2 by the type dvd_upscale.py detects (the same detection as here)."""
     if a.name:
@@ -2844,7 +2956,8 @@ def batch_arg(v):
 # ai-anime-x2 from every anime... (training them one by one would leave only the last movie's model).
 # Each step runs as a run of this script of its own, so a failure is logged and the queue goes on.
 VIDEO_EXT = {".mkv", ".mp4", ".m4v", ".avi", ".mpg", ".mpeg", ".ts", ".m2ts", ".vob", ".wmv", ".mov"}
-NOT_IN_QUEUE = ("--dvd", "--bluray", "--work", "--stages", "--name", "--pairs-from", "--focus-from", "--analyze", "--gpu-test")
+NOT_IN_QUEUE = ("--dvd", "--bluray", "--work", "--stages", "--name", "--pairs-from", "--focus-from", "--analyze", "--gpu-test",
+                "--mix", "--mix-from")
 STEPS_PER_MOVIE = 10000         # (the queue's training steps: per movie for a new model, per new movie when it carries on)
 STOPPED_CODES = (130, -2, 3221225786)        # (Ctrl+C: our own exit code, a signal, Windows' STATUS_CONTROL_C_EXIT)
 
@@ -3549,6 +3662,12 @@ def build_parser():
     g.add_argument("--name", default=None,
                    help="model name for dvd_upscale.py --model (default: from the kind of movie, e.g. ai-anime-x2)")
     g.add_argument("--models", help="the upscaler's models folder (default: found next to realesrgan-ncnn-vulkan)")
+    g.add_argument("--mix", type=float, nargs="+", metavar="SHARE",
+                   help="mix a trained model with x2plus (network interpolation), e.g. --mix 0.5 0.7 0.9: each share "
+                        "of the trained model becomes <name>-mixNN in the models folder, and all are scored on held-out "
+                        "frames (--pairs-from, or --work with the training's folder). The model: --type live (ai-live-x2), "
+                        "--name, or --mix-from")
+    g.add_argument("--mix-from", metavar="FILE.pth", help="--mix this .pth instead of the one in the models folder")
     g.add_argument("--keep-any", action="store_true",
                    help="use the new model even when it scores lower than the one in use (default: it replaces it "
                         "only when it scores higher on the held-out frames of all its movies)")
@@ -3569,6 +3688,8 @@ def main():
 
     if a.gpu_test:
         return gpu_test(a)
+    if a.mix:
+        return mix_main(a)
     if a.analyze:
         return analyze(a)
     if a.all is not None or a.queue is not None:
