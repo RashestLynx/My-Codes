@@ -20,7 +20,8 @@ whole movie, and printed with the reasons:
   fabric textures that the anime model would flatten)
 - vhs: a VHS capture or a VHS-to-DVD transfer -> the VHS handling below
 If it isn't sure it says so and takes the safe choice (live; DVD rather than VHS). --type
-anime/live/cgi/vhs (or a folder of that name with --all) overrides it. A resumed movie keeps the
+anime/live/cgi/vhs overrides it, and so does a folder of that name, or (not in such a folder) a
+name starting with it and _ or -: cgi_Shrek.mkv. A resumed movie keeps the
 type it started with.
 Output: .mkv (keeps everything) or .mp4 (for Apple devices/browsers; DVD subtitles can't be kept).
 Video is H.264 8-bit by default so it plays on any player/TV/phone; --hevc gives smaller
@@ -67,7 +68,8 @@ Every movie in a folder, one after another:
   python dvd_upscale.py --all                  # all movies in the current folder
   python dvd_upscale.py --all "D:\Movies" --shutdown
 - Movies in a subfolder named "anime", "live", "cgi" or "vhs" get that --type, whatever else you
-  pass; movies loose in the folder are detected one by one (or get the --type you give, e.g.
+  pass; so do loose movies whose name starts with that tag and _ or - (cgi_Shrek.mkv,
+  anime-DBZ.mkv). Other loose movies are detected one by one (or get the --type you give, e.g.
   --all --type anime). Other options (--hevc ...) are passed on to every movie.
 - Finished movies go into a "1080p Upscale" folder inside the movies folder (movies from the
   "anime"/"live"/"cgi"/"vhs" subfolders into "1080p Upscale\anime", "...\live" ...), so they
@@ -108,8 +110,18 @@ queue.txt has one movie per line, exactly what you'd type after "python dvd_upsc
   it was started in, so it continues instead of starting over).
 - Two lines with the same output file: the second is skipped. A finished movie records which
   file it was made from, and is never replaced by the upscale of a different file.
+- Each movie starts with the processor's and NVIDIA GPU's model, and every chunk's progress line
+  is followed by their load during that chunk: CPU busy %, GPU busy %, clock, temperature, power
+  and video memory, each as average and peak. When the movie's chunks are done, the same for the
+  whole run.
 - While it runs the PC is kept from going to sleep (single movies too). Keep it plugged in, and if you
   close the lid, set the lid action to "Do nothing" for when it's plugged in.
+- Also while it runs (Windows; --no-guard turns this off): a click in the window can't freeze the
+  run (QuickEdit is off until it ends), keys typed meanwhile are thrown away instead of being run
+  as a command afterwards, and a shutdown or restart stops at Windows' "This app is preventing
+  shutdown" screen with the progress (Shut down anyway still works; --shutdown is let through).
+  At the start it warns if the laptop is on battery, if closing the lid would sleep it, or if
+  Windows Update is waiting to restart. Ctrl+C still stops the run on purpose.
 Progress is logged to queue_log.txt next to the queue file.
 
 Progress on your phone (iPhone or Android, any browser): on by itself for every run
@@ -119,6 +131,9 @@ and all of them, the current step and the latest output, refreshed every 3 s, an
 graphics card's load, temperature, power, memory and clock (from nvidia-smi). --phone 8650
 uses another port. The first time, Windows asks whether Python may use the network: allow it
 on private networks (the Wi-Fi must be set as a Private network in Windows).
+
+After changing this script: python dvd_upscale.py --self-test checks its own logic in a few
+seconds (the queue file, the folder scan, the detection decision, face tracking, GPU steps).
 """
 import argparse, json, math, operator, os, re, shutil, signal, statistics, struct, subprocess, sys
 import atexit, tempfile
@@ -173,6 +188,10 @@ def status_line(msg=""):
 def say(msg):
     status_line()
     print(msg, flush=True)
+    if msg.startswith("["):                 # ([3/40] ...: the progress, for the shutdown screen)
+        shutdown_reason(f"dvd_upscale.py is upscaling {_GUARD['movie'] or 'a movie'} "
+                        f"({msg.split(' - ')[-1].strip()}): shutting down now loses the chunk "
+                        "in progress (finished chunks are kept)")
 
 
 # ---- --phone: the progress on a web page that a phone on the same Wi-Fi opens ----
@@ -311,30 +330,153 @@ def phone_gpus():
         if time.time() - PHONE_GPU["t"] < 2.5 or not shutil.which("nvidia-smi"):
             return PHONE_GPU["gpus"]
         PHONE_GPU["t"] = time.time()
-        gpus = []
-        try:
-            r = subprocess.run(["nvidia-smi", "--query-gpu=" + PHONE_GPU_FIELDS,
-                                "--format=csv,noheader,nounits"], capture_output=True,
-                               text=True, timeout=8, stdin=subprocess.DEVNULL,
-                               creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-            for row in r.stdout.splitlines():
-                v = [x.strip() for x in row.split(",")]
-                if len(v) != 12:
-                    continue
-                num = lambda x: (float(x) if re.fullmatch(r"[\d.]+", x) else None)
-                try:
-                    reasons = int(v[11], 16)
-                except ValueError:
-                    reasons = 0
-                why = [name for bit, name in THROTTLE_BITS if reasons & bit]
-                gpus.append(dict(index=v[0], name=v[1], temp=num(v[2]), power=num(v[3]),
-                                 power_max=num(v[4]), busy=num(v[5]), mem=num(v[6]),
-                                 mem_max=num(v[7]), clock=num(v[8]), clock_max=num(v[9]),
-                                 fan=num(v[10]), slowed=why))
-        except (OSError, subprocess.SubprocessError):
-            pass
-        PHONE_GPU["gpus"] = gpus
+        PHONE_GPU["gpus"] = gpus = query_gpus()
         return gpus
+
+
+def query_gpus():
+    """The NVIDIA GPUs right now, one nvidia-smi call ([] without it): a dict each, a value the
+    GPU doesn't report (a laptop's fan) is None."""
+    if not shutil.which("nvidia-smi"):
+        return []
+    gpus = []
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=" + PHONE_GPU_FIELDS,
+                            "--format=csv,noheader,nounits"], capture_output=True,
+                           text=True, timeout=8, stdin=subprocess.DEVNULL,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        for row in r.stdout.splitlines():
+            v = [x.strip() for x in row.split(",")]
+            if len(v) != 12:
+                continue
+            num = lambda x: (float(x) if re.fullmatch(r"[\d.]+", x) else None)
+            try:
+                reasons = int(v[11], 16)
+            except ValueError:
+                reasons = 0
+            why = [name for bit, name in THROTTLE_BITS if reasons & bit]
+            gpus.append(dict(index=v[0], name=v[1], temp=num(v[2]), power=num(v[3]),
+                             power_max=num(v[4]), busy=num(v[5]), mem=num(v[6]),
+                             mem_max=num(v[7]), clock=num(v[8]), clock_max=num(v[9]),
+                             fan=num(v[10]), slowed=why))
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return gpus
+
+
+def cpu_times():
+    """The processor's (busy, total) time so far, all its threads together, None if this system
+    doesn't tell: two calls give the load in between."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            idle, kernel, user = (ctypes.c_ulonglong() for _ in range(3))
+            if not ctypes.windll.kernel32.GetSystemTimes(ctypes.byref(idle), ctypes.byref(kernel),
+                                                         ctypes.byref(user)):
+                return None
+            total = kernel.value + user.value               # (kernel time includes idle time)
+            return total - idle.value, total
+        with open("/proc/stat", encoding="ascii") as f:
+            v = [int(x) for x in f.readline().split()[1:9]]
+        return sum(v) - v[3] - v[4], sum(v)                 # (idle and iowait aren't busy)
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
+def cpu_name():
+    """The processor's model name ("" if unknown) and its thread count."""
+    name = ""
+    try:
+        if os.name == "nt":
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                                r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+                name = winreg.QueryValueEx(k, "ProcessorNameString")[0]
+        elif sys.platform == "darwin":
+            name = subprocess.run(["sysctl", "-n", "machdep.cpu.brand_string"],
+                                  capture_output=True, text=True, timeout=5,
+                                  stdin=subprocess.DEVNULL).stdout
+        else:
+            with open("/proc/cpuinfo", encoding="utf-8", errors="replace") as f:
+                name = next((ln.split(":", 1)[1] for ln in f
+                             if ln.lower().startswith("model name")), "")
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return " ".join(str(name).split()), os.cpu_count() or 0
+
+
+def hardware_text():
+    """One line per processor and NVIDIA GPU: what they are, and their limits."""
+    name, threads = cpu_name()
+    lines = [f"CPU: {name or 'unknown model'}" + (f", {threads} threads" if threads else "")]
+    for g in query_gpus():
+        extra = [f"{g['mem_max'] / 1024:.1f} GB" if g["mem_max"] else "",
+                 f"up to {g['clock_max']:.0f} MHz" if g["clock_max"] else "",
+                 f"{g['power_max']:.0f} W limit" if g["power_max"] else ""]
+        lines.append(f"GPU {g['index']}: {g['name']}"
+                     + "".join(f", {x}" for x in extra if x))
+    return lines
+
+
+class LoadWatch:
+    """The processor's and the NVIDIA GPUs' load while a movie is made, sampled every few
+    seconds in the background: lines() gives the average and the peak of each, over the samples
+    since the last lines(since_last=True) or over the whole run."""
+
+    def __init__(self, every=3.0, start=True):
+        self.samples, self.mark, self.every = [], 0, every  # [(cpu % or None, [gpu dict])]
+        self.stop_event = threading.Event()
+        self.thread = None
+        if start:
+            self.thread = threading.Thread(target=self.loop, daemon=True)
+            self.thread.start()
+
+    def loop(self):
+        last = cpu_times()
+        while not self.stop_event.wait(self.every):
+            now = cpu_times()
+            cpu = None
+            if last and now and now[1] > last[1]:
+                cpu = 100.0 * (now[0] - last[0]) / (now[1] - last[1])
+            last = now
+            self.add(cpu, query_gpus())
+
+    def add(self, cpu, gpus):
+        self.samples.append((cpu, gpus))
+
+    def stop(self):
+        self.stop_event.set()
+
+    def lines(self, since_last=False):
+        rows = self.samples[self.mark:] if since_last else self.samples
+        if since_last:
+            self.mark = len(self.samples)
+        out = []
+        avg_peak = lambda xs, fmt, unit: (f"{fmt.format(sum(xs) / len(xs))}{unit} avg, "
+                                          f"{fmt.format(max(xs))}{unit} peak")
+        cpu = [c for c, _ in rows if c is not None]
+        if cpu:
+            out.append(f"CPU: {avg_peak(cpu, '{:.0f}', '%')}")
+        by_gpu = {}
+        for _, gpus in rows:
+            for g in gpus:
+                by_gpu.setdefault(g["index"], []).append(g)
+        for idx, gs in by_gpu.items():
+            vals = lambda k: [g[k] for g in gs if g[k] is not None]
+            parts = []
+            for key, fmt, unit in (("busy", "{:.0f}", "%"), ("clock", "{:.0f}", " MHz"),
+                                   ("temp", "{:.0f}", " C"), ("power", "{:.0f}", " W")):
+                if vals(key):
+                    parts.append(avg_peak(vals(key), fmt, unit))
+            mem, mem_max = vals("mem"), vals("mem_max")
+            if mem:
+                parts.append(f"VRAM {sum(mem) / len(mem) / 1024:.1f} GB avg, "
+                             f"{max(mem) / 1024:.1f} GB peak"
+                             + (f" of {max(mem_max) / 1024:.1f}" if mem_max else ""))
+            if parts:
+                label = "GPU" if len(by_gpu) == 1 else f"GPU {idx}"
+                out.append(f"{label}: " + " | ".join(parts))
+        return out
 
 
 def phone_snapshot():
@@ -809,7 +951,8 @@ def probe(src):
     j = json.loads(subprocess.check_output(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
          "stream=width,height,sample_aspect_ratio,avg_frame_rate,r_frame_rate,start_time,duration"
-         ":stream_tags:format=start_time,duration", "-of", "json", str(src)]))
+         ":stream_tags:format=start_time,duration", "-of", "json", str(src)],
+        stdin=subprocess.DEVNULL, timeout=LONG_PROBE_TIMEOUT))
     if not j.get("streams"):
         raise ValueError("no video stream found")
     s, f = j["streams"][0], j.get("format", {})
@@ -825,7 +968,8 @@ def probe(src):
         r = subprocess.run(["ffprobe", "-v", "quiet", "-select_streams", "v:0", "-read_intervals",
                             "%+#200", "-show_entries", "frame=best_effort_timestamp_time", "-of",
                             "csv=p=0", str(src)], capture_output=True, encoding="utf-8",
-                           errors="replace")
+                           errors="replace", stdin=subprocess.DEVNULL,
+                           timeout=LONG_PROBE_TIMEOUT)
         try:
             first = float(r.stdout.split()[0].strip(","))
             if vstart < first < vstart + 5:
@@ -1256,6 +1400,18 @@ def prefilter(a):
     return ",".join(f)
 
 
+def training_filters(a):
+    """The filters before the upscaler for this movie, without the chunk timing (start time, warm-up
+    trim, output rate): upscale_training.py makes its DVD frames with them, so the model learns from
+    frames exactly as the upscaler hands them over. None if they can't be worked out."""
+    try:
+        b = types.SimpleNamespace(**vars(a))
+        b.fps, b.crop_rows, b.dvd_trim, b.vhs_trim = "1", 0, 0, 0
+        return [f for f in prefilter(b).split(",") if f not in ("setpts=PTS-STARTPTS", "fps=1")]
+    except Exception:
+        return None
+
+
 def postfilter(a):
     # exact width (multiple of 8, e.g. 1920 or 1440): some TVs and hardware decoders reject
     # odd sizes like 1918x1080
@@ -1367,14 +1523,16 @@ def video_start(path):
     """First video timestamp of a file (0 if unknown)."""
     out = subprocess.check_output(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=start_time",
-         "-of", "csv=p=0", str(path)], encoding="utf-8", errors="replace").strip()
+         "-of", "csv=p=0", str(path)], encoding="utf-8", errors="replace",
+        stdin=subprocess.DEVNULL, timeout=LONG_PROBE_TIMEOUT).strip()
     return float(frac(out))
 
 
 def count_frames(path):
     out = subprocess.check_output(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_packets",
-         "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)], encoding="utf-8", errors="replace")
+         "-show_entries", "stream=nb_read_packets", "-of", "csv=p=0", str(path)],
+        encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL, timeout=READ_TIMEOUT)
     out = out.strip().split(",")[0]
     return int(out) if out.isdigit() else 0
 
@@ -1917,7 +2075,20 @@ def check_frames(a, tmp, n_in, strict=False):
                                    f"of about {x:.0f}: black or garbled - a GPU fault?)")
 
 
-TRAINED_MODEL = "upscale-training-x2"   # the model training/upscale_training.py makes (--trained)
+TRAINED_MODEL = "upscale-training-x2"   # the single model older versions of upscale_training.py made
+
+
+def trained_model(a):
+    """--trained: the model upscale_training.py made for this kind of movie (it names them ai-anime-x2,
+    ai-cgi-x2, ai-live-x2, ai-vhs-x2), else the single model older versions made."""
+    for m in (f"ai-{a.type}-x2", TRAINED_MODEL):
+        a.model = m
+        if model_installed(a):
+            if m == TRAINED_MODEL:
+                print(f"NOTE: --trained: no ai-{a.type}-x2 model yet (upscale_training.py makes it from a "
+                      f"{TYPE_NAMES[a.type]} movie): using {TRAINED_MODEL}, the earlier trained model")
+            return m
+    return f"ai-{a.type}-x2"            # (not there: reported as missing below)
 
 
 def models_dir(a):
@@ -2101,6 +2272,269 @@ def keep_awake():
             except OSError:
                 pass
             return
+
+
+# ---- keeping a long run safe: stray clicks and keys, sleep, shutdown (Windows) ----------------
+# A night's run is lost to small things: a click in the window (QuickEdit mode freezes the
+# program until a key is pressed, so the whole run just stops), keys typed while it runs (the
+# console keeps them, and PowerShell runs them as a command once the script ends), a shutdown or
+# a Windows Update restart. protect_run guards against them while the movie or queue runs; all of
+# it is undone when the script ends. --no-guard turns it off (sleep is still prevented).
+# Ctrl+C still stops the run, as it always has: it is the way to stop on purpose.
+
+_GUARD = {"console": None, "window": None, "thread": None, "reason": "", "proc": None,
+          "movie": ""}
+WM_APP_REASON = 0x8000 + 1          # (WM_APP + 1: the reason text changed)
+
+
+def guard_off():
+    return os.name != "nt" or bool(os.environ.get("DVD_UPSCALE_NO_GUARD"))
+
+
+def protect_run(movie=""):
+    """Called once a movie (or a queue) really starts: sleep, clicks, stray keys, shutdown."""
+    keep_awake()
+    _GUARD["movie"] = movie
+    if guard_off():
+        return
+    console_guard()
+    # (a movie of --all/--queue: its queue's run blocks the shutdown and gave the warnings)
+    if not os.environ.get("DVD_UPSCALE_QUEUE"):
+        block_shutdown(f"dvd_upscale.py is upscaling {movie or 'movies'}: shutting down now "
+                       "loses the chunk in progress (finished chunks are kept)")
+        run_warnings()
+
+
+def console_guard():
+    """QuickEdit and Insert mode off for this console while the run lasts (a click or a
+    selection in the window then can't freeze the run), and keys typed meanwhile thrown away at
+    the end (else PowerShell would run them as a command). The console's own mode comes back
+    when the script ends."""
+    if _GUARD["console"] is not None:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetStdHandle.restype = wintypes.HANDLE
+        k32.GetStdHandle.argtypes = [wintypes.DWORD]
+        k32.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        k32.FlushConsoleInputBuffer.argtypes = [wintypes.HANDLE]
+        h = k32.GetStdHandle(wintypes.DWORD(-10 & 0xFFFFFFFF))       # STD_INPUT_HANDLE
+        mode = wintypes.DWORD()
+        if not h or not k32.GetConsoleMode(h, ctypes.byref(mode)):
+            return                          # (no console: started from a GUI or a pipe)
+        old = mode.value
+        ENABLE_INSERT_MODE, ENABLE_QUICK_EDIT_MODE, ENABLE_EXTENDED_FLAGS = 0x20, 0x40, 0x80
+        if k32.SetConsoleMode(h, (old | ENABLE_EXTENDED_FLAGS)
+                              & ~(ENABLE_QUICK_EDIT_MODE | ENABLE_INSERT_MODE)):
+            _GUARD["console"] = (k32, h, old)
+            atexit.register(console_unguard)
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
+def console_unguard():
+    g = _GUARD["console"]
+    if g is None:
+        return
+    k32, h, old = g
+    _GUARD["console"] = None
+    try:
+        k32.FlushConsoleInputBuffer(h)      # (keys typed during the run: not run as a command)
+        k32.SetConsoleMode(h, old)
+    except (OSError, AttributeError, ValueError):
+        pass
+
+
+def block_shutdown(reason):
+    """Windows asks every program before a shutdown or restart: this one says no while it runs,
+    so Windows shows "This app is preventing shutdown" with the reason (and the latest progress)
+    and lets the user choose. (A forced shutdown, such as shutdown /f, a power cut or a held power
+    button, can't be stopped by any program.) A hidden window of its own, in its own thread: the
+    console window belongs to the console, not to this script."""
+    if _GUARD["window"] is not None or _GUARD["thread"] is not None:
+        return
+    _GUARD["reason"] = reason
+    started = threading.Event()
+
+    def window_thread():
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u32 = ctypes.WinDLL("user32", use_last_error=True)
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            LRESULT = ctypes.c_ssize_t
+            WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT,
+                                         wintypes.WPARAM, wintypes.LPARAM)
+
+            class WNDCLASSW(ctypes.Structure):
+                _fields_ = [("style", wintypes.UINT), ("lpfnWndProc", WNDPROC),
+                            ("cbClsExtra", ctypes.c_int), ("cbWndExtra", ctypes.c_int),
+                            ("hInstance", wintypes.HINSTANCE), ("hIcon", wintypes.HICON),
+                            ("hCursor", wintypes.HANDLE), ("hbrBackground", wintypes.HBRUSH),
+                            ("lpszMenuName", wintypes.LPCWSTR),
+                            ("lpszClassName", wintypes.LPCWSTR)]
+            u32.DefWindowProcW.restype = LRESULT
+            u32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                           wintypes.LPARAM]
+            u32.RegisterClassW.restype = wintypes.ATOM
+            u32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASSW)]
+            u32.CreateWindowExW.restype = wintypes.HWND
+            u32.CreateWindowExW.argtypes = [wintypes.DWORD, wintypes.LPCWSTR, wintypes.LPCWSTR,
+                                            wintypes.DWORD, ctypes.c_int, ctypes.c_int,
+                                            ctypes.c_int, ctypes.c_int, wintypes.HWND,
+                                            wintypes.HMENU, wintypes.HINSTANCE, wintypes.LPVOID]
+            u32.ShutdownBlockReasonCreate.restype = wintypes.BOOL
+            u32.ShutdownBlockReasonCreate.argtypes = [wintypes.HWND, wintypes.LPCWSTR]
+            u32.ShutdownBlockReasonDestroy.restype = wintypes.BOOL
+            u32.ShutdownBlockReasonDestroy.argtypes = [wintypes.HWND]
+            u32.GetMessageW.restype = wintypes.BOOL
+            u32.GetMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+                                        wintypes.UINT, wintypes.UINT]
+            u32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+            u32.DispatchMessageW.restype = LRESULT
+            u32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+            u32.DestroyWindow.argtypes = [wintypes.HWND]
+            u32.PostQuitMessage.argtypes = [ctypes.c_int]
+            k32.GetModuleHandleW.restype = wintypes.HMODULE
+            k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+            k32.SetProcessShutdownParameters.argtypes = [wintypes.DWORD, wintypes.DWORD]
+            WM_DESTROY, WM_CLOSE, WM_QUERYENDSESSION, WM_ENDSESSION = 0x2, 0x10, 0x11, 0x16
+
+            def proc(hwnd, msg, wparam, lparam):
+                try:
+                    if msg == WM_QUERYENDSESSION:
+                        return 0                    # (FALSE: not now)
+                    if msg == WM_ENDSESSION:
+                        return 0
+                    if msg == WM_APP_REASON:
+                        u32.ShutdownBlockReasonCreate(hwnd, _GUARD["reason"][:250])
+                        return 0
+                    if msg == WM_CLOSE:
+                        u32.DestroyWindow(hwnd)
+                        return 0
+                    if msg == WM_DESTROY:
+                        u32.ShutdownBlockReasonDestroy(hwnd)
+                        u32.PostQuitMessage(0)
+                        return 0
+                except Exception:
+                    pass
+                return u32.DefWindowProcW(hwnd, msg, wparam, lparam)
+            _GUARD["proc"] = WNDPROC(proc)      # (kept: Windows calls it as long as it lives)
+            inst = k32.GetModuleHandleW(None)
+            wc = WNDCLASSW()
+            wc.lpfnWndProc = _GUARD["proc"]
+            wc.hInstance = inst
+            wc.lpszClassName = "dvd_upscale_shutdown_guard"
+            u32.RegisterClassW(ctypes.byref(wc))       # (0 if already registered: fine)
+            # a top-level window that is never shown: only those are asked before a shutdown
+            hwnd = u32.CreateWindowExW(0, wc.lpszClassName, "dvd_upscale.py", 0, 0, 0, 0, 0,
+                                       None, None, inst, None)
+            if not hwnd:
+                return
+            # asked among the first, before programs that close themselves without asking
+            k32.SetProcessShutdownParameters(0x3FF, 0)
+            u32.ShutdownBlockReasonCreate(hwnd, _GUARD["reason"][:250])
+            _GUARD["window"] = hwnd
+            started.set()
+            msg = wintypes.MSG()
+            while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) > 0:
+                u32.TranslateMessage(ctypes.byref(msg))
+                u32.DispatchMessageW(ctypes.byref(msg))
+        except Exception:
+            pass
+        finally:
+            _GUARD["window"] = None
+            started.set()
+
+    t = threading.Thread(target=window_thread, name="shutdown guard", daemon=True)
+    _GUARD["thread"] = t
+    t.start()
+    started.wait(5)
+    atexit.register(allow_shutdown)
+
+
+def _post_to_guard(msg):
+    hwnd = _GUARD["window"]
+    if hwnd:
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u32 = ctypes.WinDLL("user32", use_last_error=True)
+            u32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM,
+                                         wintypes.LPARAM]
+            u32.PostMessageW(hwnd, msg, 0, 0)
+        except (OSError, AttributeError, ValueError):
+            pass
+
+
+def shutdown_reason(text):
+    """The latest progress, shown on Windows' "preventing shutdown" screen."""
+    if _GUARD["window"] and text and text != _GUARD["reason"]:
+        _GUARD["reason"] = text
+        _post_to_guard(WM_APP_REASON)
+
+
+def allow_shutdown():
+    """Lets Windows shut down again (before --shutdown, and when the script ends)."""
+    t = _GUARD["thread"]
+    if t is None:
+        return
+    _post_to_guard(0x10)                    # (WM_CLOSE: the window goes, the block with it)
+    t.join(5)
+    _GUARD["thread"] = None
+
+
+def run_warnings():
+    """Once, at the start: what could still stop a long run that the script can't prevent."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class SYSTEM_POWER_STATUS(ctypes.Structure):
+            _fields_ = [("ACLineStatus", ctypes.c_ubyte), ("BatteryFlag", ctypes.c_ubyte),
+                        ("BatteryLifePercent", ctypes.c_ubyte),
+                        ("SystemStatusFlag", ctypes.c_ubyte),
+                        ("BatteryLifeTime", wintypes.DWORD),
+                        ("BatteryFullLifeTime", wintypes.DWORD)]
+        st = SYSTEM_POWER_STATUS()
+        k32 = ctypes.WinDLL("kernel32")
+        k32.GetSystemPowerStatus.argtypes = [ctypes.POINTER(SYSTEM_POWER_STATUS)]
+        on_battery = bool(k32.GetSystemPowerStatus(ctypes.byref(st))) and \
+            st.ACLineStatus == 0 and st.BatteryFlag != 128      # (128: no battery)
+        if on_battery:
+            print("WARNING: the laptop is running on battery: plug it in (the GPU slows down a "
+                  "lot on battery, and the run stops when the battery runs out)", flush=True)
+    except (OSError, AttributeError, ValueError):
+        on_battery = False
+    # closing the lid sleeps the laptop whatever a program asks: say so if that is set
+    try:
+        out = subprocess.run(["powercfg", "/query", "SCHEME_CURRENT", "SUB_BUTTONS", "LIDACTION"],
+                             capture_output=True, stdin=subprocess.DEVNULL, timeout=15,
+                             **_NO_WINDOW).stdout.decode("utf-8", "replace")
+        # (the last two numbers are the plugged-in and the battery setting, in any language)
+        vals = [int(x, 16) for x in re.findall(r"0x([0-9a-fA-F]{8})", out)][-2:]
+        if len(vals) == 2 and vals[1 if on_battery else 0] != 0:
+            print("NOTE: closing the laptop's lid puts it to sleep, which stops the run (it "
+                  "resumes when run again). Keep the lid open, or set Control Panel > Power "
+                  "Options > \"Choose what closing the lid does\" to \"Do nothing\" when plugged "
+                  "in (and keep the laptop out of a bag: it runs hot)", flush=True)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    # Windows Update with a restart waiting can restart the PC in the night (outside the active
+    # hours), and that kind of restart doesn't wait for programs
+    try:
+        import winreg
+        winreg.CloseKey(winreg.OpenKey(
+            winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion"
+            r"\WindowsUpdate\Auto Update\RebootRequired"))
+        print("WARNING: Windows Update is waiting to restart the PC and may do it during this "
+              "run. Restart first, or pause updates (Settings > Windows Update > Pause updates) "
+              "for a long run.", flush=True)
+    except (OSError, ImportError):
+        pass
 
 
 def hold_lock(path, message):
@@ -3871,46 +4305,11 @@ class Chunk:
         a, tmp, label = self.a, self.tmp, self.label
         try:
             w, h = png_size(tmp / "in" / "000001.png")
-            frames = n_in * w * h * a.scale ** 2 * 1.8      # measured ~1.7 bytes a pixel
-            # (--faces: the frames with faces are written once more, next to them)
-            need = frames * (2 if a.faces else 1) + 1e9
-            # a helper GPU (--gpu 0,1) also leaves room for the main GPU's next chunk
-            want = need + frames if self.lane else need
-            while True:
-                with DISK_LOCK:
-                    # the frames the other GPUs are still to write count as used already
-                    free = shutil.disk_usage(tmp).free - sum(
-                        frames_to_come(c, *v) for c, v in list(UPSCALING.items())
-                        if c is not self)
-                    if free >= want:
-                        UPSCALING[self] = (frames, n_in)
-                        break
-                if self.make_room and self.make_room("disk"):
-                    continue        # the other GPUs stopped and their frames are gone: again
-                if self.lane:
-                    raise RuntimeError("the drive with the work folder is too full for two "
-                                       "chunks at once")
-                raise RuntimeError(
-                    f"the drive with the work folder needs about {need / 1e9:.0f} GB free for "
-                    f"this chunk's upscaled frames and has {free / 1e9:.1f} GB: make room (or "
-                    "use --work on another drive)")
+            self._reserve_disk(n_in, w, h)
             watch, t_up0, blacks = None, time.time(), set()
             try:
                 watch = GpuWatch() if not self.lane else None
-                # black frames upscale to black frames: not sent to the upscaler. Their inputs
-                # are moved out of in/ (back after the upscale, for the checks and the blend)
-                # and their outputs written only after it, so out/ holds exactly what the GPU
-                # made (the retry, the frame counts and the progress all read it that way)
-                if not getattr(a, "no_skip_black", False):
-                    found = [f.name for f in sorted((tmp / "in").glob("*.png"))
-                             if png_is_black(f)]
-                    if len(found) == n_in:
-                        found = found[:-1]      # (the upscaler is given at least one frame)
-                    if found:
-                        (tmp / "in_black").mkdir(exist_ok=True)
-                        for name in found:
-                            os.replace(tmp / "in" / name, tmp / "in_black" / name)
-                        blacks = set(found)
+                blacks = self._set_aside_blacks(n_in)
                 n_ai = n_in - len(blacks)       # (frames the upscaler is to make)
                 attempt, src, kept = 0, tmp / "in", 0
                 while True:
@@ -3925,14 +4324,7 @@ class Chunk:
                                                "(GPU out of memory? try --tile 128)"
                                                + ("" if self.lane else upscaler_log_tail(
                                                    tmp / "upscaler_log.txt")))
-                        if blacks:
-                            # the black frames' outputs, and their inputs back where the checks
-                            # and the blend look for them
-                            write_black_png(tmp / "black.png", w * a.scale, h * a.scale)
-                            for name in sorted(blacks):
-                                shutil.copyfile(tmp / "black.png", tmp / "out" / name)
-                                os.replace(tmp / "in_black" / name, tmp / "in" / name)
-                            (tmp / "black.png").unlink()
+                        self._put_back_blacks(blacks, w, h)
                         check_frames(a, tmp, n_in, strict=bool(self.lane))
                         if not self.lane:
                             FRAMES_OK[0] += n_ai - kept
@@ -3942,145 +4334,219 @@ class Chunk:
                         # (no second try on a helper GPU: the main GPU redoes its chunk)
                         if self.lane:
                             raise
-                        # less on the GPU at once needs less of its memory and gives shorter
-                        # pieces of GPU work: one step down per failed try, for the rest of the
-                        # run (see GPU_STEPS; --gpu-threads and --tile are kept). Tried again
-                        # once in any case, and as long as there is a step left
-                        tried = gpu_load_text(a)
-                        # the frames finished before a GPU error are kept, and the next try
-                        # does only the rest: so a GPU that is reset now and then still gets
-                        # through, and at the last step a try that got further goes on
-                        good = set(getattr(e, "good", ()))
-                        new, further = len(good) - kept, len(good) > kept
-                        kept = len(good)
-                        # only a GPU error lowers the load (not a full disk, say: smaller tiles
-                        # change the picture a little), and only when it came soon: after 120
-                        # new frames or more, a reset costs less (~25 s) than a step down would
-                        # for the rest of the run
-                        gpu_err = isinstance(e, GPUError)
-                        # (counted across chunks and runs: one reset early in a chunk after
-                        # hours without one doesn't step down for good)
-                        since = FRAMES_OK[0] + max(0, new)
-                        if gpu_err:
-                            FRAMES_OK[0] = 0
-                            save_gpu_step(a, frames_only=True)
-                        lower = gpu_err and since < 120 and lower_gpu_load(a)
-                        if attempt >= 2 and not lower and not (further and attempt < 12):
-                            if GPU_STEP[0] and isinstance(e, GPUError):
-                                raise RuntimeError(
-                                    f"{str(e).rstrip('.')}, also with {gpu_load_text(a)} (the "
-                                    "least this script tries). Update the graphics driver, plug "
-                                    "the laptop in, and close other programs that use the GPU"
-                                    + ("; or try --model realesrgan-x4plus" if "x2plus" in a.model
-                                       else "")) from e
-                            raise
-                        # a new upscaler process gets a fresh GPU device (after a driver
-                        # reset, say). Another upscaler on the same GPU (--gpu-jobs) may have
-                        # taken the memory this one needed: it stops, and this one goes alone
-                        if self.make_room:
-                            self.make_room("retry")
-                        retry_note = f"going down to {gpu_load_text(a)} and " if lower else ""
-                        windows = (gpu_report(a, self.tmp.parent, label, e, tried,
-                                              tmp / "upscaler_log.txt") if gpu_err else "")
-                        status_line()
-                        # (the retry on the first line, any upscaler output below it)
-                        first, _, rest = str(e).partition("\n")
-                        print(f"  {label}: {first.rstrip('.')} - "
-                              + (f"keeping those {kept}; " if kept else "") + retry_note
-                              + (f"trying the other {n_ai - kept} once more." if kept else
-                                 "trying this chunk once more.")
-                              + (f"\n{rest}" if rest else ""), flush=True)
-                        if windows:
-                            print(f"  (Windows recorded: {windows})", flush=True)
-                        if gpu_err and len(GPU_REPORTS) == 1:
-                            print(f"  (details for a bug report: "
-                                  f"{self.tmp.parent.resolve() / 'gpu_errors.log'})", flush=True)
-                        for f in list((tmp / "out").iterdir()):
-                            if f.name not in good:
-                                f.unlink(missing_ok=True)
-                        # (a failed check after the black frames were put in: their inputs
-                        # go aside again, else the upscaler gets them and makes too many)
-                        for name in blacks:
-                            if (tmp / "in" / name).exists():
-                                (tmp / "in_black").mkdir(exist_ok=True)
-                                os.replace(tmp / "in" / name, tmp / "in_black" / name)
-                        shutil.rmtree(tmp / "in_rest", ignore_errors=True)
-                        src = tmp / "in"
-                        if good:
-                            src = tmp / "in_rest"
-                            src.mkdir()
-                            for f in (tmp / "in").glob("*.png"):
-                                if f.name not in good:
-                                    try:
-                                        os.link(f, src / f.name)
-                                    except OSError:
-                                        shutil.copyfile(f, src / f.name)
-                        if "reset" in first:
-                            # Windows takes a few seconds to restart the graphics driver, and
-                            # crashes for good when it has to 6 times within a minute: 15 s, and
-                            # never more than 3 resets in 60 s
-                            now = time.time()
-                            RESET_TIMES.append(now)
-                            recent = [t for t in RESET_TIMES if now - t < 60]
-                            wait = max(15, 60 - (now - recent[-3]) if len(recent) >= 3 else 0)
-                            status_line(f"  {label}: waiting {wait:.0f} s for the graphics "
-                                        "driver to recover")
-                            time.sleep(wait)
+                        src, kept = self._before_retry(e, attempt, kept, n_ai, blacks)
             finally:
                 if watch:
                     watch.stop.set()        # (also when the chunk failed or was stopped)
                 with DISK_LOCK:
                     UPSCALING.pop(self, None)
-            # where the upscale's seconds went: the upscaler starting (to its first frame), the
-            # frames at full speed, and what came after the last one (checks)
-            try:
-                times = sorted(f.stat().st_mtime for f in (tmp / "out").glob("*.png")
-                               if f.name not in blacks)
-                if len(times) > 10 and not self.lane:
-                    self.up_info = (f"start {times[0] - t_up0:.0f}s, "
-                                    f"{(len(times) - 1) / max(1e-6, times[-1] - times[0]):.2f} "
-                                    f"frames/s, after {time.time() - times[-1]:.0f}s")
-                    self.gpu_info = watch.summary() if watch else ""
-                if blacks and not self.lane:
-                    self.up_info += f"{', ' if self.up_info else ''}{len(blacks)} black frames not upscaled"
-            except OSError:
-                pass
+            self._note_timing(t_up0, blacks, watch)
             if watch:
                 watch.stop.set()
-            ins = ["-framerate", a.fps, "-i", pngs(tmp / "out")]
-            if a.ai_blend < 1:
-                # mix the AI frames with a plain upscale of the same input frames, so frames
-                # where the model adds detail and frames where it doesn't look less different
-                ins += ["-framerate", a.fps, "-i", pngs(tmp / "in")]
-                if getattr(a, "detail_blend", False):
-                    # crowds, grass, gravel (dense small detail): less of the AI there, which
-                    # paints it flat and makes it shimmer; the rest keeps --ai-blend (see
-                    # detail_blend_mask)
-                    graph = (f"[1:v]split=2[p1][p2];[p1]scale=iw*{a.scale}:ih*{a.scale}:"
-                             f"flags=lanczos,format=gbrp[plain];[p2]{detail_blend_mask(a)},"
-                             f"scale=iw*{a.scale}:ih*{a.scale}:flags=bilinear,format=gbrp[mask];"
-                             f"[0:v]format=gbrp[ai];[ai][plain][mask]maskedmerge")
-                else:
-                    graph = (f"[1:v]scale=iw*{a.scale}:ih*{a.scale}:flags=lanczos,"
-                             f"format=gbrp[plain];[0:v]format=gbrp[ai];"
-                             f"[ai][plain]blend=all_mode=normal:all_opacity={a.ai_blend}")
-            else:
-                graph = "[0:v]null"
-            k = min(12, n_in - 1)
-            if a.smooth > 0 and k > 0:
-                # the temporal smoothing would start "cold" on every chunk's first frame (a
-                # visible sharp-to-soft breath every chunk); warm it up on the next k frames
-                # played backwards, then cut those warm-up frames off again
-                graph += (f",split[wa][wb];[wa]trim=start_frame=1:end_frame={k + 1},reverse[wr];"
-                          f"[wr][wb]concat=n=2:v=1:a=0,{postfilter(a)},"
-                          f"trim=start_frame={k},setpts=PTS-STARTPTS")
-            else:
-                graph += "," + postfilter(a)
-            self.encode = ["ffmpeg", "-y", "-v", "error", *ins, "-filter_complex", graph,
-                           *encode_args(a), self.part]
+            self.encode = ["ffmpeg", "-y", "-v", "error", *self._encode_inputs(),
+                           "-filter_complex", self._encode_graph(n_in), *encode_args(a),
+                           self.part]
         except BaseException:
             self.clear_frames()
             raise
+
+    def _reserve_disk(self, n_in, w, h):
+        """Waits until the drive has room for this chunk's upscaled frames (counting what the
+        other upscalers are still to write), and books it."""
+        a, tmp = self.a, self.tmp
+        frames = n_in * w * h * a.scale ** 2 * 1.8      # measured ~1.7 bytes a pixel
+        # (--faces: the frames with faces are written once more, next to them)
+        need = frames * (2 if a.faces else 1) + 1e9
+        # a helper GPU (--gpu 0,1) also leaves room for the main GPU's next chunk
+        want = need + frames if self.lane else need
+        while True:
+            with DISK_LOCK:
+                # the frames the other GPUs are still to write count as used already
+                free = shutil.disk_usage(tmp).free - sum(
+                    frames_to_come(c, *v) for c, v in list(UPSCALING.items())
+                    if c is not self)
+                if free >= want:
+                    UPSCALING[self] = (frames, n_in)
+                    return
+            if self.make_room and self.make_room("disk"):
+                continue        # the other GPUs stopped and their frames are gone: again
+            if self.lane:
+                raise RuntimeError("the drive with the work folder is too full for two "
+                                   "chunks at once")
+            raise RuntimeError(
+                f"the drive with the work folder needs about {need / 1e9:.0f} GB free for "
+                f"this chunk's upscaled frames and has {free / 1e9:.1f} GB: make room (or "
+                "use --work on another drive)")
+
+    def _set_aside_blacks(self, n_in):
+        """Black frames upscale to black frames: not sent to the upscaler. Their inputs are moved
+        out of in/ (back after the upscale, for the checks and the blend) and their outputs
+        written only after it, so out/ holds exactly what the GPU made (the retry, the frame
+        counts and the progress all read it that way). Returns their names."""
+        tmp = self.tmp
+        if getattr(self.a, "no_skip_black", False):
+            return set()
+        found = [f.name for f in sorted((tmp / "in").glob("*.png")) if png_is_black(f)]
+        if len(found) == n_in:
+            found = found[:-1]      # (the upscaler is given at least one frame)
+        if found:
+            (tmp / "in_black").mkdir(exist_ok=True)
+            for name in found:
+                os.replace(tmp / "in" / name, tmp / "in_black" / name)
+        return set(found)
+
+    def _put_back_blacks(self, blacks, w, h):
+        """The black frames' outputs, and their inputs back where the checks and the blend look
+        for them."""
+        if not blacks:
+            return
+        tmp, scale = self.tmp, self.a.scale
+        write_black_png(tmp / "black.png", w * scale, h * scale)
+        for name in sorted(blacks):
+            shutil.copyfile(tmp / "black.png", tmp / "out" / name)
+            os.replace(tmp / "in_black" / name, tmp / "in" / name)
+        (tmp / "black.png").unlink()
+
+    def _before_retry(self, e, attempt, kept, n_ai, blacks):
+        """The main upscaler failed on this chunk (e): either gives up (raises) or gets the next
+        try ready. Returns (folder of the frames still to do, frames kept from before)."""
+        a, tmp, label = self.a, self.tmp, self.label
+        # less on the GPU at once needs less of its memory and gives shorter pieces of GPU work:
+        # one step down per failed try, for the rest of the run (see GPU_STEPS; --gpu-threads
+        # and --tile are kept). Tried again once in any case, and as long as there is a step left
+        tried = gpu_load_text(a)
+        # the frames finished before a GPU error are kept, and the next try does only the rest:
+        # so a GPU that is reset now and then still gets through, and at the last step a try that
+        # got further goes on
+        good = set(getattr(e, "good", ()))
+        new, further = len(good) - kept, len(good) > kept
+        kept = len(good)
+        # only a GPU error lowers the load (not a full disk, say: smaller tiles change the
+        # picture a little), and only when it came soon: after 120 new frames or more, a reset
+        # costs less (~25 s) than a step down would for the rest of the run
+        gpu_err = isinstance(e, GPUError)
+        # (counted across chunks and runs: one reset early in a chunk after hours without one
+        # doesn't step down for good)
+        since = FRAMES_OK[0] + max(0, new)
+        if gpu_err:
+            FRAMES_OK[0] = 0
+            save_gpu_step(a, frames_only=True)
+        lower = gpu_err and since < 120 and lower_gpu_load(a)
+        if attempt >= 2 and not lower and not (further and attempt < 12):
+            if GPU_STEP[0] and gpu_err:
+                raise RuntimeError(
+                    f"{str(e).rstrip('.')}, also with {gpu_load_text(a)} (the least this "
+                    "script tries). Update the graphics driver, plug the laptop in, and close "
+                    "other programs that use the GPU"
+                    + ("; or try --model realesrgan-x4plus" if "x2plus" in a.model else "")
+                ) from e
+            raise e
+        # a new upscaler process gets a fresh GPU device (after a driver reset, say). Another
+        # upscaler on the same GPU (--gpu-jobs) may have taken the memory this one needed: it
+        # stops, and this one goes alone
+        if self.make_room:
+            self.make_room("retry")
+        retry_note = f"going down to {gpu_load_text(a)} and " if lower else ""
+        windows = (gpu_report(a, tmp.parent, label, e, tried, tmp / "upscaler_log.txt")
+                   if gpu_err else "")
+        status_line()
+        # (the retry on the first line, any upscaler output below it)
+        first, _, rest = str(e).partition("\n")
+        print(f"  {label}: {first.rstrip('.')} - "
+              + (f"keeping those {kept}; " if kept else "") + retry_note
+              + (f"trying the other {n_ai - kept} once more." if kept else
+                 "trying this chunk once more.")
+              + (f"\n{rest}" if rest else ""), flush=True)
+        if windows:
+            print(f"  (Windows recorded: {windows})", flush=True)
+        if gpu_err and len(GPU_REPORTS) == 1:
+            print(f"  (details for a bug report: "
+                  f"{tmp.parent.resolve() / 'gpu_errors.log'})", flush=True)
+        for f in list((tmp / "out").iterdir()):
+            if f.name not in good:
+                f.unlink(missing_ok=True)
+        # (a failed check after the black frames were put in: their inputs go aside again, else
+        # the upscaler gets them and makes too many)
+        for name in blacks:
+            if (tmp / "in" / name).exists():
+                (tmp / "in_black").mkdir(exist_ok=True)
+                os.replace(tmp / "in" / name, tmp / "in_black" / name)
+        shutil.rmtree(tmp / "in_rest", ignore_errors=True)
+        src = tmp / "in"
+        if good:
+            src = tmp / "in_rest"
+            src.mkdir()
+            for f in (tmp / "in").glob("*.png"):
+                if f.name not in good:
+                    try:
+                        os.link(f, src / f.name)
+                    except OSError:
+                        shutil.copyfile(f, src / f.name)
+        if "reset" in first:
+            # Windows takes a few seconds to restart the graphics driver, and crashes for good
+            # when it has to 6 times within a minute: 15 s, and never more than 3 resets in 60 s
+            now = time.time()
+            RESET_TIMES.append(now)
+            recent = [t for t in RESET_TIMES if now - t < 60]
+            wait = max(15, 60 - (now - recent[-3]) if len(recent) >= 3 else 0)
+            status_line(f"  {label}: waiting {wait:.0f} s for the graphics driver to recover")
+            time.sleep(wait)
+        return src, kept
+
+    def _note_timing(self, t_up0, blacks, watch):
+        """Where the upscale's seconds went: the upscaler starting (to its first frame), the
+        frames at full speed, and what came after the last one (checks)."""
+        try:
+            times = sorted(f.stat().st_mtime for f in (self.tmp / "out").glob("*.png")
+                           if f.name not in blacks)
+            if len(times) > 10 and not self.lane:
+                self.up_info = (f"start {times[0] - t_up0:.0f}s, "
+                                f"{(len(times) - 1) / max(1e-6, times[-1] - times[0]):.2f} "
+                                f"frames/s, after {time.time() - times[-1]:.0f}s")
+                self.gpu_info = watch.summary() if watch else ""
+            if blacks and not self.lane:
+                self.up_info += f"{', ' if self.up_info else ''}{len(blacks)} black frames not upscaled"
+        except OSError:
+            pass
+
+    def _encode_inputs(self):
+        a, tmp = self.a, self.tmp
+        ins = ["-framerate", a.fps, "-i", pngs(tmp / "out")]
+        if a.ai_blend < 1:
+            ins += ["-framerate", a.fps, "-i", pngs(tmp / "in")]
+        return ins
+
+    def _encode_graph(self, n_in):
+        """The filters from the upscaled frames to the encoder: the blend with a plain upscale
+        (--ai-blend), then the post filters (smoothing warmed up, colour, resize, sharpen)."""
+        a = self.a
+        if a.ai_blend < 1:
+            # mix the AI frames with a plain upscale of the same input frames, so frames where
+            # the model adds detail and frames where it doesn't look less different
+            if getattr(a, "detail_blend", False):
+                # crowds, grass, gravel (dense small detail): less of the AI there, which paints
+                # it flat and makes it shimmer; the rest keeps --ai-blend (see detail_blend_mask)
+                graph = (f"[1:v]split=2[p1][p2];[p1]scale=iw*{a.scale}:ih*{a.scale}:"
+                         f"flags=lanczos,format=gbrp[plain];[p2]{detail_blend_mask(a)},"
+                         f"scale=iw*{a.scale}:ih*{a.scale}:flags=bilinear,format=gbrp[mask];"
+                         f"[0:v]format=gbrp[ai];[ai][plain][mask]maskedmerge")
+            else:
+                graph = (f"[1:v]scale=iw*{a.scale}:ih*{a.scale}:flags=lanczos,"
+                         f"format=gbrp[plain];[0:v]format=gbrp[ai];"
+                         f"[ai][plain]blend=all_mode=normal:all_opacity={a.ai_blend}")
+        else:
+            graph = "[0:v]null"
+        k = min(12, n_in - 1)
+        if a.smooth > 0 and k > 0:
+            # the temporal smoothing would start "cold" on every chunk's first frame (a visible
+            # sharp-to-soft breath every chunk); warm it up on the next k frames played
+            # backwards, then cut those warm-up frames off again
+            graph += (f",split[wa][wb];[wa]trim=start_frame=1:end_frame={k + 1},reverse[wr];"
+                      f"[wr][wb]concat=n=2:v=1:a=0,{postfilter(a)},"
+                      f"trim=start_frame={k},setpts=PTS-STARTPTS")
+        else:
+            graph += "," + postfilter(a)
+        return graph
 
     def write_stab(self):
         """--stabilize: this chunk's piece of the camera-motion file, in its tmp folder, where
@@ -4325,6 +4791,9 @@ def probe_or_exit(src):
         return probe(src)
     except subprocess.CalledProcessError:
         sys.exit(f"Could not read '{src}' (see the ffprobe error above)")
+    except subprocess.TimeoutExpired:
+        sys.exit(f"Could not read '{src}': ffprobe got no answer from it in "
+                 f"{LONG_PROBE_TIMEOUT} s (a damaged file, or a drive that stopped answering?)")
     except (ValueError, KeyError) as e:
         sys.exit(f"Could not read '{src}': {e}")
 
@@ -4401,6 +4870,30 @@ _cs_BW_INK, _cs_BW_INK_HIGH = 1.2, 1.5               # dark-line ratio; non-anim
 _cs_NPL = 7                                  # planes per sample: Y, median(Y), Laplacian, black/white top-hat, U, V
 
 
+# ---- shared by the three detectors below (pictures, motion, VHS) ----------------------------
+
+_NO_WINDOW = ({"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)}
+              if os.name == "nt" else {})      # no console window flashing for every ffmpeg call
+
+
+def _quiet_run(cmd, timeout=60):
+    """(exit code, stdout bytes) of a command, stderr discarded; (-1, b"") if it couldn't run or
+    took longer than timeout. Never raises."""
+    try:
+        p = subprocess.run([str(c) for c in cmd], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           timeout=timeout, **_NO_WINDOW)
+        return p.returncode, p.stdout
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return -1, b""
+
+
+def _median(v, empty=None):
+    """The median of v (the mean of the middle two for an even count); `empty` for none."""
+    v = list(v)
+    return statistics.median(v) if v else empty
+
+
 def _cs_logit(x):
     x = min(max(x, 0.005), 0.95)
     return math.log(x / (1.0 - x))
@@ -4408,15 +4901,6 @@ def _cs_logit(x):
 
 def _cs_sig(z):
     return 1.0 / (1.0 + math.exp(-max(-60.0, min(60.0, z))))
-
-
-def _cs_run(cmd, timeout=60):
-    try:
-        p = subprocess.run([str(c) for c in cmd], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                           stderr=subprocess.DEVNULL, timeout=timeout)
-        return p.returncode, p.stdout
-    except (OSError, subprocess.SubprocessError):
-        return -1, b""
 
 
 def _cs_num(x):
@@ -4437,7 +4921,7 @@ def _cs_num(x):
 
 
 def _cs_probe(path, ffprobe):
-    rc, out = _cs_run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+    rc, out = _quiet_run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
                     "stream=width,height,duration:stream_tags:format=duration,size,bit_rate",
                     "-of", "json", path])
     try:
@@ -4455,7 +4939,7 @@ def _cs_probe(path, ffprobe):
         size = _cs_num(fm.get("size")) or (os.path.getsize(path) if os.path.isfile(path) else None)
         rate = _cs_num(fm.get("bit_rate"))
         if not rate:
-            rc, pk = _cs_run([ffprobe, "-v", "error", "-read_intervals", "%+20", "-show_entries",
+            rc, pk = _quiet_run([ffprobe, "-v", "error", "-read_intervals", "%+20", "-show_entries",
                            "packet=pts_time,size", "-of", "csv=p=0", path])
             tot, ts = 0, []
             for line in pk.decode("ascii", "replace").splitlines():
@@ -4507,7 +4991,7 @@ def _cs_grab(ffmpeg, path, t, pre, W, H, keyonly=True, count=1, select=None, lim
         fc = fc.replace("[0:v:0]", f"[0:v:0]{select},")
     cmd += ["-filter_complex", fc, "-map", "[out]", "-an", "-sn", "-dn", "-frames:v", str(count),
             "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"]
-    rc, out = _cs_run(cmd, timeout=120)
+    rc, out = _quiet_run(cmd, timeout=120)
     n = W * H * _cs_NPL
     return [out[i:i + n] for i in range(0, len(out) - n + 1, n)]
 
@@ -4780,21 +5264,6 @@ _ct_N_BURSTS = 36
 _ct_BURST_FRAMES = 23        # frames decoded per burst (first 2 are dropped: open-GOP B frames)
 _ct_SKIP = 2
 
-_ct_NOWIN = {}
-if os.name == "nt":      # no console window flashing for every ffmpeg call
-    _ct_NOWIN["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
-
-
-def _ct_run(cmd, timeout=60):
-    try:
-        p = subprocess.run([str(c) for c in cmd], stdin=subprocess.DEVNULL,
-                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                           timeout=timeout, **_ct_NOWIN)
-        return p.stdout
-    except (OSError, subprocess.SubprocessError):
-        return b""
-
-
 def _ct_num(x):
     try:
         if isinstance(x, str) and "/" in x:
@@ -4818,9 +5287,9 @@ def _ct_hms(x):
 
 def _ct_probe(path, ffprobe):
     """Candidate video durations (best first), nominal fps, container start time."""
-    out = _ct_run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+    out = _quiet_run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
                 "stream=avg_frame_rate,r_frame_rate,duration:stream_tags:format=duration,start_time",
-                "-of", "json", path])
+                "-of", "json", path])[1]
     try:
         j = json.loads(out.decode("utf-8", "replace") or "{}")
     except ValueError:
@@ -4842,8 +5311,8 @@ def _ct_probe(path, ffprobe):
 def _ct_coded_rate(path, t, ffprobe):
     """Frames actually stored per second (packets), around time t. Soft-telecined DVD video is
     flagged 29.97 but stores 23.976 frames with repeat-field flags: decoders output 23.976."""
-    out = _ct_run([ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals",
-                "%.3f%%+4" % max(0.0, t), "-show_entries", "packet=pts_time", "-of", "csv=p=0", path])
+    out = _quiet_run([ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals",
+                "%.3f%%+4" % max(0.0, t), "-show_entries", "packet=pts_time", "-of", "csv=p=0", path])[1]
     ts = sorted(_ct_num(x) for x in out.decode("ascii", "replace").split() if x and x != "N/A")
     if len(ts) < 20 or ts[-1] - ts[0] <= 0.5:
         return 0.0
@@ -4851,9 +5320,9 @@ def _ct_coded_rate(path, t, ffprobe):
 
 
 def _ct_has_frame(path, t, ffmpeg):
-    out = _ct_run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", "%.3f" % t,
+    out = _quiet_run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-ss", "%.3f" % t,
                 "-i", path, "-an", "-sn", "-dn", "-frames:v", "1", "-vf", "scale=16:16",
-                "-f", "rawvideo", "-pix_fmt", "gray", "-"], timeout=60)
+                "-f", "rawvideo", "-pix_fmt", "gray", "-"], timeout=60)[1]
     return len(out) >= 256
 
 
@@ -4877,10 +5346,10 @@ def _ct_bursts_sequential(path, ffmpeg, n, period=150):
     graph = ("[0:v]select='lt(mod(n\\,%d)\\,%d)',field=top,format=gray,scale=%d:%d:flags=area,"
              "split[o][x];[x]tblend=all_mode=difference,scale=%d:%d:flags=area,pad=%d:%d[d];"
              "[o]trim=start_frame=1[o2];[o2][d]vstack" % (period, _ct_BURST_FRAMES, _ct_W, _ct_H, _ct_BW, _ct_BH, _ct_W, _ct_BH))
-    out = _ct_run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1",
+    out = _quiet_run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", "1",
                 "-i", path, "-an", "-sn", "-dn", "-filter_complex", graph,
                 "-frames:v", str(n * _ct_BURST_FRAMES - 1), "-fps_mode", "passthrough",
-                "-f", "rawvideo", "-pix_fmt", "gray", "-"], timeout=300)
+                "-f", "rawvideo", "-pix_fmt", "gray", "-"], timeout=300)[1]
     fsz = _ct_W * (_ct_H + _ct_BH)
     frames, diffs = [], []
     for i in range(len(out) // fsz):
@@ -4899,10 +5368,10 @@ def _ct_burst(path, t, ffmpeg, threads=1):
     graph = ("[0:v]field=top,format=gray,scale=%d:%d:flags=area,split[o][x];"
              "[x]tblend=all_mode=difference,scale=%d:%d:flags=area,pad=%d:%d[d];"
              "[o]trim=start_frame=1[o2];[o2][d]vstack" % (_ct_W, _ct_H, _ct_BW, _ct_BH, _ct_W, _ct_BH))
-    out = _ct_run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", str(threads),
+    out = _quiet_run([ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-threads", str(threads),
                 "-noaccurate_seek", "-ss", "%.3f" % max(0.0, t), "-i", path,
                 "-an", "-sn", "-dn", "-filter_complex", graph, "-frames:v", str(_ct_BURST_FRAMES),
-                "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "-"])
+                "-fps_mode", "passthrough", "-f", "rawvideo", "-pix_fmt", "gray", "-"])[1]
     fsz = _ct_W * (_ct_H + _ct_BH)
     frames, diffs = [], []
     for i in range(len(out) // fsz):
@@ -4979,14 +5448,6 @@ def _ct_spatial(img, w):
         bins[k >> 2] += c
     peak = sum(sorted(bins)[-6:]) / float(len(a[::3]))
     return dict(flat=flat, low=low, mid=mid, strong=strong, line=line, peak=peak)
-
-
-def _ct_median(v):
-    s = sorted(v)
-    n = len(s)
-    if not n:
-        return 0.0
-    return s[n // 2] if n % 2 else 0.5 * (s[n // 2 - 1] + s[n // 2])
 
 
 def _ct_q(v, p):
@@ -5124,9 +5585,9 @@ def _ct_pulldown(tl):
     n = len(s) - len(s) % 5
     if n < 10:
         return tl, 0.0
-    med = [_ct_median(s[p:n:5]) for p in range(5)]
+    med = [_median(s[p:n:5], 0.0) for p in range(5)]
     p = min(range(5), key=lambda q: med[q])
-    rest = _ct_median([x for q in range(5) if q != p for x in s[q:n:5]])
+    rest = _median([x for q in range(5) if q != p for x in s[q:n:5]], 0.0)
     if med[p] <= 0.6 * rest:           # a clear repeat phase: pulldown
         return [t for i, t in enumerate(tl[:n]) if i % 5 != p], med[p]
     return _ct_decimate(tl, lambda t: t["s"]), 0.0
@@ -5148,10 +5609,10 @@ def _ct_aggregate(m):
     f = dict(alt=sum(alts) / len(alts) if alts else 0.0,
              twos=sum(1 for a in alts if a >= 0.2) / float(len(alts)) if alts else 0.0,
              active=len(alts), bursts=len(m["trans"]), pictures=len(sp),
-             noise=_ct_median(noise) if noise else -1.0, static=len(noise))
+             noise=_median(noise, 0.0) if noise else -1.0, static=len(noise))
     for k in ("mid", "line", "low", "flat", "strong", "peak"):
-        f[k] = _ct_median([x[k] for x in sp]) if sp else -1.0
-        f[k + "4"] = _ct_median([x[k + "4"] for x in sp]) if sp else -1.0
+        f[k] = _median([x[k] for x in sp], 0.0) if sp else -1.0
+        f[k + "4"] = _median([x[k + "4"] for x in sp], 0.0) if sp else -1.0
     return f
 
 
@@ -5252,20 +5713,6 @@ _src_TIME_BUDGET = 11.0        # stop sampling after this many seconds (hard lim
 
 
 # ---------------------------------------------------------------------------------- helpers ---
-def _src_run(cmd, timeout):
-    """Run a command, return stdout bytes ('' on any failure). Never raises."""
-    try:
-        kw = {}
-        if os.name == "nt":                       # no console window flashing when run from a GUI
-            kw["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        p = subprocess.run([str(c) for c in cmd], stdin=subprocess.DEVNULL,
-                           stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                           timeout=timeout, **kw)
-        return p.stdout
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return b""
-
-
 def _src_frac(x, default=0.0):
     try:
         f = Fraction(str(x).replace(":", "/"))
@@ -5284,21 +5731,13 @@ def _src_hms(x):
         return None
 
 
-def _src_median(v):
-    v = sorted(v)
-    n = len(v)
-    if not n:
-        return None
-    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
-
-
 def _src_probe(path, ffprobe, info):
     """Stream facts. Uses dvd_upscale.py's probe() dict (w, h, sar, fps, duration) when given."""
     meta = {}
-    out = _src_run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
+    out = _quiet_run([ffprobe, "-v", "error", "-select_streams", "v:0", "-show_entries",
                 "stream=codec_name,width,height,sample_aspect_ratio,avg_frame_rate,r_frame_rate,"
                 "field_order,duration:stream_tags:format=duration,format_name",
-                "-of", "json", path], 30)
+                "-of", "json", path], 30)[1]
     try:
         j = json.loads(out.decode("utf-8", "replace") or "{}")
     except ValueError:
@@ -5331,8 +5770,8 @@ def _src_probe(path, ffprobe, info):
 
 def _src_repeat_flags(path, ffprobe):
     """Share of the first ~36 frames carrying MPEG-2 repeat-field flags (soft telecine)."""
-    out = _src_run([ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#36",
-                "-show_entries", "frame=repeat_pict", "-of", "csv=p=0", path], 20)
+    out = _quiet_run([ffprobe, "-v", "error", "-select_streams", "v:0", "-read_intervals", "%+#36",
+                "-show_entries", "frame=repeat_pict", "-of", "csv=p=0", path], 20)[1]
     vals = [ln.strip().strip(",") for ln in out.decode("ascii", "replace").splitlines()]
     vals = [v for v in vals if v.lstrip("-").isdigit()]
     if len(vals) < 8:
@@ -5342,10 +5781,10 @@ def _src_repeat_flags(path, ffprobe):
 
 def _src_grab(path, ffmpeg, t, W, H, n, timeout=20.0):
     """n consecutive frames at t s, luma only, fields deinterleaved (top field rows on top)."""
-    raw = _src_run([ffmpeg, "-v", "error", "-nostdin", "-threads", "2", "-ss", "%.3f" % t,
+    raw = _quiet_run([ffmpeg, "-v", "error", "-nostdin", "-threads", "2", "-ss", "%.3f" % t,
                 "-i", path, "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", str(n),
                 "-vf", "scale=%d:%d:flags=neighbor,il=l=d:c=d,format=gray" % (W, H),
-                "-f", "rawvideo", "-"], timeout)
+                "-f", "rawvideo", "-"], timeout)[1]
     fs = W * H
     return [raw[k * fs:(k + 1) * fs] for k in range(len(raw) // fs)]
 
@@ -5461,8 +5900,8 @@ def _src_border_stats(fields, W, bw, side):
         d = [abs(pos[i] - pos[i - 1]) for i in range(1, len(pos))
              if pos[i] is not None and pos[i - 1] is not None]
         if len(d) >= 20:
-            rag.append(_src_median(d))
-    return _src_median(noise), (_src_median(rag) if len(rag) >= 2 else None)
+            rag.append(_median(d))
+    return _median(noise), (_median(rag) if len(rag) >= 2 else None)
 
 
 def _src_detail_field(acc, row, Hf, x0, x1):
@@ -5571,9 +6010,9 @@ def _src_detect_source(path, ffmpeg="ffmpeg", ffprobe="ffprobe", info=None, _all
     # borders: leading dark columns (column medians over all sampled lines)
     bws = []
     for side in (0, 1):
-        med = [_src_median(c) for c in acc.colvals[side]]
-        edge = _src_median(med[1:4])
-        inner = _src_median(med[24:40])
+        med = [_median(c) for c in acc.colvals[side]]
+        edge = _median(med[1:4])
+        inner = _median(med[24:40])
         bw = 0
         if inner - edge >= 12 and edge < 40:          # a dark band at the frame edge
             thr = min(40, (edge + inner) / 2)
@@ -5602,7 +6041,7 @@ def _src_detect_source(path, ffmpeg="ffmpeg", ffprobe="ffprobe", info=None, _all
     hsrd = (acc.rd_bot / acc.n_rd + 0.5) / (acc.rd_body / acc.n_rd + 0.5) if acc.n_rd else None
     h1h4 = acc.e1 / acc.e4 if acc.e4 > 0 else None
     sc.update(fields=acc.fields, hs_rows=len(acc.hs),
-              hs_sign=None if hs_sign is None else round(hs_sign, 2), hs_median=_src_median(acc.hs),
+              hs_sign=None if hs_sign is None else round(hs_sign, 2), hs_median=_median(acc.hs),
               hs_skew=None if hs_frac is None else round(hs_frac, 3),
               ref_skew=None if ref_frac is None else round(ref_frac, 3),
               hs_contrast=None if hs_c is None else round(hs_c, 3),
@@ -5818,6 +6257,12 @@ def resolve_type(a, find):
     if folder.lower() in TYPE_DIRS:
         a.type = TYPE_DIRS[folder.lower()]
         print(f"Type: {TYPE_NAMES[a.type]} (it's in the '{folder}' folder, as --all does)")
+        return
+    tag = type_from_name(a.input)
+    if tag:
+        a.type = tag
+        print(f"Type: {TYPE_NAMES[a.type]} (its name starts with "
+              f"'{Path(a.input).name[:len(re.match(r'[^_-]*', Path(a.input).name)[0]) + 1]}')")
         return
     try:
         in_folder = bool(json.loads(os.environ.get("DVD_UPSCALE_QUEUE") or "{}").get("folder"))
@@ -6146,8 +6591,9 @@ def build_parser():
     p.add_argument("--model", default=None, help="override model name")
     p.add_argument("--scale", type=int, default=None, help="override model scale")
     p.add_argument("--trained", action="store_true",
-                   help=f"use the model made by training/upscale_training.py ({TRAINED_MODEL}, scale 2): "
-                        "short for --model " + TRAINED_MODEL + " --scale 2")
+                   help="use the model made by upscale_training.py for this kind of movie "
+                        "(ai-anime-x2, ai-cgi-x2, ai-live-x2 or ai-vhs-x2, by the detected --type; else the "
+                        f"older {TRAINED_MODEL}), scale 2")
     p.add_argument("--height", type=int, default=1080)
     p.add_argument("--dar", default=None, help="force aspect, e.g. 16:9 or 4:3")
     p.add_argument("--fps", default=None, help="override output fps, e.g. 24000/1001")
@@ -6160,6 +6606,9 @@ def build_parser():
                         "Tailscale and the home network; --phone PORT: another port (default "
                         f"{PHONE_PORT})")
     p.add_argument("--no-phone", action="store_true", help="don't serve the phone page")
+    p.add_argument("--no-guard", action="store_true",
+                   help="Windows: leave the console's QuickEdit mode on and don't block a "
+                        "shutdown or restart while it runs (sleep is still prevented)")
     p.add_argument("--esrgan", default=ESRGAN_DEFAULT)
     p.add_argument("--engine", choices=("auto", "exe", "ncnn"), default="auto", dest="engine_choice",
                    help="what runs the big models (x2plus, x4plus): ncnn, the current ncnn from "
@@ -6544,12 +6993,14 @@ def commands_text():
     width = max((len(n) for n, _ in rows), default=0) + 2
     lines = ["", "EVERY OPTION (from --help; add to any command above)"]
     lines += [f"  {n:<{width}}{h[:150]}" for n, h in sorted(rows)]
-    lines += ["", "(--faces-worker and --ncnn-upscaler are used by the script itself: not for typing)"]
+    lines += ["", "python dvd_upscale.py --self-test   checks the script's own logic (a few seconds, "
+              "no GPU; after changing the script)",
+              "(--faces-worker and --ncnn-upscaler are used by the script itself: not for typing)"]
     return QUICK_START + COMMANDS + "\n".join(lines) + "\n"
 
 
-def main():
-    a = build_parser().parse_args()
+def start_run(a):
+    """Work folder, input/output sanity, the tools next to this script; returns find(tool)."""
     phone_movie(Path(a.input).name)
     check_values(a)
     a.combed = a.fix_combed     # (--clip --upscale: as detected for the whole movie)
@@ -6570,9 +7021,17 @@ def main():
     if find("ffmpeg"):
         check_ffmpeg()
     resolve_type(a, find)
+    a.trained_pick = a.trained and a.model is None     # (the model for the type, once its folder is known)
     if a.trained:
         a.model = a.model or TRAINED_MODEL
         a.scale = a.scale or 2
+    return find
+
+
+def pick_preset(a, find):
+    """The type's preset (model, scale, chunk size, denoise, AI blend, smoothing, sharpening), with
+    what was given on the command line kept; returns what the user gave, and the VHS probe."""
+    vhs_info = None
     if not a.fast and not a.analyze and a.type != "vhs" and not a.no_profile:
         inject_gpu_hardware_profile(a)
     # model, scale, chunk frames, pre-denoise (hqdn3d), ai blend, post smoothing, sharpen
@@ -6607,6 +7066,11 @@ def main():
         a.mode = "telecine"
     if a.dar:
         a.dar = a.dar.replace(":", "/")     # (checked in check_values)
+    return (user_model, user_blend, user_sharpen, user_chunk, user_scale), vhs_info
+
+
+def check_output(a):
+    """Output name, folder and free space, checked before hours of work."""
     if a.output is None:
         out = default_output(a.input, height=a.height)
         # a preview gets its own name: it must never replace the finished movie
@@ -6658,12 +7122,18 @@ def main():
             pass            # (a share that can't say how much is free)
         print(f"Saving to: {a.output}")
 
+
+def pick_model(a, find, user):
+    """The upscaler model actually used: the preset's, or the next best installed one."""
+    user_model, user_blend, user_sharpen, user_chunk, user_scale = user
     tools = ["ffmpeg", "ffprobe"] + ([] if a.fast or a.analyze else [a.esrgan])
     for t in tools:
         if not find(t):
             sys.exit(f"Missing tool: {t}")
     if not a.fast and not a.analyze:
         a.esrgan_path = find(a.esrgan)
+        if a.trained_pick:
+            a.model = trained_model(a)
         best = ncnn_saved().get("best_model")
         if a.best_quality and not best:
             print("NOTE: --best-quality: no best model is saved yet: run "
@@ -6748,6 +7218,9 @@ def main():
         if "x2plus" in a.model and a.scale != 2:
             sys.exit("realesrgan-x2plus needs --scale 2")
 
+
+def pick_engine(a):
+    """Which engine runs the model, and how much the GPU is given at once."""
     if not a.fast and not a.analyze:
         # the big models: the current ncnn if it is there (see ncnn_upscaler_main); the small
         # anime/camcorder ones stay on realesrgan-ncnn-vulkan, which runs them fine
@@ -6782,6 +7255,10 @@ def main():
         print(f"GPU settings: {gpu_load_text(a)}; {jobs_note}"
               + (f" (what this GPU needed before; to try more again, delete "
                  f"{gpu_step_file().name} next to {Path(__file__).name})" if GPU_STEP[0] else ""))
+
+
+def pick_faces(a):
+    """Face restoration on or off for this movie."""
     # face restoration: on by itself for live action and tapes (when its packages and model
     # files are installed: else the movie goes on without, see faces_check), only when asked
     # for 3D animation (its model was trained on photos: animated faces can turn photographic),
@@ -6807,6 +7284,10 @@ def main():
     elif a.faces is not None and a.type == "cgi" and not a.analyze:
         print("NOTE: --faces on 3D animation: its model was trained on photos, so characters' "
               "faces can come out photographic. Check a clip first (--clip ... --upscale)")
+
+
+def read_source(a, vhs_info):
+    """The source's size, aspect and frame rate; the output size from them."""
     info = vhs_info if a.type == "vhs" else probe_or_exit(a.input)
     sar_txt = f"{info['sar'].numerator}:{info['sar'].denominator}"
     print(f"Source: {info['w']}x{info['h']}, SAR {sar_txt}, "
@@ -6839,7 +7320,11 @@ def main():
     if min(abs(out_ratio - 4 / 3), abs(out_ratio - 16 / 9)) > 0.05 * out_ratio:
         print(f"WARNING: output aspect would be {out_ratio:.2f}:1, which is odd. "
               "If the picture looks squeezed/stretched, pass --dar 16:9 or --dar 4:3")
+    return info
 
+
+def detect_frames(a, info):
+    """Film or video (telecine / progressive / interlaced), and the real frame rate."""
     measured, kept, regular = (None, 1.0, 0.0) if a.type == "vhs" else cadence(a, info)
     if measured:
         print(f"Actual frames in file: {float(measured):.3f} fps")
@@ -6916,12 +7401,11 @@ def main():
             print(f"Detected: {a.mode} ({detail})")
     else:
         print(f"Mode: {a.mode} (forced)")
-    if a.analyze:
-        report = os.environ.get("DVD_UPSCALE_REPORT")
-        if report:
-            Path(report).write_text(json.dumps(dict(type=a.type, mode=a.mode,
-                                                    combed=bool(getattr(a, "combed", False)))))
-        return
+    return measured
+
+
+def check_ai(a):
+    """The upscaler and the face restoration, tried before the movie starts."""
     if not a.fast:
         check_upscaler(a)       # (exits if the model's files are broken or the GPU fails)
     if a.faces:
@@ -6938,6 +7422,9 @@ def main():
                     "_work folder. --no-faces hides this note.)", flush=True)
             a.faces = a.faces_auto = None
 
+
+def pick_fps(a, info, measured):
+    """The output frame rate (and the VHS chunk rounding and warm-up)."""
     if a.fps is None and a.type == "vhs":
         if a.mode == "telecine":
             fps = a.vhs_fin * 4 / 5 if a.vhs_fin > 26 else a.vhs_fin    # PAL film is 2:2
@@ -6985,7 +7472,11 @@ def main():
         pre = 10 if a.mode == "telecine" else 6
         trim = pre * fps / a.vhs_fin
         a.vhs_warm = (pre, int(trim)) if trim.denominator == 1 else (0, 0)
+    return fps
 
+
+def setup_stabilize(a, info, fps):
+    """--stabilize: the smoothing and zoom settings."""
     if a.stabilize:
         if "vidstabtransform" not in capture(["ffmpeg", "-hide_banner", "-filters"])[1]:
             sys.exit("--stabilize needs an ffmpeg with vid.stab (the vidstabdetect and "
@@ -7008,6 +7499,9 @@ def main():
         # reach, in whole multiples of 4 (whole 3:2 cycles, whole tape frames)
         a.stab_margin = -(-(mu + 2) // 4) * 4
 
+
+def pick_encoder(a, fps):
+    """NVENC or the CPU, and the encoder settings."""
     a.gop = round(4 * float(fps))
     old = previous_settings(a)
     if old and not a.cpu and old.get("enc") == " ".join(cpu_args(a)):
@@ -7028,10 +7522,14 @@ def main():
     print(f"Output: {a.out_w}x{a.height} {'HEVC 10-bit' if a.hevc else 'H.264'}{rate}, "
           f"keyframe every {a.gop} frames")
 
+
+def open_work(a, info):
+    """The work folder: locked, its settings.json checked against this run (a resumed movie must
+    be made the same way) and written; returns the folder and the source's stat."""
     work = Path(a.work + ("_test" if a.test else ""))
     work.mkdir(parents=True, exist_ok=True)
     a.lock = lock_work(work)
-    keep_awake()
+    protect_run(Path(a.input).name)
     st = Path(a.input).stat()
     # encoder args are included so a resumed run never mixes chunks from different encoder
     # settings (their stream headers differ, and joining them breaks playback)
@@ -7141,7 +7639,11 @@ def main():
     # what it was detected as: a resumed run keeps it, and the --all/--queue log shows it
     if a.detected or not (work / "detected.json").exists():
         write_durably(work / "detected.json", json.dumps(dict(type=a.type, **a.detected)))
+    return work, st
 
+
+def plan_chunks(a, info, fps):
+    """The chunks: (index, start, length, frames) on the video's own timeline."""
     # video may start later than the container (audio-first files): cut on the video's own grid
     vo = info["vstart"] - info["cstart"]
     eps = 0.5 / float(info["fps"]) if info["fps"] > 0 else 0.015   # half a source frame
@@ -7157,6 +7659,12 @@ def main():
         expected = a.chunk_frames if length == step else int(round(length * fps))
         if expected >= 1:
             plan.append((i, t, length, expected))
+    return plan, total, vo, eps, vlen
+
+
+def chunk_source(a, info, work, st, plan, total, vo, eps, vlen):
+    """What the chunks are cut from (an exact-seek copy of an MPEG file's video), and --stabilize's
+    camera-motion file; returns where the video starts in it."""
     # MPEG program/transport streams (capture cards, DVD recorders, .vob): they have no index, so
     # -ss can land frames off (measured on 100 s MPEG-2 captures: up to 15 frames late with
     # ffmpeg 6.1, up to 12 with a 2026 build), repeating frames at chunk starts and moving the
@@ -7200,6 +7708,12 @@ def main():
         if len(a.stab_index[1]) < n_frames - 2:
             print(f"NOTE: the camera shake was measured on {len(a.stab_index[1])} of {n_frames} "
                   "frames; the rest is left as it is")
+    return cut
+
+
+def upscale_chunks(a, info, fps, work, plan, cut, eps):
+    """Every chunk made (extract, upscale, encode, overlapped; other upscalers alongside);
+    returns the chunk files in order."""
     try:            # set by --all / --queue: which movie this is, and how much video comes after
         queue = json.loads(os.environ.get("DVD_UPSCALE_QUEUE") or "null")
         later = float(queue["later_secs"]) if queue else 0.0
@@ -7443,6 +7957,9 @@ def main():
                                  f"({two:.1f} frames/s against {one:.1f} for one): one at a "
                                  "time from the next chunk on")
 
+    for line in hardware_text():
+        say(line)
+    load = LoadWatch()                      # CPU and GPU load: per chunk and for the whole run
     old_ctrl_c = signal.getsignal(signal.SIGINT)
     if lanes and old_ctrl_c is signal.default_int_handler \
             and threading.current_thread() is threading.main_thread():
@@ -7526,6 +8043,8 @@ def main():
                    ", all chunks done, finishing the file..."))
             if detail and not helpers:
                 say("        upscale: " + "; ".join(detail))
+            for line in load.lines(since_last=True):
+                say("        " + line)
             if later > 0 and remaining:
                 # the movies still to come, at this movie's speed (seconds of work per second
                 # of video): rough, a live-action movie takes longer than an anime one
@@ -7544,6 +8063,11 @@ def main():
             took = time.time() - t_start
             say(f"Upscaled {progress['frames']} frames in {short_time(took)} "
                 f"({progress['frames'] / took:.1f} frames/s)")
+        overall = load.lines()
+        if overall:
+            say("Load over the whole run (average and peak):")
+            for line in overall:
+                say("  " + line)
     except BaseException:
         # stopped (Ctrl+C) or failed: let the steps already running in the background end
         # first, so nothing is left writing on its own (a finished encode keeps its chunk; a
@@ -7561,6 +8085,7 @@ def main():
         raise
     finally:
         meter_stop.set()
+        load.stop()
         if signal.getsignal(signal.SIGINT) is not old_ctrl_c:
             signal.signal(signal.SIGINT, old_ctrl_c)
     # every chunk must be there (a chunk lost between GPUs would otherwise just be missing
@@ -7572,7 +8097,11 @@ def main():
     chunks = [chunks[k] for k in sorted(chunks)]
     if not chunks:
         sys.exit("No video was produced (is the input's video stream empty?)")
+    return chunks
 
+
+def finish_movie(a, info, work, chunks, total):
+    """The chunks joined, with the source's audio, subtitles and chapters, into the output."""
     lst = work / "list.txt"
     lst.write_text("".join("file '{}'\n".format(c.resolve().as_posix().replace("'", "'\\''"))
                            for c in chunks), encoding="utf-8")
@@ -7594,7 +8123,8 @@ def main():
             if Path(a.input).suffix.lower() in MPEG_EXT else [])
     streams = json.loads(subprocess.check_output(
         ["ffprobe", "-v", "error", *more, "-show_entries", "stream=codec_type,codec_name,channels",
-         "-of", "json", str(a.input)]))["streams"]
+         "-of", "json", str(a.input)], stdin=subprocess.DEVNULL,
+        timeout=LONG_PROBE_TIMEOUT))["streams"]
     audio = [s for s in streams if s["codec_type"] == "audio"]
     subs = [s for s in streams if s["codec_type"] == "subtitle"]
     mp4 = Path(a.output).suffix.lower() in (".mp4", ".m4v")
@@ -7694,7 +8224,8 @@ def main():
 
     vid = float(subprocess.check_output(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
-         "-of", "csv=p=0", str(joined)], encoding="utf-8", errors="replace").strip())
+         "-of", "csv=p=0", str(joined)], encoding="utf-8", errors="replace",
+        stdin=subprocess.DEVNULL, timeout=LONG_PROBE_TIMEOUT).strip())
     diff = vid - float(total)
     print(f"Done: {a.output}\nVideo length {vid:.2f}s vs source {float(total):.2f}s "
           f"(difference {diff:+.2f}s)")
@@ -7707,6 +8238,34 @@ def main():
     if all(WORK_FILES.fullmatch(f.name) for f in work.iterdir()) and \
             not os.environ.get("DVD_UPSCALE_CLIP_TEST"):            # (that one cleans up itself)
         print("You can delete", work)
+
+
+def main():
+    a = build_parser().parse_args()
+    find = start_run(a)
+    user, vhs_info = pick_preset(a, find)
+    check_output(a)
+    pick_model(a, find, user)
+    pick_engine(a)
+    pick_faces(a)
+    info = read_source(a, vhs_info)
+    measured = detect_frames(a, info)
+    if a.analyze:
+        report = os.environ.get("DVD_UPSCALE_REPORT")
+        if report:
+            Path(report).write_text(json.dumps(dict(type=a.type, mode=a.mode,
+                                                    combed=bool(getattr(a, "combed", False)),
+                                                    denoise=a.denoise, filters=training_filters(a))))
+        return
+    check_ai(a)
+    fps = pick_fps(a, info, measured)
+    setup_stabilize(a, info, fps)
+    pick_encoder(a, fps)
+    work, st = open_work(a, info)
+    plan, total, vo, eps, vlen = plan_chunks(a, info, fps)
+    cut = chunk_source(a, info, work, st, plan, total, vo, eps, vlen)
+    chunks = upscale_chunks(a, info, fps, work, plan, cut, eps)
+    finish_movie(a, info, work, chunks, total)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -7843,11 +8402,68 @@ def queue_read(path):
     return jobs
 
 
-def media_duration(path):
-    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                        "-of", "csv=p=0", str(path)], capture_output=True, encoding="utf-8", errors="replace")
+# the quick look at a file's header (length, height, tags): a few hundred ms on a good file. A
+# damaged file, one still being copied, or a network drive that stopped answering can make
+# ffprobe hang for good, and with it a whole --all/--queue night: given up on after this long
+PROBE_TIMEOUT = 60
+# the same for a header read inside a movie's run (more patient: a .vob read 100 MB in, a
+# drive waking up), and for reading a whole file through (counting its frames)
+LONG_PROBE_TIMEOUT = 300
+READ_TIMEOUT = 3 * 3600
+
+
+def ffprobe_out(args, timeout=None):
+    """ffprobe's output (text) for a quick header read; "" if it failed, hung, or isn't there.
+    timeout: seconds (default PROBE_TIMEOUT)."""
     try:
-        return float(r.stdout.strip().split(",")[0])
+        return subprocess.run(["ffprobe", *map(str, args)], capture_output=True,
+                              stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+                              timeout=PROBE_TIMEOUT if timeout is None else timeout).stdout or ""
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return ""
+
+
+# one ffprobe per file for the header facts the queue asks about (length, video height, the
+# label of a finished movie), kept until the file changes: --all looks at every file in the
+# folder again before each movie, which was three ffprobes per file each time (slow on a NAS)
+_HEADERS = {}
+
+
+def file_header(path):
+    """{"duration": str or None, "height": str or None, "tags": dict or None} for a file (None
+    values: not there or unreadable), from one ffprobe, kept until the file's size or date
+    changes."""
+    try:
+        st = os.stat(path)
+        key = (os.path.abspath(path), st.st_size, st.st_mtime_ns)
+    except OSError:
+        key = None
+    if key is not None and key in _HEADERS:
+        head, failed_at = _HEADERS[key]
+        # (a failed read is tried again after 10 minutes: a file that was locked, a drive that
+        # was waking up; until then a file that hangs ffprobe costs one wait, not one per look)
+        if failed_at is None or time.time() - failed_at < 600:
+            return head
+    out = ffprobe_out(["-v", "error", "-show_entries", "format=duration:format_tags:stream=height",
+                       "-select_streams", "v:0", "-of", "json", path])
+    try:
+        j = json.loads(out)
+        fmt = j.get("format")
+        head = {"duration": (fmt or {}).get("duration"),
+                "height": next((s.get("height") for s in j.get("streams") or []), None),
+                "tags": None if fmt is None else (fmt.get("tags") or {})}
+    except (ValueError, AttributeError):
+        head = {"duration": None, "height": None, "tags": None}
+    if key is not None:
+        if len(_HEADERS) > 2000:
+            _HEADERS.clear()
+        _HEADERS[key] = (head, None if out else time.time())
+    return head
+
+
+def media_duration(path):
+    try:
+        return float(str(file_header(path)["duration"]).strip())
     except ValueError:
         return None
 
@@ -7886,11 +8502,8 @@ def source_id(path):
 def made_from(path):
     """The source_id a finished movie records; "" for one made by an older version (nothing
     recorded), None if it isn't one of ours (or can't be read)."""
-    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "json",
-                        str(path)], capture_output=True, encoding="utf-8", errors="replace")
-    try:
-        tags = json.loads(r.stdout).get("format", {}).get("tags", {})
-    except ValueError:
+    tags = file_header(path)["tags"]
+    if tags is None:
         return None
     for v in map(str, tags.values()):
         if OUTPUT_TAG in v:
@@ -7904,17 +8517,20 @@ def is_upscaled_output(path):
     m = re.search(r" (\d{3,4})p$", Path(path).stem)
     if m and int(m.group(1)) >= 720:
         return True
-    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags", "-of", "json",
-                        str(path)], capture_output=True, encoding="utf-8", errors="replace")
-    try:
-        tags = json.loads(r.stdout).get("format", {}).get("tags", {})
-    except ValueError:
-        return False
+    tags = file_header(path)["tags"] or {}
     return any(OUTPUT_TAG in str(v) for v in tags.values())
 
 
 TYPE_DIRS = {"live": "live", "live action": "live", "live-action": "live", "anime": "anime",
              "cgi": "cgi", "3d": "cgi", "vhs": "vhs"}
+
+
+def type_from_name(path):
+    """A type tag at the start of the file name, for movies not in a type folder: cgi_Shrek.mkv,
+    anime-DBZ.mkv, live_Spider-Man_dvd.mkv, vhs_Wedding.mpg (anime, live, cgi, 3d or vhs, then
+    _ or -). None if it has none."""
+    m = re.match(r"(anime|live|cgi|3d|vhs)[_-]", Path(path).name, re.I)
+    return TYPE_DIRS[m.group(1).lower()] if m else None
 
 
 def folder_jobs(folder, extra):
@@ -7952,7 +8568,8 @@ def folder_jobs(folder, extra):
             if abs(time.time() - f.stat().st_mtime) < 120:
                 waiting.append(str(rel))
                 continue
-            tape = (kind or passed.type) == "vhs"
+            own = kind or type_from_name(f)          # (the folder's type, else the name's tag)
+            tape = (own or passed.type) == "vhs"
             h = video_height(f)
             if h and h > 576 and not tape:
                 jobs.append((len(jobs) + 1, str(rel), None,
@@ -7968,8 +8585,8 @@ def folder_jobs(folder, extra):
             args = [str(rel), str(out), *extra]
             # the folder's type wins over a --type given for the loose movies (the last --type
             # given counts)
-            if kind:
-                args += ["--type", kind]
+            if own:
+                args += ["--type", own]
             args += ["--work", str(rel.with_name(stem + "_work"))]
             jobs.append((len(jobs) + 1, str(rel), args, None, False,
                          str(rel.with_name(f"{stem} {height}p.mkv"))))
@@ -7977,20 +8594,16 @@ def folder_jobs(folder, extra):
 
 
 def video_height(path):
-    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-                        "stream=height", "-of", "csv=p=0", str(path)],
-                       capture_output=True, encoding="utf-8", errors="replace")
-    m = re.match(r"\s*(\d+)", r.stdout)
+    m = re.match(r"\s*(\d+)", str(file_header(path)["height"] or ""))
     return int(m.group(1)) if m else None
 
 
 def video_length(path):
     """Length of the video stream itself (not the whole file, which counts the audio too)."""
-    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
-                        "stream=duration:stream_tags", "-of", "json", str(path)],
-                       capture_output=True, encoding="utf-8", errors="replace")
+    out = ffprobe_out(["-v", "error", "-select_streams", "v:0", "-show_entries",
+                       "stream=duration:stream_tags", "-of", "json", path])
     try:
-        st = json.loads(r.stdout)["streams"][0]
+        st = json.loads(out)["streams"][0]
     except (ValueError, KeyError, IndexError):
         return None
     d = hms(st.get("duration"))
@@ -8007,11 +8620,11 @@ def check_finished_movie(src, out):
                 if Path(path).suffix.lower() in MPEG_EXT else [])
         j = json.loads(subprocess.check_output(
             ["ffprobe", "-v", "error", *more, "-show_entries", "stream=codec_type,codec_name",
-             "-of", "json", str(path)]))
+             "-of", "json", str(path)], stdin=subprocess.DEVNULL, timeout=LONG_PROBE_TIMEOUT))
         return [s.get("codec_type") for s in j["streams"]], j["streams"]
     try:
         (t_src, s_src), (t_out, _) = tracks(src), tracks(out)
-    except (subprocess.CalledProcessError, ValueError, KeyError):
+    except (subprocess.SubprocessError, ValueError, KeyError):
         return "it couldn't be read"
     d_src, d_out = media_duration(src), media_duration(out)
     if d_src is None or d_out is None or d_out < 0.98 * d_src:
@@ -8027,7 +8640,7 @@ def check_finished_movie(src, out):
     try:
         fps = float(probe(out)["fps"])
         have = count_frames(out) / fps if fps > 0 else 0
-    except (subprocess.CalledProcessError, ValueError, KeyError, ZeroDivisionError):
+    except (subprocess.SubprocessError, ValueError, KeyError, ZeroDivisionError):
         have = 0
     if not want or have < 0.98 * want:
         return "its video is shorter than the original's"
@@ -8182,7 +8795,7 @@ def queue_main(argv):
     qlock = hold_lock(base / ".queue.lock",      # noqa: F841 (held until the queue exits)
                       "A queue is already running for this folder in another window. Stop that "
                       "one first (new movies / lines are picked up by the running one).")
-    keep_awake()
+    protect_run()
 
     # a marker in front of each kind of line on the screen (the log file keeps the plain text,
     # so it can be searched for DONE / FAILED)
@@ -8195,6 +8808,9 @@ def queue_main(argv):
             marker = "⚠️ "
         status_line()           # (the progress line, finished, before a line that stays)
         print(marker + msg, flush=True)
+        if msg.startswith(("START", "Started")):     # (shown if Windows is asked to shut down)
+            shutdown_reason(f"dvd_upscale.py is working through its list ({msg[:150]}): "
+                            "shutting down now loses the chunk in progress")
         try:
             with open(log, "a", encoding="utf-8") as f:
                 f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')}  {msg}\n")
@@ -8343,6 +8959,7 @@ def queue_main(argv):
              + ("shutdown /a" if sys.platform == "win32" else "shutdown -c"))
         cmd = (["shutdown", "/s", "/t", "60"] if sys.platform == "win32"
                else ["shutdown", "-h", "+1"])
+        allow_shutdown()                    # (this run's own shutdown block goes first)
         subprocess.run(cmd)
 
 
@@ -8352,11 +8969,9 @@ def hms_text(secs):
 
 
 def has_dvd_pcm(path):
-    r = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries",
-                        "stream=codec_name", "-of", "csv=p=0", str(path)],
-                       capture_output=True, stdin=subprocess.DEVNULL)
-    return any(c.strip() in ("pcm_dvd", "pcm_bluray")
-               for c in r.stdout.decode("utf-8", "replace").splitlines())
+    out = ffprobe_out(["-v", "error", "-select_streams", "a", "-show_entries",
+                       "stream=codec_name", "-of", "csv=p=0", path])
+    return any(c.strip() in ("pcm_dvd", "pcm_bluray") for c in out.splitlines())
 
 
 def clip_main(argv):
@@ -8459,6 +9074,397 @@ def clip_upscale(src, clip, extra):
     print(f"\nTest done. The original piece: {clip}\nUpscaled: {out}")
 
 
+# ---------------------------------------------------------------------------------------------
+# Self-test: python dvd_upscale.py --self-test
+# Quick checks of this script's own logic (no GPU, no movie needed; a few seconds): the queue
+# file, the folder scan, the detection decision, face tracking, GPU steps, the PNG helpers and the
+# timeouts. Tests that need ffmpeg/ffprobe are skipped when those aren't found. Run it after
+# changing the script: it catches a broken queue parser or folder scan before a night's queue
+# does. (Defined in here so nothing of it is loaded on a normal run.)
+
+def self_test_main(argv):
+    import unittest
+    from types import SimpleNamespace
+    from unittest import mock
+    du = sys.modules[__name__]              # (this script, as the tests see it)
+
+    HAVE_FFMPEG = bool(shutil.which("ffmpeg") and shutil.which("ffprobe"))
+
+
+    def make_clip(path, secs=2, size="320x240", rate="24000/1001", extra=()):
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "lavfi",
+                        "-i", f"testsrc2=s={size}:r={rate}", "-t", str(secs), *extra,
+                        "-c:v", "mpeg2video", str(path)], check=True)
+
+
+    class TempDir(unittest.TestCase):
+        def setUp(self):
+            self.dir = Path(tempfile.mkdtemp(prefix="dvd_upscale_test_"))
+
+        def tearDown(self):
+            shutil.rmtree(self.dir, ignore_errors=True)
+
+
+    class SmallHelpers(unittest.TestCase):
+        def test_frac(self):
+            self.assertEqual(du.frac("30000/1001"), Fraction(30000, 1001))
+            self.assertEqual(du.frac("16:9"), Fraction(16, 9))
+            self.assertEqual(du.frac("N/A"), Fraction(0))
+            self.assertEqual(du.frac("1/0", Fraction(5)), Fraction(5))
+
+        def test_hms(self):
+            self.assertAlmostEqual(du.hms("01:23:45.678000000"), 5025.678)
+            self.assertEqual(du.hms("12.5"), 12.5)
+            self.assertIsNone(du.hms("0"))
+            self.assertIsNone(du.hms("N/A"))
+            self.assertIsNone(du.hms(None))
+
+        def test_short_time(self):
+            self.assertEqual(du.short_time(0.2), "1 s")
+            self.assertEqual(du.short_time(59), "59 s")
+            self.assertEqual(du.short_time(150), "2 min")      # (rounded: 2.5 -> 2)
+            self.assertEqual(du.short_time(3 * 3600 + 5 * 60), "3 h 5 min")
+
+        def test_eta_text(self):
+            self.assertTrue(du.eta_text(90).startswith("2 min left, done ~"))
+            self.assertTrue(du.eta_text(2 * 3600).startswith("2 h 0 min left"))
+            self.assertTrue(du.eta_text(0).startswith("1 min left"))   # never "0 min"
+
+        def test_median(self):
+            self.assertEqual(du._median([3, 1, 2]), 2)
+            self.assertEqual(du._median([4, 1, 3, 2]), 2.5)
+            self.assertIsNone(du._median([]))
+            self.assertEqual(du._median([], 0.0), 0.0)
+            self.assertEqual(du._median(x for x in (5, 7)), 6)      # any iterable
+
+        def test_quiet_run_never_raises(self):
+            self.assertEqual(du._quiet_run(["surely-not-a-program-xyz"]), (-1, b""))
+            rc, out = du._quiet_run([sys.executable, "-c", "print('hi')"])
+            self.assertEqual((rc, out.strip()), (0, b"hi"))
+            rc, out = du._quiet_run([sys.executable, "-c", "import time; time.sleep(5)"],
+                                    timeout=0.5)
+            self.assertEqual((rc, out), (-1, b""))
+
+        def test_ffprobe_out_gives_up(self):
+            with mock.patch.object(du.subprocess, "run",
+                                   side_effect=subprocess.TimeoutExpired("ffprobe", 60)):
+                self.assertEqual(du.ffprobe_out(["x"]), "")
+            with mock.patch.object(du.subprocess, "run", side_effect=FileNotFoundError):
+                self.assertEqual(du.ffprobe_out(["x"]), "")
+
+        def test_hung_file_is_waited_for_once(self):
+            with tempfile.TemporaryDirectory() as d:
+                f = Path(d) / "Stuck.mkv"
+                f.write_bytes(b"x")
+                with mock.patch.object(du, "ffprobe_out", return_value="") as probe:
+                    for _ in range(3):
+                        self.assertIsNone(du.media_duration(f))
+                        self.assertIsNone(du.video_height(f))
+                    self.assertEqual(probe.call_count, 1)
+                    with mock.patch.object(du.time, "time", return_value=time.time() + 601):
+                        du.media_duration(f)              # tried again after 10 minutes
+                    self.assertEqual(probe.call_count, 2)
+
+
+    class QueueFile(TempDir):
+        def test_words(self):
+            self.assertEqual(du.queue_parse('"My Movie.mkv" out.mkv --type live'),
+                             ["My Movie.mkv", "out.mkv", "--type", "live"])
+            self.assertEqual(du.queue_parse('a.mkv b.mkv   # a comment "with quotes'),
+                             ["a.mkv", "b.mkv"])
+            self.assertEqual(du.queue_parse("'It''s.mkv' x.mkv"), ["It's.mkv", "x.mkv"])
+            self.assertEqual(du.queue_parse(r'"C:\Movies\A B.mkv"'), [r"C:\Movies\A B.mkv"])
+            self.assertEqual(du.queue_parse("# whole line"), [])
+            self.assertEqual(du.queue_parse(""), [])
+
+        def test_unclosed_quote(self):
+            with self.assertRaises(ValueError):
+                du.queue_parse('"Movie.mkv out.mkv')
+
+        def test_test_secs(self):
+            self.assertEqual(du.queue_test_secs(["a", "b", "--test", "60"]), 60)
+            self.assertEqual(du.queue_test_secs(["a", "--test=30"]), 30)
+            self.assertEqual(du.queue_test_secs(["a", "--test", "x"]), 0)
+            self.assertEqual(du.queue_test_secs(["a", "b"]), 0)
+            self.assertEqual(du.queue_test_secs(["a", "--test"]), 0)
+
+        def test_encodings(self):
+            text = '"Été.mkv" "Été 1080p.mkv"\n# comment\n'
+            for enc, bom in (("utf-8", b""), ("utf-8", b"\xef\xbb\xbf"), ("utf-16-le", b"\xff\xfe")):
+                p = self.dir / f"q_{enc}_{len(bom)}.txt"
+                p.write_bytes(bom + text.encode(enc))
+                lines = du.queue_lines(p)
+                self.assertEqual(du.queue_parse(lines[0]), ["Été.mkv", "Été 1080p.mkv"], enc)
+
+
+    class Pngs(TempDir):
+        def test_black_png_round_trip(self):
+            p = self.dir / "000001.png"
+            du.write_black_png(p, 64, 36)
+            self.assertEqual(du.png_size(p), (64, 36))
+            self.assertTrue(du.png_is_black(p))
+
+        def test_not_black(self):
+            import numpy as np
+            img = np.zeros((36, 64, 3), np.uint8)
+            img[20, 30] = (0, 1, 0)                     # one pixel off black
+            p = self.dir / "sub" / "000001.png"
+            p.parent.mkdir()
+            du.write_png(p, img)
+            self.assertEqual(du.png_size(p), (64, 36))
+            self.assertFalse(du.png_is_black(p))
+            du.write_png(p, np.zeros((36, 64, 3), np.uint8))
+            self.assertTrue(du.png_is_black(p))
+
+        def test_garbage_is_not_black(self):
+            p = self.dir / "x.png"
+            p.write_bytes(b"not a png at all")
+            self.assertFalse(du.png_is_black(p))
+            self.assertFalse(du.png_is_black(self.dir / "missing.png"))
+
+        @unittest.skipUnless(HAVE_FFMPEG, "needs ffmpeg")
+        def test_write_png_reads_back_exactly(self):
+            import numpy as np
+            rng = np.random.default_rng(1)
+            img = rng.integers(0, 256, (24, 40, 3), dtype=np.uint8)
+            p = self.dir / "f" / "000001.png"
+            p.parent.mkdir()
+            du.write_png(p, img)
+            raw = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-i", str(p), "-f", "rawvideo",
+                                  "-pix_fmt", "rgb24", "-"], capture_output=True, check=True).stdout
+            self.assertEqual(raw, img.tobytes())
+
+
+    class Faces(unittest.TestCase):
+        @staticmethod
+        def face(x, y):
+            """A detection (landmarks, score) of a face big enough for full strength: eyes
+            between FACE_FULL_EYES and FACE_TAPER_EYES source pixels apart (frames at scale 2)."""
+            import numpy as np       # 5 landmarks: eyes, nose, mouth corners
+            e = (du.FACE_FULL_EYES + du.FACE_TAPER_EYES)       # (2x the middle of that range)
+            return (np.array([[x, y], [x + e, y], [x + e / 2, y + e / 2], [x + e / 5, y + e],
+                              [x + 4 * e / 5, y + e]], float), 0.9)
+
+        def test_steady_face_everywhere(self):
+            n = 12
+            plan = du.face_plan([[self.face(100, 50)] for _ in range(n)], n, 0.6)
+            self.assertEqual(len(plan), n)
+            self.assertTrue(all(len(p) == 1 for p in plan))
+            # reaches both chunk edges: no fade-in/out there (no pulse at the seams)
+            self.assertAlmostEqual(plan[0][0][1], 0.6)
+            self.assertAlmostEqual(plan[-1][0][1], 0.6)
+
+        def test_flash_of_a_face_is_dropped(self):
+            n = 20
+            dets = [[] for _ in range(n)]
+            dets[9], dets[10] = [self.face(100, 50)], [self.face(101, 50)]
+            self.assertTrue(all(p == [] for p in du.face_plan(dets, n, 0.6)))
+
+        def test_one_missed_detection_is_filled(self):
+            n = 16
+            dets = [[self.face(100, 50)] for _ in range(n)]
+            dets[7] = []
+            plan = du.face_plan(dets, n, 0.6)
+            self.assertEqual(len(plan[7]), 1)
+
+
+    class DetectionDecision(unittest.TestCase):
+        """detect_content: how the picture check and the motion check are combined."""
+
+        def run_with(self, pictures, motion, flat):
+            a = dict(content=pictures, confidence="high", reasons="", scores={"flat_share": flat})
+            b = dict(content=motion, confidence="high", reasons="", scores={"alt": 0.2})
+            with mock.patch.object(du, "_cs_detect_content", return_value=a), \
+                    mock.patch.object(du, "_ct_detect_content", return_value=b):
+                return du.detect_content("x.mkv")
+
+        def test_anime_needs_both_and_flat_areas(self):
+            self.assertEqual(self.run_with("anime", "anime", 0.8)["content"], "anime")
+            r = self.run_with("anime", "anime", 0.45)          # silent-film look
+            self.assertEqual((r["content"], r["confidence"]), ("live", "low"))
+            self.assertEqual(self.run_with("anime", "live", 0.8)["content"], "live")
+            self.assertEqual(self.run_with("live", "anime", 0.8)["content"], "live")
+
+        def test_cgi_only_when_both_agree(self):
+            self.assertEqual(self.run_with("cgi", "cgi", 0.2)["content"], "cgi")
+            self.assertEqual(self.run_with("cgi", "live", 0.2)["content"], "live")
+            self.assertEqual(self.run_with("live", "live", 0.2)["content"], "live")
+
+
+    class GpuSteps(TempDir):
+        def setUp(self):
+            super().setUp()
+            self.env = mock.patch.dict(os.environ, {"DVD_UPSCALE_GPU_STEPS": str(self.dir / "s.json")})
+            self.env.start()
+            du.GPU_STEP[0], du.FRAMES_OK[0] = 0, 0
+
+        def tearDown(self):
+            self.env.stop()
+            du.GPU_STEP[0], du.FRAMES_OK[0] = 0, 0
+            super().tearDown()
+
+        def args(self, model="realesrgan-x2plus", **kw):
+            return SimpleNamespace(model=model, gpu=None, gpu_threads=None, tile=None, engine="exe",
+                                   **kw)
+
+        def test_steps_down_and_is_remembered(self):
+            a = self.args()
+            self.assertEqual(du.gpu_load(a), (2, None))
+            self.assertTrue(du.lower_gpu_load(a))
+            self.assertEqual(du.gpu_load(a), (1, None))
+            du.GPU_STEP[0] = 0                          # a new run
+            self.assertTrue(du.load_gpu_step(a))
+            self.assertEqual(du.gpu_load(a), (1, None))
+
+        def test_last_step(self):
+            a = self.args()
+            while du.lower_gpu_load(a):
+                pass
+            self.assertEqual(du.gpu_load(a), (1, 32))
+            self.assertFalse(du.lower_gpu_load(a))
+
+        def test_user_settings_kept(self):
+            a = self.args(model="realesr-animevideov3")
+            a.tile = 128
+            self.assertEqual(du.gpu_load(a), (8, 128))
+            self.assertIn("128-pixel tiles", du.gpu_load_text(a))
+
+        def test_no_step_down(self):
+            a = self.args(no_step_down=True)
+            self.assertFalse(du.lower_gpu_load(a))
+
+
+    class WorkFolder(TempDir):
+        def test_clean_keeps_foreign_files(self):
+            w = self.dir / "Movie_work"
+            (w / "tmp_00003").mkdir(parents=True)
+            for name in ("chunk_00001.mkv", "chunk_00002.part.mkv", "settings.json", "list.txt",
+                         "my notes.txt"):
+                (w / name).write_text("x")
+            du.clean_work_folder(w)
+            self.assertEqual(sorted(p.name for p in w.iterdir()), ["my notes.txt"])
+            (w / "my notes.txt").unlink()
+            du.clean_work_folder(w)
+            self.assertFalse(w.exists())
+
+
+    @unittest.skipUnless(HAVE_FFMPEG, "needs ffmpeg and ffprobe")
+    class Headers(TempDir):
+        def test_header_and_cache(self):
+            clip = self.dir / "Clip.mkv"
+            make_clip(clip, secs=2)
+            self.assertAlmostEqual(du.media_duration(clip), 2.0, delta=0.1)
+            self.assertEqual(du.video_height(clip), 240)
+            self.assertIsNone(du.made_from(clip))
+            self.assertFalse(du.is_upscaled_output(clip))
+            with mock.patch.object(du, "ffprobe_out", side_effect=AssertionError("not cached")):
+                self.assertEqual(du.video_height(clip), 240)       # read once, kept
+            # a changed file is read again
+            make_clip(clip, secs=3, size="640x480")
+            os.utime(clip, (time.time() + 5, time.time() + 5))
+            self.assertEqual(du.video_height(clip), 480)
+            self.assertAlmostEqual(du.media_duration(clip), 3.0, delta=0.1)
+
+        def test_our_label(self):
+            src, out = self.dir / "Movie.mkv", self.dir / "Out.mkv"
+            make_clip(src)
+            subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(src), "-c", "copy",
+                            "-metadata", f"comment={du.OUTPUT_TAG} from {du.source_id(src)}",
+                            str(out)], check=True)
+            self.assertEqual(du.made_from(out), du.source_id(src))
+            self.assertTrue(du.is_upscaled_output(out))
+
+        def test_unreadable(self):
+            bad = self.dir / "bad.mkv"
+            bad.write_bytes(b"\x00" * 1000)
+            self.assertIsNone(du.media_duration(bad))
+            self.assertIsNone(du.video_height(bad))
+            self.assertIsNone(du.made_from(bad))
+            self.assertIsNone(du.media_duration(self.dir / "missing.mkv"))
+
+        def test_folder_scan(self):
+            f = self.dir
+            (f / "anime").mkdir()
+            make_clip(f / "Short.mkv", secs=2)                  # under 5 minutes: skipped
+            make_clip(f / "anime" / "Show.mkv", secs=2)
+            make_clip(f / "HD.mkv", secs=2, size="1280x720")
+            make_clip(f / "Movie 1080p.mkv", secs=2)              # one of our outputs
+            (f / "VTS_01_1.VOB").write_bytes(b"\x00")
+            old = time.time() - 3600
+            for p in f.rglob("*.*"):
+                os.utime(p, (old, old))
+            make_clip(f / "Copying.mkv", secs=2)                 # just changed: still copying?
+            long = mock.patch.object(du, "media_duration", return_value=600.0)
+            with long:
+                jobs, waiting = du.folder_jobs(f, [])
+            self.assertEqual(waiting, ["Copying.mkv"])
+            by_name = {j[1]: j for j in jobs}
+            self.assertIn("already HD", by_name["HD.mkv"][3])
+            self.assertIn("pieces of a DVD", by_name["VTS_01_1.VOB"][3])
+            self.assertNotIn("Movie 1080p.mkv", by_name)
+            show = by_name[str(Path("anime") / "Show.mkv")]
+            self.assertEqual(show[2][show[2].index("--type") + 1], "anime")
+            self.assertEqual(show[2][1], str(Path("1080p Upscale") / "anime" / "Show 1080p.mkv"))
+            jobs, _ = du.folder_jobs(f, [])                      # real lengths: 2 s
+            self.assertIn("shorter than 5 minutes", {j[1]: j for j in jobs}["Short.mkv"][3])
+
+        def test_queue_finished(self):
+            src, out = self.dir / "Movie.mkv", self.dir / "Movie 1080p.mkv"
+            make_clip(src, secs=3)
+            self.assertFalse(du.queue_finished(self.dir, [src.name, out.name]))
+            subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-i", str(src), "-t", "1",
+                            "-c", "copy", str(out)], check=True)
+            self.assertFalse(du.queue_finished(self.dir, [src.name, out.name]))   # too short
+            self.assertTrue(du.queue_finished(self.dir, [src.name, out.name, "--test", "1"]))
+
+
+    class CommandLine(unittest.TestCase):
+        def test_parser_knows_every_queue_value_option(self):
+            p = du.build_parser()
+            known = {s for act in p._actions for s in act.option_strings}
+            for opt in du.VALUE_OPTS:
+                self.assertIn(opt, known)
+
+        def test_trained(self):
+            a = du.build_parser().parse_args(["in.mkv", "--trained"])
+            self.assertTrue(a.trained)
+
+        def test_commands_text(self):
+            self.assertIn("--all", du.commands_text())
+
+
+    class Load(unittest.TestCase):
+        def test_lines(self):
+            w = du.LoadWatch(start=False)
+            self.assertEqual(w.lines(), [])
+            g = lambda busy, temp: dict(index="0", name="X", busy=busy, clock=1500.0, temp=temp,
+                                        power=None, mem=2048.0, mem_max=8192.0)
+            w.add(20.0, [g(90.0, 60.0)])
+            w.add(None, [g(100.0, 70.0)])
+            w.add(60.0, [])
+            self.assertEqual(w.lines(since_last=True), [
+                "CPU: 40% avg, 60% peak",
+                "GPU: 95% avg, 100% peak | 1500 MHz avg, 1500 MHz peak | 65 C avg, 70 C peak"
+                " | VRAM 2.0 GB avg, 2.0 GB peak of 8.0"])
+            w.add(10.0, [])
+            self.assertEqual(w.lines(since_last=True), ["CPU: 10% avg, 10% peak"])
+            self.assertEqual(w.lines()[0], "CPU: 30% avg, 60% peak")    # (the whole run)
+
+        def test_cpu_times(self):
+            t = du.cpu_times()
+            if t:
+                self.assertLessEqual(t[0], t[1])
+            self.assertIsInstance(du.hardware_text()[0], str)
+
+    tests = unittest.TestSuite(
+        unittest.defaultTestLoader.loadTestsFromTestCase(case)
+        for case in list(locals().values())
+        if isinstance(case, type) and issubclass(case, unittest.TestCase))
+    verbosity = 1 if "-q" in argv else 2
+    ok = unittest.TextTestRunner(verbosity=verbosity).run(tests).wasSuccessful()
+    return 0 if ok else 1
+
+
 if __name__ == "__main__":
     for stream in (sys.stdout, sys.stderr):      # a name the console/log can't show: '?', not a crash
         try:    # (the face worker's output is read by this script, as UTF-8: any path in it)
@@ -8473,22 +9479,20 @@ if __name__ == "__main__":
     _here = str(Path(__file__).resolve().parent)
     if any(shutil.which(t, path=_here) for t in ("ffmpeg", "realesrgan-ncnn-vulkan")):
         os.environ["PATH"] = _here + os.pathsep + os.environ.get("PATH", "")
-    if sys.argv[1:2] == ["--faces-worker"]:          # (a chunk's face restoration: see Chunk)
-        sys.exit(faces_worker_main(sys.argv[2:]))
-    if sys.argv[1:2] == ["--ncnn-models"]:           # (every model on the same frames)
-        sys.exit(ncnn_models_main(sys.argv[2:]))
-    if sys.argv[1:2] == ["--gpu-detect"]:            # (the GPUs, the profile; made if there is none)
-        sys.exit(gpu_detect_main(sys.argv[2:]))
-    if sys.argv[1:2] == ["--ncnn-auto"]:             # (all of the GPU set-up and a timed test)
-        sys.exit(ncnn_auto_main(sys.argv[2:]))
-    if sys.argv[1:2] == ["--ncnn-winograd"]:         # (the winograd variants the GPU survives)
-        sys.exit(ncnn_winograd_main(sys.argv[2:]))
-    if sys.argv[1:2] == ["--ncnn-bench-gpu"]:        # (which GPU is faster)
-        sys.exit(ncnn_bench_gpu_main(sys.argv[2:]))
-    if sys.argv[1:2] == ["--ncnn-bench"]:            # (the fastest settings that keep the picture)
-        sys.exit(ncnn_bench_main(sys.argv[2:]))
-    if sys.argv[1:2] == ["--ncnn-stress"]:           # (find the ncnn options the GPU survives)
-        sys.exit(ncnn_stress_main(sys.argv[2:]))
+    # commands that run on their own, first word only (the rest of the line is theirs)
+    tools = {
+        "--faces-worker": faces_worker_main,        # (a chunk's face restoration: see Chunk)
+        "--ncnn-models": ncnn_models_main,          # (every model on the same frames)
+        "--gpu-detect": gpu_detect_main,            # (the GPUs, the profile; made if there is none)
+        "--ncnn-auto": ncnn_auto_main,              # (all of the GPU set-up and a timed test)
+        "--ncnn-winograd": ncnn_winograd_main,      # (the winograd variants the GPU survives)
+        "--ncnn-bench-gpu": ncnn_bench_gpu_main,    # (which GPU is faster)
+        "--ncnn-bench": ncnn_bench_main,            # (the fastest settings that keep the picture)
+        "--ncnn-stress": ncnn_stress_main,          # (find the ncnn options the GPU survives)
+        "--self-test": self_test_main,              # (checks of this script's own logic)
+    }
+    if sys.argv[1:2] and sys.argv[1] in tools:
+        sys.exit(tools[sys.argv[1]](sys.argv[2:]))
     if sys.argv[1:2] == ["--ncnn-upscaler"]:         # (the current ncnn: see esrgan_cmd)
         rc = ncnn_upscaler_main(sys.argv[2:])
         # (leave at once, without Python's and ncnn's clean-up: on Windows with the NVIDIA
@@ -8521,6 +9525,10 @@ if __name__ == "__main__":
               '       python dvd_upscale.py --all          (every movie in this folder)\n'
               '       python dvd_upscale.py --commands     (every command and option)')
         sys.exit(0)
+    if "--no-guard" in sys.argv:                   # (see protect_run; the movies inherit it)
+        while "--no-guard" in sys.argv:
+            sys.argv.remove("--no-guard")
+        os.environ["DVD_UPSCALE_NO_GUARD"] = "1"
     phone_port = phone_args(sys.argv)              # (the phone page: before anything parses argv)
     queue_mode = any(w in ("--queue", "--all") or w.startswith(("--queue=", "--all="))
                      for w in sys.argv[1:])
@@ -8536,7 +9544,7 @@ if __name__ == "__main__":
         if not queue_mode:
             print("\nStopped. Re-run the same command to resume.", file=sys.stderr)
         sys.exit(130)       # distinct code: the queue stops instead of moving on
-    except (subprocess.CalledProcessError, RuntimeError) as e:
+    except (subprocess.SubprocessError, RuntimeError) as e:
         sys.exit(f"\nFailed: {e}\nRe-run the same command to retry from the last finished chunk.")
     except OSError as e:                         # disk full, file in use, missing folder...
         sys.exit(f"\nFailed: {e}\nFix that and re-run the same command: finished chunks are kept.")
