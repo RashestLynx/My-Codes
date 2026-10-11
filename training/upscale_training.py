@@ -1273,7 +1273,8 @@ def upscaler_settings(a, work):
         return None
     report = Path(work) / "upscaler_report.json"
     report.unlink(missing_ok=True)
-    cmd = [sys.executable, str(up), str(dvd), "--analyze", "--work", str(Path(work) / "upscaler_check")]
+    # (--trained: the frame sizes it uses with the 2x model trained here, e.g. a tape's, not a 4x model's)
+    cmd = [sys.executable, str(up), str(dvd), "--analyze", "--trained", "--work", str(Path(work) / "upscaler_check")]
     cmd += (["--type", a.type] if a.type != "auto" else []) + (["--dar", a.dar] if a.dar else [])
     say(f"asking {up.name} what this movie is and how it prepares its frames (--analyze, a minute or two)...")
     r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, errors="replace",

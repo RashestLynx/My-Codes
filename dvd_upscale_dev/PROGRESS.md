@@ -30,8 +30,8 @@ The user's changes:
 
 - `python3 e2e.py ../dvd_upscale.py TAG [case...]` runs 14 cases: frame order, sync and chunk
   seams for NTSC/PAL film, VHS and AVI, plus the AI path with a fake upscaler and two GPUs.
-  - Expected: every case has `breaks 0`, except `ntsc_film_bff`, which has one repeated first
-    frame (it was there before these changes).
+  - Expected: every case has `breaks 0` (`ntsc_film_bff` had one repeated first frame until
+    `repeatfields` was left out for discs with no soft pulldown).
   - VHS AVI captures are offset by -33 ms (mpeg4) and -67 ms (h264): this is the B-frame delay,
     and it is the same as before.
   - Run it on ffmpeg 6.1 and on master: `PATH=dl/ffmpeg-master-latest-linux64-gpl/bin:$PATH`.

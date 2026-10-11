@@ -1232,10 +1232,13 @@ def prefilter(a):
         # Not for PAL: soft pulldown is an NTSC thing, and repeatfields drops the timestamps of
         # frames not flagged top field first unless the rate is 29.97; with no decimate after
         # it to make new ones, fps= then dropped every frame of BFF/progressive-flagged discs
+        # (a disc with no soft pulldown at all goes without it: on a bottom-field-first disc
+        #  repeatfields turned the movie's first frame into a copy of the second)
         if getattr(a, "pal", False):
             f += ["fieldmatch", "yadif=deint=interlaced"]   # PAL film is 2:2: nothing to drop
         else:
-            f += ["repeatfields", "fieldmatch", "yadif=deint=interlaced", "decimate"]
+            f += ([] if getattr(a, "no_soft_pulldown", False) else ["repeatfields"]) \
+                 + ["fieldmatch", "yadif=deint=interlaced", "decimate"]
     elif a.mode == "interlaced":
         f += ["bwdif=mode=send_frame:deint=all"]
     elif getattr(a, "combed", False):
@@ -1917,7 +1920,10 @@ def check_frames(a, tmp, n_in, strict=False):
                                    f"of about {x:.0f}: black or garbled - a GPU fault?)")
 
 
-TRAINED_MODEL = "upscale-training-x2"   # the model training/upscale_training.py makes (--trained)
+# --trained: the model training/upscale_training.py makes for each kind of movie (ai-anime-x2,
+# ai-live-x2, ai-cgi-x2, ai-vhs-x2); TRAINED_MODEL is the name its first versions gave every model
+TRAINED_NAME = "ai-{}-x2"
+TRAINED_MODEL = "upscale-training-x2"
 
 
 def models_dir(a):
@@ -6146,8 +6152,9 @@ def build_parser():
     p.add_argument("--model", default=None, help="override model name")
     p.add_argument("--scale", type=int, default=None, help="override model scale")
     p.add_argument("--trained", action="store_true",
-                   help=f"use the model made by training/upscale_training.py ({TRAINED_MODEL}, scale 2): "
-                        "short for --model " + TRAINED_MODEL + " --scale 2")
+                   help="use the model training/upscale_training.py made for this kind of movie "
+                        "(ai-anime-x2, ai-live-x2, ai-cgi-x2 or ai-vhs-x2, by the type detected; "
+                        f"else {TRAINED_MODEL}): short for --model ai-<type>-x2 --scale 2")
     p.add_argument("--height", type=int, default=1080)
     p.add_argument("--dar", default=None, help="force aspect, e.g. 16:9 or 4:3")
     p.add_argument("--fps", default=None, help="override output fps, e.g. 24000/1001")
@@ -6570,8 +6577,9 @@ def main():
     if find("ffmpeg"):
         check_ffmpeg()
     resolve_type(a, find)
+    trained_pick = a.trained and a.model is None       # (the model of the type detected)
     if a.trained:
-        a.model = a.model or TRAINED_MODEL
+        a.model = a.model or TRAINED_NAME.format(a.type)
         a.scale = a.scale or 2
     if not a.fast and not a.analyze and a.type != "vhs" and not a.no_profile:
         inject_gpu_hardware_profile(a)
@@ -6664,6 +6672,15 @@ def main():
             sys.exit(f"Missing tool: {t}")
     if not a.fast and not a.analyze:
         a.esrgan_path = find(a.esrgan)
+        if trained_pick and not model_installed(a):
+            wanted = a.model
+            a.model = TRAINED_MODEL                 # (made by an earlier upscale_training.py)
+            if not model_installed(a):
+                sys.exit(f"--trained: {wanted}.param/.bin (the trained model for "
+                         f"{TYPE_NAMES[a.type]}) isn't in {models_dir(a)}. Make it with "
+                         "training/upscale_training.py, or leave out --trained.")
+            print(f"NOTE: --trained: {wanted} not found, using {TRAINED_MODEL} (made by an "
+                  "earlier upscale_training.py)")
         best = ncnn_saved().get("best_model")
         if a.best_quality and not best:
             print("NOTE: --best-quality: no best model is saved yet: run "
@@ -6916,15 +6933,12 @@ def main():
             print(f"Detected: {a.mode} ({detail})")
     else:
         print(f"Mode: {a.mode} (forced)")
-    if a.analyze:
-        report = os.environ.get("DVD_UPSCALE_REPORT")
-        if report:
-            Path(report).write_text(json.dumps(dict(type=a.type, mode=a.mode,
-                                                    combed=bool(getattr(a, "combed", False)))))
-        return
-    if not a.fast:
+    if a.type != "vhs" and a.mode == "telecine" and not a.pal:
+        mix = pulldown_mix(a.input)         # (None: not MPEG-2, or not readable: repeatfields stays)
+        a.no_soft_pulldown = mix is not None and mix[0] == 0
+    if not a.fast and not a.analyze:
         check_upscaler(a)       # (exits if the model's files are broken or the GPU fails)
-    if a.faces:
+    if a.faces and not a.analyze:
         try:
             faces_check(a)      # (exits with what to install or download if something's missing)
         except FacesUnavailable as e:
@@ -6970,6 +6984,17 @@ def main():
         if old and frac(old.get("fps")) == given:
             fps = given                     # started that way by an older version
     a.fps = f"{fps.numerator}/{fps.denominator}"
+    if a.analyze:
+        report = os.environ.get("DVD_UPSCALE_REPORT")
+        if report:
+            # (upscale_training.py prepares its DVD frames with these: the filters before the AI,
+            #  without the black-bar crop and the chunk warm-up, which depend on the run)
+            if a.type == "vhs":
+                a.vhs_trim = 0
+            Path(report).write_text(json.dumps(dict(type=a.type, mode=a.mode, fps=a.fps,
+                                                    combed=bool(getattr(a, "combed", False)),
+                                                    filters=prefilter(a).split(","))))
+        return
     if fps > 30 and a.level == "4.1":
         # 1440x1080p59.94 is 366,833 macroblocks/s, level 4.1 allows 245,760 (camcorder tapes,
         # or --fps 50/59.94 on a DVD: 1080p59.94 is 489,110)
